@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // chatSeq 进程级请求序号。
@@ -39,6 +40,9 @@ type chatStat struct {
 	toks   int // <0 表示 usage 缺失 → 显示 "-"
 	status int
 
+	// timing 上游分段耗时（纯观测，见 upstream/timing.go）。零值 = 未采集/未测量。
+	timing upstream.ChatTiming
+
 	logged bool
 }
 
@@ -57,7 +61,7 @@ func (s *chatStat) done() {
 		return
 	}
 	s.logged = true
-	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks)
+	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks, s.timing)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -268,7 +272,19 @@ func uidPrefix(uid string) string {
 
 // logChatRow 打印一行请求级表格日志（直接输出 stdout，无 log 时间戳前缀）。
 // toks<0 表示 usage 缺失，显示 "-"。
-func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks int) {
+//
+// timing 为上游分段耗时（见 upstream/timing.go）。语义澄清（本次排查的核心产出）：
+// 本行 TTFB 的口径是「首个 SSE data 帧到达 − 请求进 handler」，**包含**选号、
+// 建连、本地请求体准备、上游首字节、SSE 解析——不等于「上游首字节」，直接拿它
+// 与 curl time_starttransfer 对比会系统性偏高（实测差 ~0.5s）。分段字段用于
+// 把这段差拆开：
+//
+//	seg=prepNms/doNms — 本地准备 / 上游 Do（含建连+首字节）耗时
+//	×N                — 上游尝试次数（>1 表示 global 404/405 fallback 重试）
+//
+// 不变量（upstream.ChatTiming.Total() ≤ 本行 total）：分段合计必然不超过总耗时，
+// 差值即 handler 自身开销。若违反则该观测本身不可信——见 timing_test.go 断言。
+func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks int, timing upstream.ChatTiming) {
 	if !chatLogEnabled {
 		return
 	}
@@ -290,7 +306,13 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
-	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | total=%.1fs |\n",
+	// 分段字段：仅在采集到数据时展示（未采集保持旧行形态，零回归）。
+	segField := ""
+	if timing.Attempts > 0 {
+		segField = fmt.Sprintf(" | seg=prep%dms/do%dms×%d",
+			timing.Prepare.Milliseconds(), timing.Do.Milliseconds(), timing.Attempts)
+	}
+	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s%s | tok=%s | %stok/s | total=%.1fs |\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
@@ -298,6 +320,7 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 		status,
 		uidPrefix(uid),
 		ttfbMS,
+		segField,
 		tokField,
 		tokpsField,
 		total.Seconds(),

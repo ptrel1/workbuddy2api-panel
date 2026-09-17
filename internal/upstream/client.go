@@ -908,14 +908,27 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta Cha
 //
 // global 首次路径 404/405 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody
 // 后统一套用全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128）。
+// timing 为纯观测出参（见 timing.go）：nil = 不采集。分段耗时**不参与任何
+// 判定/重试/熔断**，仅回填给调用方写日志（零行为变更）。
 func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
+	return c.ChatStreamContextTimed(ctx, a, body, clientIP, meta, nil)
+}
+
+// ChatStreamContextTimed 是 ChatStreamContext 的带观测版本：额外把分段耗时写入
+// timing（nil = 不采集）。控制流与 ChatStreamContext 逐字一致，仅为可观测性插桩。
+// timing 每次写入都受 nil 判断保护，无 nil panic 面。
+func (c *Client) ChatStreamContextTimed(ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta, timing *ChatTiming) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	// global 首次路径 404/405 时换 fallback 路径重试。
+	prepStart := time.Now()
 	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
+	}
+	if timing != nil {
+		timing.Prepare = time.Since(prepStart)
 	}
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 +
@@ -931,7 +944,16 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
 		reqCtx, cancel := context.WithCancel(ctx)
 		req = req.WithContext(reqCtx)
+		// Do 段计时：包住「连接获取 + 请求写出 + 响应头到达」。与 CancelFunc 无关，
+		// 故 cancel() 分支不影响该计时（只观测不干预）。attempts 每次尝试都累加，
+		// 用于识别 fallback 重试造成的总耗时翻倍。
+		doStart := time.Now()
 		resp, err := c.chatHTTP().Do(req)
+		doCost := time.Since(doStart)
+		if timing != nil {
+			timing.Do += doCost
+			timing.Attempts++
+		}
 		if err != nil {
 			cancel()
 			log.Printf("ERR: [upstream] chat_stream uid=%s: transport error: %v", logfmt.UID8(a.UID), err)

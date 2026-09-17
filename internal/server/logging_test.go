@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // captureStdout 重定向 os.Stdout（连同 chatLogOut，见 SetChatLogOutput 的注入点）
@@ -152,7 +153,7 @@ func TestUIDPrefix(t *testing.T) {
 func TestLogChatRowFormat(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", "00e26541abcdef", http.StatusOK, 1234)
+		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", "00e26541abcdef", http.StatusOK, 1234, upstream.ChatTiming{})
 	})
 	for _, want := range []string{
 		"| #", "deepseek-v4", "| stream |", "| 200 |", "uid=00e26541", "TTFB=412ms", "tok=1234", "tok/s |", "total=",
@@ -169,7 +170,7 @@ func TestLogChatRowFormat(t *testing.T) {
 func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", http.StatusServiceUnavailable, -1)
+		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", http.StatusServiceUnavailable, -1, upstream.ChatTiming{})
 	})
 	for _, want := range []string{"TTFB=-", "tok=-", "-tok/s", "| 503 |"} {
 		if !strings.Contains(out, want) {
@@ -181,8 +182,8 @@ func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 func TestLogChatRowSeqIncrements(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1)
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1)
+		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, upstream.ChatTiming{})
+		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, upstream.ChatTiming{})
 	})
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) != 2 {
@@ -290,5 +291,45 @@ func TestHealthzDoesNotLogTableRow(t *testing.T) {
 	})
 	if strings.Contains(out, "| #") {
 		t.Errorf("healthz/models/status must not emit table rows:\n%s", out)
+	}
+}
+
+// TestLogChatRowSegmentedShowsBreakdown 采集到分段耗时时，行内必须出现 seg= 段，
+// 且模型名截断/uid 前缀等既有语义不受影响。
+func TestLogChatRowSegmentedShowsBreakdown(t *testing.T) {
+	withChatLog(t)
+	out := captureStdout(t, func() {
+		logChatRow(2500*time.Millisecond, 3000*time.Millisecond, "deepseek-v4.1-flash", "stream", "00e26541abcdef", http.StatusOK, 1000,
+			upstream.ChatTiming{Prepare: 40 * time.Millisecond, Do: 1900 * time.Millisecond, Attempts: 1})
+	})
+	for _, want := range []string{"seg=prep40ms/do1900ms×1", "TTFB=2500ms"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("segmented row missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestLogChatRowNoTimingKeepsLegacyFormat 未采集分段（Attempts==0）时不得出现 seg= 段，
+// 保持旧行形态——这是「零回归」的显式回归网。
+func TestLogChatRowNoTimingKeepsLegacyFormat(t *testing.T) {
+	withChatLog(t)
+	out := captureStdout(t, func() {
+		logChatRow(100*time.Millisecond, time.Second, "m", "stream", "u1", http.StatusOK, 5, upstream.ChatTiming{})
+	})
+	if strings.Contains(out, "seg=") {
+		t.Errorf("未采集时应无 seg= 段，实际：\n%s", out)
+	}
+}
+
+// TestLogChatRowFallbackAttemptsShown 重试次数 >1 时必须在行内可见——
+// 「总耗时翻倍」的归因依赖该字段。
+func TestLogChatRowFallbackAttemptsShown(t *testing.T) {
+	withChatLog(t)
+	out := captureStdout(t, func() {
+		logChatRow(500*time.Millisecond, 6*time.Second, "m", "stream", "u1", http.StatusOK, 10,
+			upstream.ChatTiming{Prepare: 10 * time.Millisecond, Do: 5200 * time.Millisecond, Attempts: 2})
+	})
+	if !strings.Contains(out, "×2") {
+		t.Errorf("重试次数未展示：\n%s", out)
 	}
 }
