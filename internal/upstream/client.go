@@ -1115,6 +1115,26 @@ func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
 // 版本号需随上游 IDE 发版跟进：UAn 版本过旧时该端点可能同样返回精简目录。
 const codeBuddyIDEUA = "CodeBuddyIDE/4.12.0 CodeBuddy/4.12.0"
 
+// codeBuddyCLIUA 同一端点的 CLI 形态 UA。
+//
+// ✅ 20260917 实测：/v3/config 对 UA 敏感，两种 UA 返回**不同的模型目录**：
+//   - IDE UA：模型少但 maxOutputTokens **更高**（IDE 完整能力档）
+//   - CLI UA：模型**多**（CN 22 → 51）但共有模型的 maxOutputTokens 被压低
+//
+// 两者互不包含，故需**并集**才能看全。
+//
+// 为何 maxOutputTokens 取两者较大值（20260917 实测依据）：
+//   - 实测 IDE 声称的上限真的被接受：对 kimi-k3-1（IDE=1048576/CLI=32000）
+//     发 max_tokens=50000 上游返回 200 而非报错；glm-5.3-flash 同理（20000+ 也接受）。
+//     若上游真限制在 32K，超限请求应被拒而非静默接受。
+//   - 实测 IDE 值**从不小于** CLI 值（CN 20 个共有模型中 10 个 IDE 更大、
+//     10 个相同、0 个 CLI 更大），故“取较大值”实际等价于“IDE 值优先”。
+//
+// ⚠️ 保留不确定性声明：上游对 max_tokens 只是“接受”，未证实长输出不会在
+// 某个内部阈值被截断（实测到 1815 tokens 就停了，因模型自然结束）。
+// 故 UI 须保留“官方声称值仅供参考”的提示。
+const codeBuddyCLIUA = "WorkBuddy/5.5.4 WorkBuddy/5.5.4 CLI/2.137.1"
+
 // FetchModels 调上游动态模型接口（CN 侧；global 账号见 global_models.go 家族）。
 //
 // v3-config-merge：动态目录 = /v3/config（主，IDE UA 完整能力版）+ 企业端点
@@ -1277,21 +1297,46 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 // nonChatModel 规则剔除非对话条目（selected 会选模型报 code=11102）。
 // 失败返回错误（调用方降级为仅企业端点）。
 func (c *Client) fetchV3Models(a *auth.Auth) ([]ModelInfo, error) {
-	byID, err := c.fetchV3ConfigModelMap(a)
-	if err != nil {
-		return nil, err
+	// 双 UA 并集（见 v3union.go）：IDE 目录模型少但上限高，CLI 目录
+	// 模型多但上限低，两者互不包含（CN 22 vs 51），只取一路会丢模型。
+	// 主路 IDE：失败时降级为“仅 CLI”而非直接报错（两路均失败才错）。
+	ideMap, ideErr := c.fetchV3ConfigModelMapUA(a, codeBuddyIDEUA)
+	cliMap, cliErr := c.fetchV3ConfigModelMapUA(a, codeBuddyCLIUA)
+	if ideErr != nil && cliErr != nil {
+		return nil, ideErr // 两路全失败：返回主路错误（保持原语义）
 	}
-	out := make([]ModelInfo, 0, len(byID))
-	for _, mi := range byID {
+	if ideErr != nil {
+		log.Printf("WARN: [upstream] v3/config IDE-UA probe failed (CLI-UA only): %v", ideErr)
+	}
+	if cliErr != nil {
+		log.Printf("WARN: [upstream] v3/config CLI-UA probe failed (IDE-UA only): %v", cliErr)
+	}
+	ide := chatModelsOf(ideMap)
+	cli := chatModelsOf(cliMap)
+	out := unionV3(ide, cli)
+	if len(out) == 0 {
+		return nil, fmt.Errorf("v3/config returned empty models")
+	}
+	return out, nil
+}
+
+// chatModelsOf 把能力表转为**去非对话**的模型列表，并保持 id 升序以保证输出稳定（map
+// 迭代顺序随机，直接转列表会让同一数据每次拉到不同顺序）。
+func chatModelsOf(byID map[string]ModelInfo) []ModelInfo {
+	ids := make([]string, 0, len(byID))
+	for id := range byID {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]ModelInfo, 0, len(ids))
+	for _, id := range ids {
+		mi := byID[id]
 		if nonChatModel(mi.ID, mi.MaxTokens, mi.Tags) {
 			continue
 		}
 		out = append(out, mi)
 	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("v3/config returned empty models")
-	}
-	return out, nil
+	return out
 }
 
 // storeEfforts 按 realm 写入 effort 能力缓存桶（efforts + defaultEfforts），并发安全。
@@ -1339,9 +1384,18 @@ func v3ConfigDomain(a *auth.Auth, chatBase string) string {
 	return "copilot.tencent.com"
 }
 
-// fetchV3ConfigModelMap 拉官方 IDE 配置目录，按模型 id 建能力表。
+// fetchV3ConfigModelMap 拉官方 IDE 配置目录（IDE UA），按模型 id 建能力表。
 // 该端点对 UA 敏感：必须带 CodeBuddy/CodeBuddyIDE 版本，否则 400 code=12403。
 func (c *Client) fetchV3ConfigModelMap(a *auth.Auth) (map[string]ModelInfo, error) {
+	return c.fetchV3ConfigModelMapUA(a, codeBuddyIDEUA)
+}
+
+// fetchV3ConfigModelMapUA 同上，但显式指定 UA。
+//
+// 为何需要两种 UA：同一端点按 UA 返回**不同目录**
+// （见 codeBuddyCLIUA 注释）——IDE 目录模型少但上限高，
+// CLI 目录模型多但上限低，两者互不包含，需取并集。
+func (c *Client) fetchV3ConfigModelMapUA(a *auth.Auth, ua string) (map[string]ModelInfo, error) {
 	req, err := http.NewRequest(http.MethodGet, c.chatBase(a)+"/v3/config", nil)
 	if err != nil {
 		return nil, err
@@ -1354,7 +1408,7 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth) (map[string]ModelInfo, erro
 	}
 	req.Header.Set("X-Domain", v3ConfigDomain(a, c.chatBase(a)))
 	req.Header.Set("X-Product", "SaaS")
-	req.Header.Set("User-Agent", codeBuddyIDEUA)
+	req.Header.Set("User-Agent", ua)
 	c.injectCodeBuddyRequest(req)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {

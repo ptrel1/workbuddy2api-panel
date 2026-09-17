@@ -526,8 +526,10 @@ func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
 			],"agents":[{"name":"cli","models":["deepseek-v4.1-flash"]}]}}`), nil
 		case strings.HasSuffix(r.URL.Path, "/v3/config"):
 			sawIDE = true
-			if r.Header.Get("User-Agent") != codeBuddyIDEUA {
-				t.Errorf("v3/config UA=%q want %s", r.Header.Get("User-Agent"), codeBuddyIDEUA)
+			// 20260917 起 v3/config 用两种 UA 各探一次（IDE + CLI，
+			// 取模型并集，见 v3union.go）；两者均合法。
+			if ua := r.Header.Get("User-Agent"); ua != codeBuddyIDEUA && ua != codeBuddyCLIUA {
+				t.Errorf("v3/config UA=%q want %s or %s", ua, codeBuddyIDEUA, codeBuddyCLIUA)
 			}
 			if r.Header.Get("X-Product") != "SaaS" {
 				t.Errorf("X-Product=%q want SaaS", r.Header.Get("X-Product"))
