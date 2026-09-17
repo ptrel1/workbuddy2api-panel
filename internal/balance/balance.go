@@ -387,6 +387,16 @@ type Daily struct {
 	Max    int64  `json:"max"`
 	N      int    `json:"n"`    // 当日采样点数
 	Full   bool   `json:"full"` // 是否为完整一天（非今日、且点数达到预期）
+
+	// Consumed / Gained 当日「消耗」与「到账」估算量（相邻采样差值分正负累加）。
+	//
+	// 口径局限（UI 必须标注，见 cross/dev-principles.md 第十一节）：采样间隔 30
+	// 分钟，真实事件远密于此（实测 6 小时 2127 次请求 vs 14 个采样点）。同一
+	// 窗口内消耗与到账会被合并成一个净差，故 Consumed 是下界估计：窗口内若
+	// 既消耗又到账，只能观测到净值，真实消耗可能更高。它仍比只有 Change 有
+	// 信息量——Change 为 +262 时看不出「其实消耗了 124」。
+	Consumed int64 `json:"consumed"` // 相邻采样下降量之和，恒 >= 0
+	Gained   int64 `json:"gained"`   // 相邻采样上升量之和，恒 >= 0
 }
 
 // Snapshot 返回窗口内的余额序列。since 为零值 = 全部。
@@ -455,6 +465,9 @@ func dailyOf(pts []Point, now time.Time) []Daily {
 	type acc struct {
 		first, last, min, max int64
 		n                     int
+		consumed, gained      int64 // 相邻采样差值分正负累加（见 Daily 字段注释）
+		prev                  int64 // 上一采样值（算相邻差）
+		hasPrev               bool
 	}
 	m := map[string]*acc{}
 	var days []string
@@ -467,6 +480,17 @@ func dailyOf(pts []Point, now time.Time) []Daily {
 			days = append(days, day)
 		}
 		a.last = p.Credits
+		// 相邻采样差值分正负累加：涨 = 到账，跌 = 消耗。跨日时 a 是新建的，
+		// hasPrev=false 不会把昨日末值误算进今日。
+		if a.hasPrev {
+			if d := p.Credits - a.prev; d > 0 {
+				a.gained += d
+			} else if d < 0 {
+				a.consumed += -d
+			}
+		}
+		a.prev = p.Credits
+		a.hasPrev = true
 		if p.Credits < a.min {
 			a.min = p.Credits
 		}
@@ -488,7 +512,10 @@ func dailyOf(pts []Point, now time.Time) []Daily {
 			Min:    a.min,
 			Max:    a.max,
 			N:      a.n,
-			Full:   day != today && a.n >= expectedPerDay,
+
+			Consumed: a.consumed,
+			Gained:   a.gained,
+			Full:     day != today && a.n >= expectedPerDay,
 		})
 	}
 	return out

@@ -315,17 +315,60 @@ function outCell(m, pr) {
   return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--ink-3)">?</span><div class="note">未测出' + stale + '</div></td>';
 }
 
+/* 模型页当前域。与余额页同款：两域的模型目录不同（global 有 gpt-5.3-codex 等
+   只在 /v2 下发的模型），混在一起既看不到全貌也会串用数据。 */
+let mdRealm = null;
+
+/* renderMdRealmSeg 画模型页的域切换。只列**有账号的域**，账号数一并标出，
+   让"这个域有没有号"一眼可见（该域无号时后端会 503，提前拦住）。 */
+function renderMdRealmSeg(accounts) {
+  const seg = $('mdRealmSeg');
+  if (!seg) return;
+  const count = {};
+  (accounts || []).forEach(a => {
+    const r = a.realm === 'global' ? 'global' : 'cn';
+    count[r] = (count[r] || 0) + 1;
+  });
+  const items = BH_REALMS.filter(r => count[r.key]);
+  if (!items.length) { seg.innerHTML = ''; return; }
+  if (mdRealm === null || !count[mdRealm]) {
+    const remembered = (function () { try { return localStorage.getItem('mdRealm'); } catch (e) { return null; } })();
+    mdRealm = (remembered && count[remembered]) ? remembered : items[0].key;
+  }
+  seg.innerHTML = items.map(r =>
+    '<button type="button" aria-pressed="' + (r.key === mdRealm ? 'true' : 'false') + '" data-realm="' + esc(r.key) + '">' +
+    esc(r.label) + ' · ' + count[r.key] + '</button>').join('');
+  Array.prototype.forEach.call(seg.querySelectorAll('button'), function (b) {
+    b.onclick = function () {
+      mdRealm = b.getAttribute('data-realm');
+      try { localStorage.setItem('mdRealm', mdRealm); } catch (e) { /* 隐私模式：忽略 */ }
+      loadModels();
+    };
+  });
+}
+
 async function loadModels() {
   const tb = $('mdBody');
   tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
+    // 账号列表用于画域切换（无号域提前禁用，避免点了才 503）
+    let accts = [];
+    try { const ov = await api('overview'); accts = ov.accounts || []; } catch (e) { /* 忽略 */ }
+    renderMdRealmSeg(accts);
+    const realm = mdRealm || 'cn';
+
     // 探测数据是可选增强：拉取失败不影响模型列表本身
-    const [d, pr] = await Promise.all([api('models'), api('model_probes').catch(() => ({}))]);
+    const [d, pr] = await Promise.all([
+      api('models?realm=' + encodeURIComponent(realm)),
+      api('model_probes').catch(() => ({})),
+    ]);
     const list = d.models || [];
-    if (!list.length) { tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>'; return; }
+    if (!list.length) { tb.innerHTML = '<tr><td colspan="7"><div class="empty">该域上游未返回模型</div></td></tr>'; return; }
     const probes = pr.probes || {};
-    const probeKeys = Object.keys(probes);
-    const probeOf = id => probes[id] || probes[probeKeys.find(k => k.endsWith(':' + id))];
+    // 探测键带域前缀（cn:glm-5.2）。**必须按当前域精确匹配**，不能用
+    // endsWith(':'+id) 模糊找 —— 跨域同名模型（如两域都有 deepseek-v4.1）
+    // 时 find() 只会命中第一个，导致 global 表格显示 cn 的探测结果。
+    const probeOf = id => probes[realm + ':' + id] || probes[id];
     tb.innerHTML = list.map(m => {
       const eff = (m.supported_efforts || []).slice();
       if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
@@ -347,7 +390,7 @@ async function loadModels() {
         outCell(m, probeOf(m.id)) + '</tr>';
     }).join('');
     const hit = list.filter(m => probeOf(m.id)).length;
-    $('mdNote').textContent = list.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
+    $('mdNote').textContent = realmLabel(realm) + ' · ' + list.length + ' 个模型' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
   } catch (e) {
     tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
   }
@@ -1598,6 +1641,18 @@ function fmtChange(v, full) {
     (full ? '' : ' title="该日采样不完整（当天未结束或中途启用），不宜与完整日直接比较"') + '>' + txt + '</span>';
 }
 
+/* fmtFlow 渲染「消耗/到账」这类恒非负的流量值。
+   与 fmtChange 的区别：这些量不表示方向（消耗恒 >=0），故不用涨跌色，
+   用中性色 + 弱化不完整日。0 显示为 "–"（无变化比 "0" 更易扫读）。 */
+function fmtFlow(v, full) {
+  if (v === null || v === undefined) return '—';
+  const n = Number(v);
+  if (!n) return '<span style="color:var(--ink-3)">–</span>';
+  return '<span style="color:var(--ink-2)' + (full ? '' : '; opacity:.6') + '"' +
+    (full ? '' : ' title="该日采样不完整，消耗/到账均为下界估计，不宜与完整日直接比较"') + '>' +
+    fmtNum(n) + '</span>';
+}
+
 function fmtNum(v) {
   const n = Number(v) || 0;
   return n.toLocaleString('zh-CN');
@@ -1644,10 +1699,13 @@ async function loadBalance() {
       (function () {
         const t = dayChangeOf(s, 'today'), y = dayChangeOf(s, 'yesterday');
         return '<td class="num">' + fmtChange(t && t.change, t && t.full) + '</td>' +
-               '<td class="num">' + fmtChange(y && y.change, y && y.full) + '</td>';
+               '<td class="num">' + fmtChange(y && y.change, y && y.full) + '</td>' +
+               // 今日消耗/到账：不完整日按弱化显示（口径与今日列一致）
+               '<td class="num">' + fmtFlow(t && t.consumed, t && t.full) + '</td>' +
+               '<td class="num">' + fmtFlow(t && t.gained, t && t.full) + '</td>';
       })() +
       '<td class="num">' + (s.points || []).length + '</td></tr>').join('')
-      : '<tr><td colspan="9"><div class="empty"><div class="big">该域暂无采样</div>' +
+      : '<tr><td colspan="11"><div class="empty"><div class="big">该域暂无采样</div>' +
         '切到其他域，或等待下一次余额刷新</div></td></tr>';
     renderBalanceFoot(rows);
     const note = $('bhNote');
@@ -1669,6 +1727,7 @@ function renderBalanceFoot(rows) {
   if (!rows.length) { host.innerHTML = ''; return; }
   let cur = 0, chg = 0, pts = 0;
   let todaySum = 0, todayHas = false, ydaySum = 0, ydayHas = false;
+  let consSum = 0, consHas = false, gainSum = 0, gainHas = false;
   rows.forEach(s => {
     cur += Number(s.current || 0);
     chg += Number(s.change || 0);
@@ -1676,6 +1735,9 @@ function renderBalanceFoot(rows) {
     const t = dayChangeOf(s, 'today'), y = dayChangeOf(s, 'yesterday');
     if (t && typeof t.change === 'number') { todaySum += t.change; todayHas = true; }
     if (y && typeof y.change === 'number') { ydaySum += y.change; ydayHas = true; }
+    // 消耗/到账可跨账号相加（都是同域的绝对量），但**同为下界估计**
+    if (t && typeof t.consumed === 'number') { consSum += t.consumed; consHas = true; }
+    if (t && typeof t.gained === 'number') { gainSum += t.gained; gainHas = true; }
   });
   const num = (v, has) => has
     ? '<td class="num" style="color:' + (v > 0 ? 'var(--ok)' : v < 0 ? 'var(--bad)' : 'inherit') + '">' +
@@ -1691,8 +1753,17 @@ function renderBalanceFoot(rows) {
     '<td class="num" style="color:' + (chg > 0 ? 'var(--ok)' : chg < 0 ? 'var(--bad)' : 'inherit') + '">' +
       (chg > 0 ? '+' : '') + fmtNum(chg) + '</td>' +
     num(todaySum, todayHas) + num(ydaySum, ydayHas) +
+    flowCell(consSum, consHas) + flowCell(gainSum, gainHas) +
     '<td class="num">' + fmtNum(pts) + '</td>' +
     '</tr>';
+}
+
+/* flowCell 合计行的流量单元格（消耗/到账）。无数据显示 —，有数据显示数值。
+   注意：合计值同为**下界估计**（各账号的采样漏掉量不因求和而补回）。 */
+function flowCell(v, has) {
+  return has
+    ? '<td class="num">' + (v ? fmtNum(v) : '<span style="color:var(--ink-3)">–</span>') + '</td>'
+    : '<td class="num na">—</td>';
 }
 
 /* realmLabel 域 key 到展示名。 */

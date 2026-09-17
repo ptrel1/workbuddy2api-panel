@@ -568,6 +568,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <header>
           <h3>模型能力 <span class="hint">官方返回的最大输出仅为参考——实测多数模型实际被限制在 40K 左右（如 deepseek-v4.1-flash 仅 32K），配置 max_tokens 时请自行留意，以免长输出被静默截断</span></h3>
           <span class="grow"></span>
+          <span class="seg" id="mdRealmSeg"></span>
           <span class="note" id="mdNote">实时查询上游</span>
           <button class="xs" id="btnModels">重新获取</button>
         </header>
@@ -626,7 +627,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <thead><tr>
               <th class="mark" aria-hidden="true"></th><th>账号</th>
               <th class="num">当前</th><th class="num">最低</th><th class="num">最高</th>
-              <th class="num">净变化</th><th class="num">今日</th><th class="num">昨日</th><th class="num">采样点</th>
+              <th class="num">净变化</th><th class="num">今日</th><th class="num">昨日</th><th class="num" title="按 30 分钟采样估算的当日消耗（相邻采样下降量之和）。因采样间隔远粗于真实事件密度，同一窗口内的消耗与到账会被合并为净差，故这是下界估计，实际消耗可能更高。">今日消耗*</th><th class="num" title="按 30 分钟采样估算的当日到账（相邻采样上升量之和）。口径与「今日消耗*」相同，为下界估计。">今日到账*</th><th class="num">采样点</th>
             </tr></thead>
             <tbody id="bhAccBody"></tbody>
             <tfoot id="bhAccFoot"></tfoot>

@@ -248,9 +248,19 @@ func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
 // 回答"该模型到底支持哪几档思考"。顺带刷新 client 的 effort 降级能力缓存。
 // 无可用账号 503（先添加账号）；上游失败 502。
 func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
-	acct := p.cfg.Pool.Pick()
+	// realm 选择按哪个域取模型目录，缺省 cn（与历史行为一致）。
+	//
+	// 修（20260917）：此前用 Pool.Pick() 取随机一个账号查目录，该账号可能属 cn
+	// 也可能属 global，而两域的上游 base 与模型目录都不同，导致同一页面刷新两次
+	// 可能看到不同列表（同一输入不同输出，属不确定性缺陷）。现按指定域取号。
+	// 见 cross/dev-principles.md 第十四节。
+	realm := r.URL.Query().Get("realm")
+	if realm == "" {
+		realm = "cn"
+	}
+	acct := p.cfg.Pool.PickExcludingForRealm(nil, "", realm)
 	if acct == nil {
-		writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
+		writeErr(w, http.StatusServiceUnavailable, "该域没有可用账号（realm="+realm+"）：请先添加账号或切换域")
 		return
 	}
 	infos, err := p.cfg.Upstream.FetchModels(acct)
@@ -289,7 +299,8 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		if mo, ok := upstream.MaxOutputTokensListingV4(mi.ID, mi.MaxTokens, p.cfg.Upstream.HTTP); ok {
 			entry["max_output_tokens"] = mo
 		}
-		if efforts, def := upstream.EffortListing("cn", mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
+		// 按账号**实际**域取 effort 档位（此前写死 "cn"，global 模型会误用 cn 表）。
+		if efforts, def := upstream.EffortListing(realm, mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
 			entry["supported_efforts"] = efforts
 			if def != "" {
 				entry["default_effort"] = def
@@ -297,7 +308,8 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, entry)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
+	// 回显 realm：前端据此标注"当前看的是哪个域"，避免把某个域的数字误当全局（§十四）。
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "realm": realm, "models": out})
 }
 
 // modelProbes 返回模型输出上限的探测结果（scripts/probe_max_tokens.py --panel-out

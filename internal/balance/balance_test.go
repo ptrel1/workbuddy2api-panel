@@ -480,3 +480,98 @@ func TestSetRealmNotPersisted(t *testing.T) {
 		t.Errorf("realm 不应入盘，实际文件含 cn：\n%s", raw)
 	}
 }
+
+// TestDailyConsumedGained 消耗/到账必须由相邻采样差值分正负累加得出，
+// 且与净变化满足恒等式：Change == Gained - Consumed。
+//
+// 该恒等式是本字段的正确性判据：若破坏（如把跨日差值也累加进来、
+// 或漏算首点），三者会对不上。见 dev-principles.md 第十节（不得产出
+// 语义上不可能的值：消耗/到账都恒 >= 0）。
+func TestDailyConsumedGained(t *testing.T) {
+	r := New("")
+	// 逐点推进时钟，全部落在同一天内
+	base := time.Date(2026, 9, 17, 10, 0, 0, 0, time.Local)
+	cur := base
+	r.clock = func() time.Time { return cur }
+	step := 31 * time.Minute
+
+	// 100 -> 130 (+30 到账) -> 110 (-20 消耗) -> 150 (+40 到账) -> 120 (-30 消耗)
+	for _, v := range []int64{100, 130, 110, 150, 120} {
+		r.Add("u1", v)
+		cur = cur.Add(step)
+	}
+
+	series, _ := r.Snapshot(time.Time{})
+	if len(series) != 1 || len(series[0].Daily) != 1 {
+		t.Fatalf("want 1 series with 1 day, got %+v", series)
+	}
+	d := series[0].Daily[0]
+	if d.Gained != 70 { // 30 + 40
+		t.Errorf("Gained = %d, want 70", d.Gained)
+	}
+	if d.Consumed != 50 { // 20 + 30
+		t.Errorf("Consumed = %d, want 50", d.Consumed)
+	}
+	if d.Change != d.Gained-d.Consumed {
+		t.Errorf("恒等式破坏：Change=%d != Gained(%d) - Consumed(%d)", d.Change, d.Gained, d.Consumed)
+	}
+	if d.Consumed < 0 || d.Gained < 0 {
+		t.Errorf("消耗/到账不得为负：consumed=%d gained=%d", d.Consumed, d.Gained)
+	}
+}
+
+// TestDailyConsumedNotCrossDay 跨日的相邻点不得互相累加：
+// 昨日末值 → 今日首值 的差值属于隔夜变化，不是今天的消耗/到账。
+func TestDailyConsumedNotCrossDay(t *testing.T) {
+	r := New("")
+	cur := time.Date(2026, 9, 16, 23, 30, 0, 0, time.Local)
+	r.clock = func() time.Time { return cur }
+	step := 31 * time.Minute
+
+	r.Add("u1", 100)    // 09-16 23:30
+	cur = cur.Add(step) // -> 09-17 00:01
+	r.Add("u1", 500)    // 跨日大涨 400：不应算进任一天的 gained
+	cur = cur.Add(step)
+	r.Add("u1", 480) // 09-17 内跌 20
+
+	series, _ := r.Snapshot(time.Time{})
+	if len(series) != 1 {
+		t.Fatalf("want 1 series, got %d", len(series))
+	}
+	days := series[0].Daily
+	if len(days) != 2 {
+		t.Fatalf("want 2 days, got %d: %+v", len(days), days)
+	}
+	for _, d := range days {
+		if d.Day == "2026-09-16" {
+			if d.Gained != 0 || d.Consumed != 0 {
+				t.Errorf("09-16 不该有流量（单点无相邻）：gained=%d consumed=%d", d.Gained, d.Consumed)
+			}
+		}
+		if d.Day == "2026-09-17" {
+			// 该日只有 500 -> 480 一对，跌 20；500 相对昨日 100 的 +400 不算今日到账
+			if d.Gained != 0 {
+				t.Errorf("09-17 Gained = %d, want 0（跨日涨幅不该算今日到账）", d.Gained)
+			}
+			if d.Consumed != 20 {
+				t.Errorf("09-17 Consumed = %d, want 20", d.Consumed)
+			}
+		}
+	}
+}
+
+// TestDailyZeroFlowIsZero 余额全程不变时，消耗/到账必须都是 0（不是负值、不是残留）。
+func TestDailyZeroFlowIsZero(t *testing.T) {
+	r := New("")
+	cur := time.Date(2026, 9, 17, 10, 0, 0, 0, time.Local)
+	r.clock = func() time.Time { return cur }
+	for i := 0; i < 3; i++ {
+		r.Add("u1", 349)
+		cur = cur.Add(31 * time.Minute)
+	}
+	series, _ := r.Snapshot(time.Time{})
+	d := series[0].Daily[0]
+	if d.Consumed != 0 || d.Gained != 0 || d.Change != 0 {
+		t.Errorf("余额恒定时应为全零：%+v", d)
+	}
+}

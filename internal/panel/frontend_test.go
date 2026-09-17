@@ -5,6 +5,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/balance"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -240,6 +241,107 @@ func TestFailoverColorSemantics(t *testing.T) {
 func readAppJS(t *testing.T) string {
 	t.Helper()
 	path, err := filepath.Abs("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// TestModelPageRealmParam 模型页必须按域取数：接口接受 realm 参数，
+// 且用 PickExcludingForRealm 而非 Pick()。
+//
+// 为什么：Pick() 取**随机账号**，其域是偶然的 —— 而 cn/global 的上游 base 与
+// 模型目录**都不同**，导致同一页面刷新两次可能看到不同列表
+// （同一输入不同输出 = 不确定性缺陷）。见 dev-principles.md 第十四节。
+func TestModelPageRealmParam(t *testing.T) {
+	// APIKey 置空 = 不鉴权，直接进 handler（本测试只关心域参数的路由与文案）
+	p := New(Config{Version: "test", APIKey: "", Pool: pool.New("")})
+	rec := httptest.NewRecorder()
+	// 无账号时返回 503，但错误文案必须点出所请求的域（便于自查）
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/api/models?realm=global", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503（测试面板无账号）", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "global") {
+		t.Errorf("503 文案未点出所请求的域，排查困难：%s", rec.Body.String())
+	}
+}
+
+// TestModelsNoRandomPick 行为级守卫：模型接口不得再用 Pool.Pick()（随机账号）。
+// 源码级断言，因为该缺陷的表现是"结果不确定"，无法用单次调用断言。
+func TestModelsNoRandomPick(t *testing.T) {
+	path, _ := filepath.Abs("panel.go")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	i := strings.Index(src, "func (p *Panel) models(")
+	if i < 0 {
+		t.Fatal("models handler 不存在")
+	}
+	j := strings.Index(src[i:], "\n}\n")
+	body := src[i : i+j]
+	// 逐行剥离行注释后再判断：函数头注释里提到 Pool.Pick() 是说明历史缺陷，
+	// 不能因此判红（变异测试暴露：直接 Contains 会被自己的注释骗过）。
+	var code strings.Builder
+	for _, ln := range strings.Split(body, "\n") {
+		if k := strings.Index(ln, "//"); k >= 0 {
+			ln = ln[:k]
+		}
+		code.WriteString(ln)
+		code.WriteString("\n")
+	}
+	if strings.Contains(code.String(), "Pool.Pick()") {
+		t.Error("models 仍用 Pool.Pick()（随机账号）——两域目录不同会导致刷新结果飘忽")
+	}
+	if !strings.Contains(body, "PickExcludingForRealm") {
+		t.Error("models 未按域取号（PickExcludingForRealm）")
+	}
+	// effort 档位不得写死 "cn"
+	if strings.Contains(body, `EffortListing("cn"`) {
+		t.Error(`EffortListing 仍写死 "cn"——global 模型会误用 cn 档位表`)
+	}
+	if !strings.Contains(body, "EffortListing(realm") {
+		t.Error("EffortListing 未使用请求的 realm")
+	}
+}
+
+// TestModelProbeKeyExactMatch 探测键必须按「域前缀精确匹配」，不得用
+// endsWith(':'+id) 模糊查找 —— 跨域同名模型时 find() 只命中第一个，
+// 会让 global 表格显示 cn 的探测结果（静默串数据）。
+func TestModelProbeKeyExactMatch(t *testing.T) {
+	src := readAppJS(t)
+	if strings.Contains(src, "endsWith(':' + id)") || strings.Contains(src, `endsWith(":" + id)`) {
+		t.Error("probeOf 仍用 endsWith 模糊匹配——跨域同名模型会串用探测数据")
+	}
+	if !strings.Contains(src, "probes[realm + ':' + id]") {
+		t.Error("probeOf 未按 realm 前缀精确匹配")
+	}
+}
+
+// TestMdRealmSegWired 模型页的域切换器必须存在且与账�balances 页共用 BH_REALMS。
+func TestMdRealmSegWired(t *testing.T) {
+	js := readAppJS(t)
+	for _, want := range []string{"mdRealmSeg", "renderMdRealmSeg", "let mdRealm"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js 缺少 %q", want)
+		}
+	}
+	html := readIndexHTML(t)
+	if !strings.Contains(html, `id="mdRealmSeg"`) {
+		t.Error("index.html 缺少模型页域切换容器 #mdRealmSeg")
+	}
+}
+
+// readIndexHTML 读取 index.html 源码文本。
+func readIndexHTML(t *testing.T) string {
+	t.Helper()
+	path, err := filepath.Abs("index.html")
 	if err != nil {
 		t.Fatal(err)
 	}
