@@ -86,6 +86,14 @@ type Recorder struct {
 	// names uid → 昵称，仅供 API 展示（不入盘：账号改名不影响历史数据）。
 	names map[string]string
 
+	// realms uid 到账号域（"cn"/"global"）的映射，仅供 API 分组展示（不入盘）。
+	//
+	// 语义：这是账号的**当前属性**，不是采样时刻的快照。账号重登/换域后，
+	// 其全部历史点都会归入新域——有意取舍：realm 极少变化，变了通常意味着
+	// 账号重登（历史余额本就该随账号归新域）；若把 realm 写进 Point，内存会
+	// 放大 maxPoints 倍且结构复杂化，收益不抵成本。
+	realms map[string]string
+
 	clock func() time.Time // 便于测试注入
 
 	stopOnce sync.Once
@@ -98,6 +106,7 @@ func New(path string) *Recorder {
 	r := &Recorder{
 		path:       path,
 		names:      map[string]string{},
+		realms:     map[string]string{},
 		clock:      time.Now,
 		lastSample: map[string]time.Time{},
 		stop:       make(chan struct{}),
@@ -121,6 +130,18 @@ func (r *Recorder) SetName(uid, name string) {
 	}
 	r.mu.Lock()
 	r.names[uid] = name
+	r.mu.Unlock()
+}
+
+// SetRealm 记录账号所属域（"cn"/"global"），供面板按域分组展示。
+// 与 SetName 同为展示元数据：不入盘，进程重启后由面板重新注入。
+// realm 为空时忽略（不清除已有值，避免上游偶发空值抹掉已记录的域）。
+func (r *Recorder) SetRealm(uid, realm string) {
+	if r == nil || uid == "" || realm == "" {
+		return
+	}
+	r.mu.Lock()
+	r.realms[uid] = realm
 	r.mu.Unlock()
 }
 
@@ -345,6 +366,10 @@ type Series struct {
 	Max     int64   `json:"max"`
 	Change  int64   `json:"change"`          // 窗口内净变化（末 - 首）
 	Daily   []Daily `json:"daily,omitempty"` // 按日聚合（升序），供每日对照视图
+	// Realm 账号域（"cn"/"global"），供前端分域切换。
+	// cn 与 global 的积分不同源、不可互换，跨域求和语义不成立，故 UI 必须分域展示。
+	// 空 = 未注入（未调 SetRealm），前端归入 other 组。
+	Realm string `json:"realm,omitempty"`
 }
 
 // Daily 单账号某一天的余额变化（供「每日变化对照」）。
@@ -387,7 +412,7 @@ func (r *Recorder) Snapshot(since time.Time) ([]Series, time.Time) {
 	out := make([]Series, 0, len(byUID))
 	for uid, pts := range byUID {
 		sort.Slice(pts, func(i, j int) bool { return pts[i].TS < pts[j].TS })
-		s := Series{UID: uid, Name: r.names[uid], Points: pts}
+		s := Series{UID: uid, Name: r.names[uid], Points: pts, Realm: r.realms[uid]}
 		if n := len(pts); n > 0 {
 			s.Current = pts[n-1].Credits
 			s.Min, s.Max = pts[0].Credits, pts[0].Credits

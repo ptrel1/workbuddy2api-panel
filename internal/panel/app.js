@@ -1337,7 +1337,46 @@ function fmtTokTip(v) { return fmtTok(v); }
 /* ── 余额趋势 ────────────────────────────────────────────────────────
    与「用量」视图的区别：用量是事件驱动的流量（柱状），余额是定时采样的存量
    水位（折线）。每账号一条线；涨跌用圆点标记，到账/消耗一眼可辨。 */
-const BH_COLORS = ['var(--accent)', 'var(--ok)', 'var(--warn)', 'var(--bad)', '#9b6dff', '#26b3c9'];
+/* 账号身份色板。刻意**不含** var(--ok)/var(--bad) —— 绿/红已被「净增/净减」
+   语义占用（每日变化柱），若账号色复用它们会产生双重编码冲突：同一颜色
+   有两个互斥含义（"涨" vs "某账号"），读者必然误读。详见 §十一 同源纪律：
+   一个视觉通道只承载一种含义。6 色循环，够覆盖单域常见账号数。 */
+const BH_COLORS = ['var(--accent)', '#9b6dff', '#26b3c9', 'var(--warn)', '#e879a6', '#7d8cff'];
+
+/* 域元数据：cn = 国内（CodeBuddy），global = 国际（WorkBuddy）。
+   两域的积分不同源、不可互换（连上游 base 与模型目录都不同），
+   因此**跨域求和语义不成立** —— 余额趋势与模型页都必须分域展示，
+   不做"国内 + 国际"的全局总计。 */
+const BH_REALMS = [
+  { key: 'cn', label: '国内' },
+  { key: 'global', label: '国际' },
+];
+/* bhRealm 当前选中的域。null = 尚未初始化（首次加载时按数据自动选一个非空域）。 */
+let bhRealm = null;
+
+/* realmOf 归一化账号域：空/未知归入 'other'（不静默丢弃，让它可见）。 */
+function realmOf(s) {
+  const r = (s && s.realm) || '';
+  return r === 'cn' || r === 'global' ? r : 'other';
+}
+
+/* pickRealm 选择默认域：优先记住的选择，其次第一个有数据的已知域。 */
+function pickRealm(rows) {
+  const have = {};
+  rows.forEach(s => { have[realmOf(s)] = true; });
+  const remembered = (function () {
+    try { return localStorage.getItem('bhRealm'); } catch (e) { return null; }
+  })();
+  if (remembered && have[remembered]) return remembered;
+  const first = BH_REALMS.find(r => have[r.key]);
+  if (first) return first.key;
+  return have.other ? 'other' : (BH_REALMS[0] && BH_REALMS[0].key) || 'cn';
+}
+
+/* filterRealm 取当前域的账号行。 */
+function filterRealm(rows, realm) {
+  return rows.filter(s => realmOf(s) === realm);
+}
 
 /* renderBalanceChart 画多账号余额折线。
    x 轴按**真实时间比例**排布（30 分钟等间隔），而非数据序号等距——
@@ -1460,8 +1499,18 @@ function renderDailyBars(series) {
     if (d.change > hi) hi = d.change;
     if (d.change < lo) lo = d.change;
   }));
-  const span = Math.max(1, Math.max(hi, -lo));
-  hi = span; lo = -span;
+  // 上下独立缩放 + 各留 12% 余量（不再强制对称）。
+  // 为什么：强制对称（hi=lo=-span）在"几乎只涨"的数据上会把下半区留成
+  // 5 倍空白（实测 +1998/-393 → 轴 ±1998），视觉上又空又怪，且正柱贴顶。
+  // 独立缩放让柱高比例真实反映数值比例。
+  // 边界断言（§十：不得产出物理上不可能的值）：日变化可正可负，故只在
+  // 该侧确有数据时才外扩；两侧都无数据时兜底 ±1 避免除零。
+  if (hi > 0) hi *= 1.12;
+  if (lo < 0) lo *= 1.12;
+  // 单侧有数据时，给另一侧留一点呼吸空间，否则零轴贴边、柱子像被裁掉。
+  if (hi > 0 && lo === 0) lo = -Math.max(1, hi * 0.15);
+  if (lo < 0 && hi === 0) hi = Math.max(1, -lo * 0.15);
+  if (hi === 0 && lo === 0) { hi = 1; lo = -1; }
 
   const W = 760, H = 180, PL = 56, PR = 12, PT = 14, PB = 34;
   const iw = W - PL - PR, ih = H - PT - PB;
@@ -1470,14 +1519,14 @@ function renderDailyBars(series) {
 
   const nAcc = Math.max(1, series.length);
   const groupW = iw / days.length;
-  const bw = Math.max(2, Math.min(14, (groupW - 8) / nAcc));
+  const bw = Math.max(2, Math.min(14, (groupW - 8 - Math.max(0, nAcc - 1)) / nAcc));
 
   let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" role="img">';
   // 网格（4 档）+ 零轴加粗
   for (let i = 0; i <= 4; i++) {
     const v = lo + (hi - lo) * i / 4;
     const y = Y(v);
-    const isZero = Math.abs(v) < span / 8;
+    const isZero = Math.abs(v) < Math.max(hi, -lo) / 8;
     out += '<line class="' + (isZero ? 'ax' : 'gl') + '" x1="' + PL + '" y1="' + y.toFixed(1) +
       '" x2="' + (W - PR) + '" y2="' + y.toFixed(1) + '"/>';
     out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5).toFixed(1) + '" text-anchor="end">' +
@@ -1490,7 +1539,10 @@ function renderDailyBars(series) {
       const v = (map.get(s.uid) || {})[day];
       if (v === undefined) return;
       const color = BH_COLORS[si % BH_COLORS.length];
-      const x = gx + (groupW - bw * nAcc) / 2 + si * bw;
+      // 组内柱之间留 1px 缝：无缝隙时相邻两柱会被知觉成一个整体
+      // （格式塔共边界效应），看不出"两根独立的柱"。
+      const gap = nAcc > 1 ? 1 : 0;
+      const x = gx + (groupW - (bw * nAcc + gap * (nAcc - 1))) / 2 + si * (bw + gap);
       const y0 = Math.min(zeroY, Y(v)), h = Math.max(1, Math.abs(Y(v) - zeroY));
       const incomplete = fullMap.get(s.uid + '|' + day);
       // 零值画一条中性底痕（与 buka 规范一致：0 值也要可见）
@@ -1516,10 +1568,17 @@ function renderDailyBars(series) {
   out += '</svg>';
   host.innerHTML = out;
 
+  // 图例：柱色表示**涨跌**（绿=净增、红=净减），不表示账号——账号由组内
+  // 左→右的位置区分（与下方表格行序一致）。故这里只说明颜色语义，
+  // 再按位置列出账号顺序，避免"颜色=账号"的错误暗示。
   const lg = $('bhDailyLegend');
-  if (lg) lg.innerHTML = series.map((s, i) =>
-    '<i class="sw" style="background:' + BH_COLORS[i % BH_COLORS.length] + '"></i>' +
-    esc(s.name || s.uid.slice(0, 8))).join(' ');
+  if (lg) lg.innerHTML =
+    '<span class="lg-key"><i class="sw" style="background:var(--ok)"></i>净增</span>' +
+    '<span class="lg-key"><i class="sw" style="background:var(--bad)"></i>净减</span>' +
+    '<span class="lg-sep"></span>' +
+    '<span class="lg-order">组内左→右：' +
+    series.map((s, i) => (i + 1) + '. ' + esc(s.name || s.uid.slice(0, 8))).join('　') +
+    '</span>';
 }
 
 /* 取某账号的「今日/昨日」变化（用于表格列）。 */
@@ -1554,9 +1613,17 @@ async function loadBalance() {
   const days = Number(($('bhWindow') || {}).value || 30);
   try {
     const d = await api('balance_history?days=' + days);
-    const rows = d.series || [];
+    const all = d.series || [];
+    // 首次进入（或记忆的域已无数据）时确定默认域；之后保持用户的显式选择。
+    if (bhRealm === null || !all.some(s => realmOf(s) === bhRealm)) {
+      bhRealm = pickRealm(all);
+    }
+    renderRealmSeg(all);
+    const rows = filterRealm(all, bhRealm);
     renderBalanceChart(rows);
     renderDailyBars(rows);
+    // 分域小计：同域内可加（语义成立）；**不做跨域总计**——cn 与 global 的
+    // 积分不同源、不可互换，相加得出的数没有意义（见 BH_REALMS 注释）。
     let total = 0, delta = 0;
     rows.forEach(s => { total += Number(s.current || 0); delta += Number(s.change || 0); });
     const st = $('bhStats');
@@ -1580,8 +1647,9 @@ async function loadBalance() {
                '<td class="num">' + fmtChange(y && y.change, y && y.full) + '</td>';
       })() +
       '<td class="num">' + (s.points || []).length + '</td></tr>').join('')
-      : '<tr><td colspan="9"><div class="empty"><div class="big">暂无采样</div>' +
-        '服务每 30 分钟自动记录一点余额</div></td></tr>';
+      : '<tr><td colspan="9"><div class="empty"><div class="big">该域暂无采样</div>' +
+        '切到其他域，或等待下一次余额刷新</div></td></tr>';
+    renderBalanceFoot(rows);
     const note = $('bhNote');
     if (note) note.textContent = '更新于 ' + new Date(d.now).toLocaleTimeString('zh-CN', { hour12: false });
   } catch (e) {
@@ -1589,10 +1657,72 @@ async function loadBalance() {
   }
 }
 
-if ($('btnBalHist')) $('btnBalHist').onclick = async () => {
-  try { await api('balance_all', { method: 'POST' }); } catch (e) { /* 忽略：仍重画历史 */ }
-  loadBalance();
-};
+/* renderBalanceFoot 画「按账号」表的合计行（**域内小计**）。
+   口径纪律（§十：不得产出语义错误的数）：
+     - 当前 / 净变化 / 今日 / 昨日 / 采样点 —— 可加，给出合计；
+     - 最低 / 最高 —— **不可加**！各账号的低谷/高峰不在同一时刻，
+       Σ最低 没有任何物理含义（会得出一个从未存在过的水位），故填 "—"。
+   不做跨域总计：cn 与 global 的积分不同源、不可互换（见 BH_REALMS）。 */
+function renderBalanceFoot(rows) {
+  const host = $('bhAccFoot');
+  if (!host) return;
+  if (!rows.length) { host.innerHTML = ''; return; }
+  let cur = 0, chg = 0, pts = 0;
+  let todaySum = 0, todayHas = false, ydaySum = 0, ydayHas = false;
+  rows.forEach(s => {
+    cur += Number(s.current || 0);
+    chg += Number(s.change || 0);
+    pts += (s.points || []).length;
+    const t = dayChangeOf(s, 'today'), y = dayChangeOf(s, 'yesterday');
+    if (t && typeof t.change === 'number') { todaySum += t.change; todayHas = true; }
+    if (y && typeof y.change === 'number') { ydaySum += y.change; ydayHas = true; }
+  });
+  const num = (v, has) => has
+    ? '<td class="num" style="color:' + (v > 0 ? 'var(--ok)' : v < 0 ? 'var(--bad)' : 'inherit') + '">' +
+      (v > 0 ? '+' : '') + fmtNum(v) + '</td>'
+    : '<td class="num na">—</td>';
+  host.innerHTML = '<tr>' +
+    '<td class="mark" aria-hidden="true"></td>' +
+    '<td>合计（' + esc(realmLabel(bhRealm)) + '）</td>' +
+    '<td class="num">' + fmtNum(cur) + '</td>' +
+    // 最低/最高不求和——见函数头注释
+    '<td class="num na" title="各账号低谷不在同一时刻，不可相加">—</td>' +
+    '<td class="num na" title="各账号高峰不在同一时刻，不可相加">—</td>' +
+    '<td class="num" style="color:' + (chg > 0 ? 'var(--ok)' : chg < 0 ? 'var(--bad)' : 'inherit') + '">' +
+      (chg > 0 ? '+' : '') + fmtNum(chg) + '</td>' +
+    num(todaySum, todayHas) + num(ydaySum, ydayHas) +
+    '<td class="num">' + fmtNum(pts) + '</td>' +
+    '</tr>';
+}
+
+/* realmLabel 域 key 到展示名。 */
+function realmLabel(key) {
+  const r = BH_REALMS.find(x => x.key === key);
+  return r ? r.label : '其他';
+}
+
+/* renderRealmSeg 画域切换分段控件。只列出**有数据的域**（避免点了空白页），
+   并在按钮上标明账号数，让"这个域有几个号"一眼可见。 */
+function renderRealmSeg(all) {
+  const seg = $('bhRealmSeg');
+  if (!seg) return;
+  const count = {};
+  all.forEach(s => { const r = realmOf(s); count[r] = (count[r] || 0) + 1; });
+  const items = BH_REALMS.filter(r => count[r.key]).concat(
+    count.other ? [{ key: 'other', label: '其他' }] : []);
+  if (!items.length) { seg.innerHTML = ''; return; }
+  seg.innerHTML = items.map(r =>
+    '<button type="button" aria-pressed="' + (r.key === bhRealm ? 'true' : 'false') + '" data-realm="' + esc(r.key) + '">' +
+    esc(r.label) + ' · ' + count[r.key] + '</button>').join('');
+  Array.prototype.forEach.call(seg.querySelectorAll('button'), function (b) {
+    b.onclick = function () {
+      bhRealm = b.getAttribute('data-realm');
+      try { localStorage.setItem('bhRealm', bhRealm); } catch (e) { /* 隐私模式：忽略 */ }
+      loadBalance();
+    };
+  });
+}
+
 if ($('bhWindow')) $('bhWindow').onchange = loadBalance;
 
 async function loadUsage() {

@@ -558,9 +558,15 @@ func (p *Panel) balanceHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	since := time.Now().AddDate(0, 0, -days)
 	// 昵称仅用于展示，取自池快照（不含任何凭证）；实时值优先，历史值兜底。
+	// 昵称与域仅用于展示，取自池快照（不含任何凭证）；实时值优先，历史值兜底。
+	// realm 必须在 Snapshot 前注入：cn 与 global 的积分不同源、不可互换，
+	// 跨域求和语义不成立，前端需按域分组渲染。
 	for _, st := range p.cfg.Pool.List() {
 		if st.Nickname != "" {
 			p.cfg.Balance.SetName(st.UID, st.Nickname)
+		}
+		if st.Realm != "" {
+			p.cfg.Balance.SetRealm(st.UID, st.Realm)
 		}
 	}
 	series, now := p.cfg.Balance.Snapshot(since)

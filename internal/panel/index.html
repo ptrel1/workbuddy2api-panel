@@ -161,6 +161,21 @@ button.ghost { background: transparent; }
 button.danger { color: var(--bad); }
 button.danger:hover:not(:disabled) { border-color: var(--bad); }
 button.xs { padding: 3.5px 9px; font-size: 12.5px; border-radius: 6px; }
+
+/* 分段控件（域切换）：按钮组视觉上连成一体，选中态用 accent 实底。
+   用于「余额趋势」与「模型与档位」的 国内/国际 切换 —— 两域的积分体系
+   不同源、模型目录不同，必须分开看，不能混在一张图里。 */
+.seg { display: inline-flex; gap: 0; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+.seg > button {
+  border: none; border-radius: 0; background: var(--surface-2); color: var(--ink-2);
+  padding: 4px 11px; font-size: 12.5px;
+}
+.seg > button + button { border-left: 1px solid var(--line); }
+.seg > button:hover:not(:disabled) { border-color: transparent; color: var(--ink); }
+.seg > button[aria-pressed="true"] {
+  background: var(--accent); color: var(--accent-ink); font-weight: 550;
+}
+.seg > button:disabled { opacity: .38; }
 button.icon { padding: 7px 9px; }
 input, select {
   font: inherit; color: var(--ink); background: var(--surface-2);
@@ -375,6 +390,13 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     margin-top: 8px; font-size: 12px; color: var(--ink-3); }
   .bh-daylegend .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px;
     margin-right: 4px; vertical-align: -1px; }
+  .bh-daylegend .lg-key { display: inline-flex; align-items: center; }
+  .bh-daylegend .lg-sep { width: 1px; height: 12px; background: var(--line); }
+  .bh-daylegend .lg-order { color: var(--ink-3); }
+  /* 合计行：与正文行用顶边线分隔，数值加粗；"—"表示该列不可相加 */
+  table.acc tfoot td { border-top: 1px solid var(--line); padding-top: 9px;
+    font-weight: 550; color: var(--ink); }
+  table.acc tfoot td.na { color: var(--ink-3); font-weight: 400; }
   .uschart-hd .sw { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-left: 8px; }
   .uschart-hd .sw-p { background: var(--accent); }
   .uschart-hd .sw-c { background: var(--ok); }
@@ -564,6 +586,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <header>
           <h3>余额趋势</h3>
           <span class="grow"></span>
+          <span class="seg" id="bhRealmSeg"></span>
           <span class="note" id="bhNote">—</span>
           <select id="bhWindow" class="xs">
             <option value="1">近 24 小时</option>
@@ -606,6 +629,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <th class="num">净变化</th><th class="num">今日</th><th class="num">昨日</th><th class="num">采样点</th>
             </tr></thead>
             <tbody id="bhAccBody"></tbody>
+            <tfoot id="bhAccFoot"></tfoot>
           </table>
         </div>
       </div>

@@ -3,6 +3,7 @@ package balance
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -411,5 +412,71 @@ func TestSnapshotIncludesDaily(t *testing.T) {
 	}
 	if got[0].Daily[0].Change != 200 {
 		t.Errorf("daily 变化应为 +200, 得到 %d", got[0].Daily[0].Change)
+	}
+}
+
+// TestSetRealmAppearsInSnapshot realm 注入后必须出现在 Snapshot 的每条序列上，
+// 供前端分域切换（cn 与 global 的积分不可跨域求和）。
+func TestSetRealmAppearsInSnapshot(t *testing.T) {
+	r := New("")
+	now := time.Date(2026, 9, 17, 10, 0, 0, 0, time.Local)
+	r.clock = func() time.Time { return now }
+	r.SetRealm("uid-cn", "cn")
+	r.SetRealm("uid-global", "global")
+	r.Add("uid-cn", 100)
+	r.Add("uid-global", 200)
+
+	series, _ := r.Snapshot(time.Time{})
+	got := map[string]string{}
+	for _, s := range series {
+		got[s.UID] = s.Realm
+	}
+	if got["uid-cn"] != "cn" {
+		t.Errorf("uid-cn realm = %q, want cn", got["uid-cn"])
+	}
+	if got["uid-global"] != "global" {
+		t.Errorf("uid-global realm = %q, want global", got["uid-global"])
+	}
+}
+
+// TestSetRealmEmptyIgnored 空 realm 不得覆盖已记录的值
+// （上游偶发空值不该把已分好组的账号打回 other）。
+func TestSetRealmEmptyIgnored(t *testing.T) {
+	r := New("")
+	r.SetRealm("uid1", "cn")
+	r.SetRealm("uid1", "")   // 空值：忽略
+	r.SetRealm("", "global") // 空 uid：忽略
+
+	series, _ := r.Snapshot(time.Time{})
+	r.Add("uid1", 1)
+	series, _ = r.Snapshot(time.Time{})
+	if len(series) != 1 {
+		t.Fatalf("series len = %d, want 1", len(series))
+	}
+	if series[0].Realm != "cn" {
+		t.Errorf("realm = %q, want cn（空值不应覆盖）", series[0].Realm)
+	}
+}
+
+// TestSetRealmNilSafe nil Recorder 上调用 SetRealm 不得 panic（防御）。
+func TestSetRealmNilSafe(t *testing.T) {
+	var r *Recorder
+	r.SetRealm("uid", "cn") // 不应 panic
+}
+
+// TestSetRealmNotPersisted realm 是展示元数据，不入盘；重启后由面板重新注入。
+func TestSetRealmNotPersisted(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bal.json")
+	r := New(path)
+	r.SetRealm("uid1", "cn")
+	r.Add("uid1", 500)
+	r.flush(true) // force：立即落盘（正常路径是 30s 防抖）
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if strings.Contains(string(raw), `"cn"`) {
+		t.Errorf("realm 不应入盘，实际文件含 cn：\n%s", raw)
 	}
 }
