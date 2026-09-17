@@ -351,3 +351,56 @@ func readIndexHTML(t *testing.T) string {
 	}
 	return string(b)
 }
+
+// TestLogoPreviewPage Logo 候选页必须可访问、无鉴权（只含展示内容，不含账号/密钥），
+// 且引用同源脚本（严格 CSP 下内联脚本会被拦，页面将白屏）。
+func TestLogoPreviewPage(t *testing.T) {
+	p := New(Config{Version: "test", APIKey: "secret-key"}) // 故意启用鉴权
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/logo", nil))
+	if rec.Code != 200 {
+		t.Fatalf("GET /panel/logo = %d, want 200（展示页不需鉴权）", rec.Code)
+	}
+	body := rec.Body.String()
+	if strings.Contains(body, "<script>") {
+		t.Error("含内联 <script> 会被严格 CSP 拦截导致白屏")
+	}
+	if !strings.Contains(body, `src="logo.js"`) {
+		t.Error("未引用同源 logo.js")
+	}
+	// 展示页不得泄露任何密钥/账号信息
+	for _, leak := range []string{"secret-key", "api_key", "access_token", "refresh_token"} {
+		if strings.Contains(body, leak) {
+			t.Errorf("展示页泄露敏感内容 %q", leak)
+		}
+	}
+	// 脚本必须可访问且是 JS
+	rec2 := httptest.NewRecorder()
+	p.ServeHTTP(rec2, httptest.NewRequest("GET", "/panel/logo.js", nil))
+	if rec2.Code != 200 {
+		t.Fatalf("GET /panel/logo.js = %d, want 200", rec2.Code)
+	}
+	if ct := rec2.Header().Get("Content-Type"); !strings.Contains(ct, "javascript") {
+		t.Errorf("logo.js Content-Type = %q, want javascript", ct)
+	}
+	// 安全头与面板其它页面一致
+	if rec2.Header().Get("Content-Security-Policy") == "" {
+		t.Error("logo.js 缺少 CSP 头")
+	}
+}
+
+// TestLogoJSNoInlineHandler logo.js 不得含内联事件属性（CSP script-src 'self'
+// 只允许外部脚本，内联 onclick/onload 属性同样会被拦）。
+func TestLogoJSNoInlineHandler(t *testing.T) {
+	b, err := os.ReadFile("logo.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	// 允许 .onclick = fn 这类 DOM 属性赋值；禁止 HTML 属性形式的 on*="..."
+	for _, bad := range []string{`onclick="`, `onload="`, `onchange="`} {
+		if strings.Contains(src, bad) {
+			t.Errorf("logo.js 含内联事件属性 %s（会被 CSP 拦截）", bad)
+		}
+	}
+}

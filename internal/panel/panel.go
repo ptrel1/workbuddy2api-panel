@@ -146,6 +146,9 @@ func (p *Panel) Logs() *Ring { return p.logs }
 func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/{$}", p.index)
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
+	// Logo 候选对比页（只读展示，无需鉴权：页面不含账号/密钥）
+	p.mux.HandleFunc("GET /panel/logo", p.logoPreview)
+	p.mux.HandleFunc("GET /panel/logo.js", p.logoPreviewJS)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))

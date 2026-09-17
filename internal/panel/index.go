@@ -19,6 +19,12 @@ var indexHTML []byte
 //go:embed app.js
 var appJS []byte
 
+//go:embed logo.html
+var logoHTML []byte
+
+//go:embed logo.js
+var logoJS []byte
+
 // csp 内容安全策略（严格版，无需 unsafe-inline）：
 //   - default-src 'none'        默认全禁，逐个开口
 //   - script-src 'self'         只跑同源脚本（app.js）；页面无内联事件处理器/内联脚本
@@ -58,4 +64,27 @@ func (p *Panel) appScript(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(appJS)
+}
+
+// logoPreview 输出 Logo 候选对比页（只读展示，
+// 不依赖任何后端接口与凭证）。
+//
+// 为何内嵌进面板而不单独起静态服务：
+// 面板已有公网入口与严格 CSP，做成同源页零额外运维
+// （无需新域名/证书/frp 隧道）。该页不含任何账号信息或密钥，
+// 故与 /panel/ 同权限（仅页面，API 仍需鉴权）。
+func (p *Panel) logoPreview(w http.ResponseWriter, r *http.Request) {
+	setSecurityHeaders(w)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(logoHTML)
+}
+
+// logoPreviewJS 输出 Logo 预览页的脚本（同源，
+// 供 CSP script-src 'self' 加载）。
+func (p *Panel) logoPreviewJS(w http.ResponseWriter, r *http.Request) {
+	setSecurityHeaders(w)
+	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(logoJS)
 }

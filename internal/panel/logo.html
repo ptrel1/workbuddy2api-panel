@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Logo 候选 · WorkBuddy2API</title>
+<style>
+:root {
+  --bg:#0c0e14; --surface:#14171f; --surface-2:#1a1e28; --line:#262c3a; --line-soft:#1e232e;
+  --ink:#e8ebf2; --ink-2:#a8b0c2; --ink-3:#6b7488; --accent:#5b7cfa;
+  --ok:#3ddc97; --warn:#f5b544; --bad:#f0655f;
+  --sans:system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+}
+[data-theme="light"] {
+  --bg:#f4f5f8; --surface:#fff; --surface-2:#f8f9fb; --line:#e2e5ec; --line-soft:#eceef3;
+  --ink:#14171f; --ink-2:#545c6e; --ink-3:#8b93a5; --accent:#3d5fe0;
+  --ok:#0f9d63; --warn:#b47611; --bad:#cf3b34;
+}
+* { box-sizing:border-box; }
+body { margin:0; padding:26px 22px 60px; background:var(--bg); color:var(--ink);
+  font-family:var(--sans); -webkit-font-smoothing:antialiased; }
+.wrap { max-width:900px; margin:0 auto; }
+h1 { font-size:18px; margin:0 0 5px; letter-spacing:-.01em; }
+.sub { color:var(--ink-3); font-size:12.5px; margin-bottom:22px;
+  font-family:ui-monospace,Consolas,monospace; }
+.tog { position:fixed; top:18px; right:20px; z-index:9; }
+.tog button { font:inherit; font-size:12.5px; color:var(--ink-2); background:var(--surface-2);
+  border:1px solid var(--line); border-radius:7px; padding:6px 12px; cursor:pointer; }
+.tog button:hover { border-color:var(--accent); }
+.grid { display:grid; gap:11px; }
+.card { display:flex; align-items:center; gap:20px; background:var(--surface);
+  border:1px solid var(--line); border-radius:14px; padding:16px 20px; }
+.card:hover { border-color:var(--accent); }
+.ico { color:var(--accent); flex:none; display:flex; align-items:center; }
+.ico svg { width:46px; height:46px; display:block; }
+.sizes { display:flex; align-items:center; gap:14px; flex:none; opacity:.6; }
+.sizes svg { display:block; }
+.sizes .s28 svg { width:28px; height:28px; }
+.sizes .s20 svg { width:20px; height:20px; }
+.sizes .s16 svg { width:16px; height:16px; }
+.meta { flex:1; min-width:0; }
+.nm { font-size:14px; font-weight:600; }
+.ds { color:var(--ink-3); font-size:12.5px; margin-top:3px; }
+.sec { margin:26px 0 12px; font-size:13px; color:var(--ink-2); font-weight:600; }
+.brandbar { display:flex; align-items:center; gap:11px; background:var(--surface);
+  border:1px solid var(--line); border-radius:14px; padding:16px 20px; }
+.brandbar .ic { color:var(--accent); }
+.brandbar .ic svg { width:30px; height:30px; display:block; }
+.brandbar .nm { font-size:15px; font-weight:650; letter-spacing:-.01em; }
+.brandbar .sb { color:var(--ink-3); font-size:11.5px;
+  font-family:ui-monospace,Consolas,monospace; margin-top:2px; }
+.strip { display:flex; align-items:center; gap:22px; flex-wrap:wrap; background:var(--surface);
+  border:1px solid var(--line); border-radius:14px; padding:18px 22px; color:var(--accent); }
+.strip svg { width:30px; height:30px; display:block; }
+.favrow { display:flex; gap:16px; align-items:center; background:var(--surface);
+  border:1px solid var(--line); border-radius:14px; padding:14px 20px; margin-top:11px; }
+.fav { display:flex; flex-direction:column; align-items:center; gap:6px; }
+.fav .box { width:44px; height:44px; border-radius:9px; background:var(--surface-2);
+  border:1px solid var(--line); display:flex; align-items:center; justify-content:center;
+  color:var(--accent); }
+.fav .box svg { width:26px; height:26px; display:block; }
+.fav .lb { font-size:11px; color:var(--ink-3); }
+.note { color:var(--ink-3); font-size:12px; margin-top:16px; line-height:1.6; }
+.warnbox { background:rgba(245,181,68,.08); border:1px solid rgba(245,181,68,.3);
+  border-radius:12px; padding:14px 18px; margin-top:18px; font-size:12.5px;
+  color:var(--ink-2); line-height:1.65; }
+.warnbox b { color:var(--warn); }
+</style>
+</head>
+<body>
+<div class="tog"><button id="btnT">切换明暗</button></div>
+<div class="wrap">
+  <h1>Logo 候选（6 个）</h1>
+  <div class="sub">单色 currentColor · 随主题自动变色 · 零外部依赖</div>
+
+  <div class="grid" id="cards"></div>
+
+  <div class="sec">放在真实顶栏里（以 1 号为例）</div>
+  <div class="brandbar">
+    <div class="ic" id="bbIc"></div>
+    <div><div class="nm">WorkBuddy2API</div><div class="sb">控制台</div></div>
+  </div>
+
+  <div class="sec">全部候选并排（顶栏实际尺寸 30px）</div>
+  <div class="strip" id="strip"></div>
+
+  <div class="sec">favicon 尺寸预览（26px 圆角底）</div>
+  <div class="favrow" id="favrow"></div>
+
+  <div class="warnbox">
+    <b>关于微信 logo：</b>本项目是把腾讯 CodeBuddy 账号包装成 OpenAI 兼容网关的工具，
+    而微信图标是<b>腾讯注册商标</b>。在此挂腾讯商标会被读作「官方产品」，
+    且微信绿会与面板已有的语义色 <code>--ok</code>（表示「净增/成功」）冲突。
+    故本批候选均为自有几何标记 + 靛蓝单色。
+  </div>
+
+  <div class="note">
+    这些是纯展示页（只读，不依赖任何后端接口）。选定后我会把它做成
+    favicon + 顶栏图标正式接入，并同步明暗两套主题。
+  </div>
+</div>
+
+<script src="logo.js"></script>
+</body>
+</html>
