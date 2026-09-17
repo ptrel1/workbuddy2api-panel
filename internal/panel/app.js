@@ -1361,8 +1361,11 @@ function renderBalanceChart(series) {
   }));
   if (t1 <= t0) t1 = t0 + 1;                  // 单点：给最小跨度，避免除零
   if (hi <= lo) hi = lo + 1;                  // 水平线：撑开一点，否则贴边
+  // 上下留白 12%，但 y 轴下界不得低于 0 —— 余额永远非负，画出负刻度是误导。
+  // （曾因 lo 下推过多而显示 "-443" 这样的负刻度，用户会以为余额为负。）
   const pad = (hi - lo) * 0.12;
-  lo -= pad; hi += pad;
+  lo = Math.max(0, lo - pad);
+  hi += pad;
 
   const W = 760, H = 200, PL = 52, PR = 12, PT = 12, PB = 26;
   const iw = W - PL - PR, ih = H - PT - PB;
