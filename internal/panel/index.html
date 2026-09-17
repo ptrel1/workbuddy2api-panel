@@ -4,6 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>WorkBuddy2API · 控制台</title>
+<!-- favicon 内联 data URI：零额外路由，且随系统明暗变色
+     （favicon 读不到页面的 data-theme，只能用
+     prefers-color-scheme，这也是浏览器唯一支持的方式）。 -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2032%2032%27%3E%3Cstyle%3E.b%7Bfill%3A%2314171f%7D.w%7Bstroke%3A%235b7cfa%7D%40media%20%28prefers-color-scheme%3Alight%29%7B.b%7Bfill%3A%23ffffff%7D.w%7Bstroke%3A%233d5fe0%7D%7D%3C%2Fstyle%3E%3Crect%20class%3D%27b%27%20width%3D%2732%27%20height%3D%2732%27%20rx%3D%277%27%2F%3E%3Cpath%20class%3D%27w%27%20d%3D%27M6%209%20L11.5%2023%20L16%2014%20L20.5%2023%20L26%209%27%20fill%3D%27none%27%20stroke-width%3D%272.4%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%2F%3E%3C%2Fsvg%3E">
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%27http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%27%20viewBox%3D%270%200%2032%2032%27%3E%3Cstyle%3E.b%7Bfill%3A%2314171f%7D.w%7Bstroke%3A%235b7cfa%7D%40media%20%28prefers-color-scheme%3Alight%29%7B.b%7Bfill%3A%23ffffff%7D.w%7Bstroke%3A%233d5fe0%7D%7D%3C%2Fstyle%3E%3Crect%20class%3D%27b%27%20width%3D%2732%27%20height%3D%2732%27%20rx%3D%277%27%2F%3E%3Cpath%20class%3D%27w%27%20d%3D%27M6%209%20L11.5%2023%20L16%2014%20L20.5%2023%20L26%209%27%20fill%3D%27none%27%20stroke-width%3D%272.4%27%20stroke-linecap%3D%27round%27%20stroke-linejoin%3D%27round%27%2F%3E%3C%2Fsvg%3E">
 <style>
 /* ── 设计令牌：明暗两套独立色板 ─────────────────────────────────────────
    冷石墨基调（仪表盘语言，非营销页）：底色分层 + 单一靛蓝强调（仅交互），
@@ -47,7 +52,11 @@ body {
   background: var(--surface); border-right: 1px solid var(--line);
   display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh;
 }
-.brand { padding: 20px 18px 16px; border-bottom: 1px solid var(--line-soft); }
+.brand { padding: 20px 18px 16px; border-bottom: 1px solid var(--line-soft);
+  display: flex; align-items: center; gap: 10px; }
+/* 品牌图标：W 折线，单色 currentColor 随主题变色。
+   尺寸与 .name 的行高对齐，避免顶部视觉重心偏移。 */
+.brand .mark { width: 22px; height: 22px; flex: none; color: var(--accent); }
 .brand .name { font-weight: 650; letter-spacing: -.01em; font-size: 15px; }
 .brand .sub { color: var(--ink-3); font-size: 11.5px; font-family: var(--mono); margin-top: 3px; }
 .nav ul { list-style: none; padding: 10px 8px; flex: 1; }
@@ -438,8 +447,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 <div class="shell">
   <nav class="nav">
     <div class="brand">
-      <div class="name">WorkBuddy2API</div>
-      <div class="sub" id="navSub">控制台</div>
+      <svg class="mark" viewBox="0 0 48 48" fill="none" aria-hidden="true">
+        <path d="M9 13 L17 35 L24 21 L31 35 L39 13" stroke="currentColor"
+          stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <div>
+        <div class="name">WorkBuddy2API</div>
+        <div class="sub" id="navSub">控制台</div>
+      </div>
     </div>
     <ul>
       <li><a href="#accounts" data-view="accounts" class="on">

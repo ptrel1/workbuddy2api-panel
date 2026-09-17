@@ -2,14 +2,18 @@ package panel
 
 import (
 	"encoding/json"
+	"encoding/xml"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/balance"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -401,6 +405,89 @@ func TestLogoJSNoInlineHandler(t *testing.T) {
 	for _, bad := range []string{`onclick="`, `onload="`, `onchange="`} {
 		if strings.Contains(src, bad) {
 			t.Errorf("logo.js 含内联事件属性 %s（会被 CSP 拦截）", bad)
+		}
+	}
+}
+
+// TestFaviconEmbedded favicon 必须内嵌 data URI（零额外路由、零外部请求），
+// 且解码后是合法 SVG。含糊或缺失会让浏览器标签显示默认空白图标。
+func TestFaviconEmbedded(t *testing.T) {
+	html := readIndexHTML(t)
+	m := regexp.MustCompile(`<link rel="icon"[^>]*href="([^"]+)"`).FindStringSubmatch(html)
+	if m == nil {
+		t.Fatal("index.html 缺少 <link rel=\"icon\">（浏览器标签会显示空白图标）")
+	}
+	uri := m[1]
+	const pfx = "data:image/svg+xml,"
+	if !strings.HasPrefix(uri, pfx) {
+		t.Fatalf("favicon 未内嵌 data URI：%s", uri[:min(40, len(uri))])
+	}
+	svg, err := url.QueryUnescape(strings.TrimPrefix(uri, pfx))
+	if err != nil {
+		t.Fatalf("favicon data URI 解码失败：%v", err)
+	}
+	// 必须是合法 XML（否则部分浏览器不渲染）
+	if _, err := xmlDecode(svg); err != nil {
+		t.Fatalf("favicon 不是合法 SVG：%v\n%s", err, svg)
+	}
+	// 必须跟随系统明暗，否则浅色系统下是深底方块、深色下是白底方块
+	if !strings.Contains(svg, "prefers-color-scheme") {
+		t.Error("favicon 未按 prefers-color-scheme 适配明暗（favicon 读不到页面 data-theme，只能用媒体查询）")
+	}
+}
+
+// TestBrandLogoPresent 顶栏 brand 必须有图标（此前只有纯文字）。
+// 图标用 currentColor 单色，随主题变色；不得写死颜色。
+func TestBrandLogoPresent(t *testing.T) {
+	html := readIndexHTML(t)
+	i := strings.Index(html, `class="brand"`)
+	if i < 0 {
+		t.Fatal("未找到 .brand 区块")
+	}
+	j := strings.Index(html[i:], "</div>\n    <ul>")
+	body := html[i : i+j]
+	if !strings.Contains(body, `class="mark"`) {
+		t.Error("顶栏 brand 缺少图标（.mark）")
+	}
+	if !strings.Contains(body, "currentColor") {
+		t.Error("brand 图标未用 currentColor（写死颜色会不随主题变色）")
+	}
+	// 样式必须给 .brand .mark 定尺寸，否则 SVG 会用默认 300x150 撑破侧栏
+	css := html[:strings.Index(html, "</style>")]
+	if !strings.Contains(css, ".brand .mark") {
+		t.Error("缺少 .brand .mark 尺寸样式（SVG 无尺寸会撑破 208px 侧栏）")
+	}
+}
+
+// TestLogoPageStillListsAllCandidates Logo 对比页必须仍列出全部 6 个候选
+// （选定 2 号后，对比页保留作为决策留痕，不得删减）。
+func TestLogoPageStillListsAllCandidates(t *testing.T) {
+	b, err := os.ReadFile("logo.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	n := strings.Count(src, "\n    ['")
+	if n != 6 {
+		t.Errorf("候选数 = %d, want 6（对比页应保留全部候选作为留痕）", n)
+	}
+	for _, name := range []string{"池 · 三层环", "W 折线", "汇聚路由", "六边节点", "双环交错", "盾 · 闸"} {
+		if !strings.Contains(src, name) {
+			t.Errorf("候选 %q 缺失", name)
+		}
+	}
+}
+
+// xmlDecode 只校验 XML 合法性（不需要取内容）：用 Decoder 遍历一次即可。
+func xmlDecode(s string) (any, error) {
+	d := xml.NewDecoder(strings.NewReader(s))
+	for {
+		_, err := d.Token()
+		if err != nil {
+			if err == io.EOF {
+				return nil, nil
+			}
+			return nil, err
 		}
 	}
 }
