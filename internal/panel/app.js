@@ -126,7 +126,7 @@ $('btnKey').onclick = async () => {
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', balhist: '余额趋势', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -137,6 +137,7 @@ function go(v) {
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
+  if (v === 'balhist') loadBalance();
   if (v === 'taskscenter') { loadSchoolStatus(true); pollQueueOnce(); }
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
@@ -1042,6 +1043,147 @@ function renderUsageChart(series) {
 }
 
 function fmtTokTip(v) { return fmtTok(v); }
+
+/* ── 余额趋势 ────────────────────────────────────────────────────────
+   与「用量」视图的区别：用量是事件驱动的流量（柱状），余额是定时采样的存量
+   水位（折线）。每账号一条线；涨跌用圆点标记，到账/消耗一眼可辨。 */
+const BH_COLORS = ['var(--accent)', 'var(--ok)', 'var(--warn)', 'var(--bad)', '#9b6dff', '#26b3c9'];
+
+/* renderBalanceChart 画多账号余额折线。
+   x 轴按**真实时间比例**排布（30 分钟等间隔），而非数据序号等距——
+   因为"什么时候到账/掉分"本身就是这张图要回答的问题。 */
+function renderBalanceChart(series) {
+  const host = $('bhChart');
+  const rows = (series || []).filter(s => (s.points || []).length >= 1);
+  if (!rows.length) {
+    host.innerHTML = '<div class="us-empty">暂无余额采样。服务每 30 分钟自动记录一点，' +
+      '余额刷新后即出现（也可点上方「刷新」立即采样一次）。</div>';
+    return;
+  }
+  let t0 = Infinity, t1 = -Infinity, lo = Infinity, hi = -Infinity;
+  rows.forEach(s => s.points.forEach(p => {
+    const t = Number(p.t) * 1000;
+    if (t < t0) t0 = t;
+    if (t > t1) t1 = t;
+    const c = Number(p.c);
+    if (c < lo) lo = c;
+    if (c > hi) hi = c;
+  }));
+  if (t1 <= t0) t1 = t0 + 1;                  // 单点：给最小跨度，避免除零
+  if (hi <= lo) hi = lo + 1;                  // 水平线：撑开一点，否则贴边
+  const pad = (hi - lo) * 0.12;
+  lo -= pad; hi += pad;
+
+  const W = 760, H = 200, PL = 52, PR = 12, PT = 12, PB = 26;
+  const iw = W - PL - PR, ih = H - PT - PB;
+  const X = t => PL + iw * ((t - t0) / (t1 - t0));
+  const Y = c => PT + ih - ih * ((c - lo) / (hi - lo));
+
+  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" role="img">';
+  for (let i = 0; i <= 4; i++) {              // y 轴 4 档刻度
+    const v = lo + (hi - lo) * i / 4;
+    const y = Y(v);
+    out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + y.toFixed(1) + '"/>';
+    out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5).toFixed(1) + '" text-anchor="end">' +
+      fmtNum(Math.round(v)) + '</text>';
+  }
+  out += '<line class="ax" x1="' + PL + '" y1="' + (PT + ih) + '" x2="' + (W - PR) + '" y2="' + (PT + ih) + '"/>';
+
+  const spanDays = (t1 - t0) / 86400000;      // x 轴标签：首/中/末三点
+  const fmtT = t => {
+    const d = new Date(t);
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    if (spanDays <= 2) return mm + '-' + dd + ' ' + String(d.getHours()).padStart(2, '0') + ':00';
+    return mm + '-' + dd;
+  };
+  [t0, (t0 + t1) / 2, t1].forEach((t, i) => {
+    out += '<text class="tk" x="' + X(t).toFixed(1) + '" y="' + (H - 8) +
+      '" text-anchor="' + (i === 0 ? 'start' : i === 2 ? 'end' : 'middle') + '">' + esc(fmtT(t)) + '</text>';
+  });
+
+  rows.forEach((s, si) => {
+    const color = BH_COLORS[si % BH_COLORS.length];
+    const pts = s.points.map(p => ({ x: X(Number(p.t) * 1000), y: Y(Number(p.c)), c: Number(p.c), t: Number(p.t) * 1000, g: p.d }));
+    out += '<polyline fill="none" stroke="' + color + '" stroke-width="1.8" stroke-linejoin="round" ' +
+      'stroke-linecap="round" points="' + pts.map(p => p.x.toFixed(1) + ',' + p.y.toFixed(1)).join(' ') + '"/>';
+    pts.forEach((p, i) => {
+      const prev = i > 0 ? pts[i - 1] : null;
+      const delta = prev ? p.c - prev.c : 0;
+      if (prev && delta !== 0) {              // 涨跌标记：涨=实心绿、跌=小号红
+        const up = delta > 0;
+        out += '<circle cx="' + p.x.toFixed(1) + '" cy="' + p.y.toFixed(1) + '" r="' + (up ? 3 : 2.2) +
+          '" fill="' + (up ? 'var(--ok)' : 'var(--bad)') + '" stroke="' + color + '" stroke-width="1"/>';
+      } else if (!prev) {
+        out += '<circle cx="' + p.x.toFixed(1) + '" cy="' + p.y.toFixed(1) + '" r="2.2" fill="' + color + '"/>';
+      }
+      const when = new Date(p.t).toLocaleString('zh-CN', { hour12: false });
+      const head = esc(s.name || s.uid.slice(0, 8)) + '  ' + esc(when) + (p.g ? '（日粒度）' : '');
+      out += '<title>' + head + '\n余额 ' + fmtNum(p.c) +
+        (prev ? '\n较上一点 ' + (delta > 0 ? '+' : '') + fmtNum(delta) : '') + '</title>';
+    });
+    const last = pts[pts.length - 1];          // 末点加大命中圈，便于悬停
+    out += '<circle cx="' + last.x.toFixed(1) + '" cy="' + last.y.toFixed(1) + '" r="9" fill="transparent">' +
+      '<title>' + esc(s.name || s.uid.slice(0, 8)) + '  当前 ' + fmtNum(last.c) + '</title></circle>';
+  });
+  out += '</svg>';
+  host.innerHTML = out;
+
+  const lg = $('bhLegend');
+  if (lg) lg.innerHTML = rows.map((s, i) =>
+    '<i class="sw" style="background:' + BH_COLORS[i % BH_COLORS.length] + '"></i>' +
+    esc(s.name || s.uid.slice(0, 8))).join(' ');
+}
+
+function fmtNum(v) {
+  const n = Number(v) || 0;
+  return n.toLocaleString('zh-CN');
+}
+
+function bhCard(k, v, tone) {
+  return '<div class="st"><span class="k">' + esc(k) + '</span><span class="v' +
+    (tone ? ' ' + tone : '') + '">' + esc(v) + '</span></div>';
+}
+
+async function loadBalance() {
+  const host = $('bhChart');
+  const days = Number(($('bhWindow') || {}).value || 30);
+  try {
+    const d = await api('balance_history?days=' + days);
+    const rows = d.series || [];
+    renderBalanceChart(rows);
+    let total = 0, delta = 0;
+    rows.forEach(s => { total += Number(s.current || 0); delta += Number(s.change || 0); });
+    const st = $('bhStats');
+    if (st) st.innerHTML =
+      bhCard('账号', String(rows.length)) +
+      bhCard('当前合计', fmtNum(total)) +
+      bhCard('窗口净变化', (delta > 0 ? '+' : '') + fmtNum(delta), delta > 0 ? 'ok' : delta < 0 ? 'bad' : '') +
+      bhCard('采样点数', fmtNum(rows.reduce((a, s) => a + (s.points || []).length, 0)));
+    const tb = $('bhAccBody');
+    if (tb) tb.innerHTML = rows.length ? rows.map((s, i) =>
+      '<tr><td class="mark"><i class="dot" style="background:' + BH_COLORS[i % BH_COLORS.length] + '"></i></td>' +
+      '<td>' + esc(s.name || s.uid.slice(0, 8)) + '</td>' +
+      '<td class="num">' + fmtNum(s.current) + '</td>' +
+      '<td class="num">' + fmtNum(s.min) + '</td>' +
+      '<td class="num">' + fmtNum(s.max) + '</td>' +
+      '<td class="num" style="color:' + (s.change > 0 ? 'var(--ok)' : s.change < 0 ? 'var(--bad)' : 'inherit') + '">' +
+        (s.change > 0 ? '+' : '') + fmtNum(s.change) + '</td>' +
+      '<td class="num">' + (s.points || []).length + '</td></tr>').join('')
+      : '<tr><td colspan="7"><div class="empty"><div class="big">暂无采样</div>' +
+        '服务每 30 分钟自动记录一点余额</div></td></tr>';
+    const note = $('bhNote');
+    if (note) note.textContent = '更新于 ' + new Date(d.now).toLocaleTimeString('zh-CN', { hour12: false });
+  } catch (e) {
+    if (host) host.innerHTML = '<div class="us-empty">读取余额趋势失败：' + esc(e.message) + '</div>';
+  }
+}
+
+if ($('btnBalHist')) $('btnBalHist').onclick = async () => {
+  try { await api('balance_all', { method: 'POST' }); } catch (e) { /* 忽略：仍重画历史 */ }
+  loadBalance();
+};
+if ($('bhWindow')) $('bhWindow').onchange = loadBalance;
 
 async function loadUsage() {
   const hours = ($('usWindow') && $('usWindow').value) || 72;

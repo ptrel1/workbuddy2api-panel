@@ -1,0 +1,411 @@
+// Package balance 按固定间隔采样账号积分余额，供面板「余额趋势」视图画折线。
+//
+// 与 internal/usage 的区别（两者刻意分开，不合并）：
+//   - usage 是**事件驱动**：每次聊天请求 Add 一次，记录的是「流量」（token 数），
+//     没有请求就没有数据点；
+//   - 本包是**定时驱动**：每 sampleInterval 主动查一次余额，记录的是「存量」
+//     （某时刻的水位值），没有请求也照常采样。
+//     把存量塞进请求驱动的桶里会出现「空闲时段无采样点 → 折线断裂」，那是数据缺陷
+//     而非实现细节，故独立成包。
+//
+// 保留策略（两级粒度，总量有界）：
+//   - 近 detailedKeep 内：原始采样点（默认 30 分钟一个）
+//   - 更早：折叠为日粒度（每天取当日最后一个采样值 = 当日收盘水位），保留 detailKeep
+//
+// 落盘：与 state 文件同目录的 balance_history.json，原子替换 + 防抖刷新，重启不丢。
+package balance
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"sort"
+	"sync"
+	"time"
+)
+
+const (
+	// sampleInterval 采样间隔：30 分钟一个点（1440 分钟 / 30 = 每天 48 点）。
+	sampleInterval = 30 * time.Minute
+
+	// detailedKeep 原始采样点的保留时长；超出后折叠为日粒度。
+	// 30 天 × 48 点 ≈ 1440 点/账号，折线图可读且文件很小。
+	detailedKeep = 30 * 24 * time.Hour
+
+	// dayKeep 日粒度点的保留时长；更早的丢弃（总量有界）。
+	dayKeep = 365 * 24 * time.Hour
+
+	// flushInterval 防抖落盘间隔。
+	flushInterval = 30 * time.Second
+
+	// maxPoints 点数硬上限（所有账号合计）。超过时立即折叠，避免异常把文件撑爆。
+	maxPoints = 200_000
+
+	// dayLayout 日粒度键的格式（本地时区，与用户直觉一致）。
+	dayLayout = "2006-01-02"
+)
+
+// Point 一次采样（某账号在某时刻的积分水位）。
+// JSON 字段名取短：点数会随时间增长。
+type Point struct {
+	TS      int64  `json:"t"`           // Unix 秒
+	UID     string `json:"u"`           // 账号 uid
+	Credits int64  `json:"c"`           // 该时刻积分余额
+	Day     string `json:"d,omitempty"` // 非空 = 日粒度折叠点（值形如 2006-01-02）
+}
+
+// file 落盘结构。
+type file struct {
+	Version int     `json:"version"`
+	Saved   string  `json:"saved"`
+	Points  []Point `json:"points"`
+}
+
+// Recorder 并发安全的余额采样记录器。
+type Recorder struct {
+	mu     sync.Mutex
+	path   string
+	points []Point // 按 TS 升序维护（Add 时追加，采样本身即时间递增）
+	dirty  bool
+
+	// 每账号的上次采样时刻，用于「距上次不足 sampleInterval 则跳过」的节流
+	// （防止高频调用把曲线打成锯齿）。
+	//
+	// ⚠️ 必须**按账号**而非全局：采样由 RunBalanceRefreshNow 并发触达所有账号，
+	// 若共用一个时间戳，同一窗口内只有"抢到"的那个账号能落点，其余账号的点被
+	// 静默丢弃 —— 症状是「多个账号只有一条线」。单账号时该缺陷不显形，故曾漏测。
+	lastSample map[string]time.Time
+
+	// names uid → 昵称，仅供 API 展示（不入盘：账号改名不影响历史数据）。
+	names map[string]string
+
+	clock func() time.Time // 便于测试注入
+
+	stopOnce sync.Once
+	stop     chan struct{}
+	done     chan struct{}
+}
+
+// New 构造。path 为空时不做任何落盘（纯内存，用于测试）。
+func New(path string) *Recorder {
+	r := &Recorder{
+		path:       path,
+		names:      map[string]string{},
+		clock:      time.Now,
+		lastSample: map[string]time.Time{},
+		stop:       make(chan struct{}),
+		done:       make(chan struct{}),
+	}
+	if path != "" {
+		if err := r.load(); err != nil {
+			log.Printf("[balance] 载入失败（按空历史启动）: %v", err)
+		}
+	}
+	return r
+}
+
+// Interval 返回采样间隔，供调度器使用（避免两处各写一个魔法数字）。
+func Interval() time.Duration { return sampleInterval }
+
+// SetName 记录账号昵称（仅供展示，不落盘）。
+func (r *Recorder) SetName(uid, name string) {
+	if r == nil || uid == "" {
+		return
+	}
+	r.mu.Lock()
+	r.names[uid] = name
+	r.mu.Unlock()
+}
+
+// Add 记录一次采样。同一账号、同一采样窗口内重复调用只保留最后一个值
+// （签到/领奖后余额会跳变，取最新值才是真实水位）。
+// 与上次采样间隔不足 sampleInterval 时跳过，返回 false。
+func (r *Recorder) Add(uid string, credits int64) bool {
+	if r == nil || uid == "" {
+		return false
+	}
+	now := r.clock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if last, ok := r.lastSample[uid]; ok && now.Sub(last) < sampleInterval {
+		return false
+	}
+	r.lastSample[uid] = now
+	r.points = append(r.points, Point{TS: now.Unix(), UID: uid, Credits: credits})
+	r.dirty = true
+
+	// 点数超硬上限：立即折叠一次（异常保护）。
+	if len(r.points) > maxPoints {
+		r.rollupLocked(now)
+	}
+	return true
+}
+
+// Rollup 把超出 detailedKeep 的原始点折叠为日粒度（每账号每天留最后一个值）。
+// 由调度器周期调用；也可在 Add 触发上限时内部调用。
+func (r *Recorder) Rollup(now time.Time) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rollupLocked(now)
+}
+
+func (r *Recorder) rollupLocked(now time.Time) {
+	cutoff := now.Add(-detailedKeep).Unix()
+
+	// 待折叠：超出 detailedKeep 的原始点，按 (uid, 日) 分组取当日最后一个。
+	type key struct {
+		uid string
+		day string
+	}
+	newest := map[key]Point{}
+	var kept []Point
+	folded := 0
+	for _, p := range r.points {
+		if p.Day != "" || p.TS >= cutoff {
+			kept = append(kept, p)
+			continue
+		}
+		day := time.Unix(p.TS, 0).In(time.Local).Format(dayLayout)
+		k := key{p.UID, day}
+		if old, ok := newest[k]; !ok || p.TS > old.TS {
+			newest[k] = p
+		}
+		folded++
+	}
+	if folded == 0 {
+		r.pruneDaysLocked(now)
+		return
+	}
+	for k, p := range newest {
+		kept = append(kept, Point{TS: p.TS, UID: p.UID, Credits: p.Credits, Day: k.day})
+	}
+	sort.Slice(kept, func(i, j int) bool { return kept[i].TS < kept[j].TS })
+	r.points = kept
+	r.dirty = true
+	log.Printf("[balance] 折叠 %d 个原始采样点为 %d 个日粒度点（保留 %v 细粒度）", folded, len(newest), detailedKeep)
+
+	r.pruneDaysLocked(now)
+}
+
+// pruneDaysLocked 丢弃超出 dayKeep 的日粒度点。
+func (r *Recorder) pruneDaysLocked(now time.Time) {
+	cutoff := now.Add(-dayKeep)
+	var kept []Point
+	dropped := 0
+	for _, p := range r.points {
+		if p.Day == "" {
+			kept = append(kept, p)
+			continue
+		}
+		t, err := time.ParseInLocation(dayLayout, p.Day, time.Local)
+		if err == nil && t.Before(cutoff) {
+			dropped++
+			continue
+		}
+		kept = append(kept, p)
+	}
+	if dropped > 0 {
+		r.points = kept
+		r.dirty = true
+		log.Printf("[balance] 丢弃 %d 个超期日粒度点（保留 %v）", dropped, dayKeep)
+	}
+}
+
+// ---------------------------------------------------------------- 持久化 ----
+
+func (r *Recorder) load() error {
+	raw, err := os.ReadFile(r.path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // 首次启动：空历史
+		}
+		return err
+	}
+	var f file
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return err
+	}
+	if f.Version != 1 {
+		return fmt.Errorf("不支持的版本 %d", f.Version)
+	}
+	// 过滤非法值（手改/损坏文件不该让服务起不来）。
+	pts := make([]Point, 0, len(f.Points))
+	for _, p := range f.Points {
+		if p.UID == "" || p.TS <= 0 {
+			continue
+		}
+		pts = append(pts, p)
+	}
+	sort.Slice(pts, func(i, j int) bool { return pts[i].TS < pts[j].TS })
+	r.points = pts
+	// 按账号恢复「上次采样时刻」（各取最后一个原始点），避免重启后立刻补点导致
+	// 曲线密集；只认原始点——日粒度点是折叠产物，不代表上次采样时刻。
+	for _, p := range pts {
+		if p.Day != "" {
+			continue
+		}
+		at := time.Unix(p.TS, 0)
+		if old, ok := r.lastSample[p.UID]; !ok || at.After(old) {
+			r.lastSample[p.UID] = at
+		}
+	}
+	return nil
+}
+
+func (r *Recorder) flush(force bool) {
+	if r == nil || r.path == "" {
+		return
+	}
+	r.mu.Lock()
+	if !r.dirty && !force {
+		r.mu.Unlock()
+		return
+	}
+	snap := file{Version: 1, Saved: time.Now().Format(time.RFC3339), Points: r.points}
+	r.dirty = false
+	r.mu.Unlock()
+
+	raw, err := json.Marshal(snap)
+	if err != nil {
+		log.Printf("[balance] 序列化失败: %v", err)
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(r.path), 0o755); err != nil {
+		log.Printf("[balance] 建目录失败: %v", err)
+		return
+	}
+	tmp := r.path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		log.Printf("[balance] 写临时文件失败: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, r.path); err != nil {
+		log.Printf("[balance] 原子替换失败: %v", err)
+	}
+}
+
+// Save 立即落盘（关闭前调用）。
+func (r *Recorder) Save() { r.flush(true) }
+
+// Start 启动后台防抖落盘与周期折叠。
+// 为什么必须显式 Start：Recorder 只在内存累积，缺了这个协程就永远不落盘
+// （重启即丢光历史）——这是很容易漏掉的一环。
+func (r *Recorder) Start() {
+	if r == nil {
+		return
+	}
+	go func() {
+		defer close(r.done)
+		t := time.NewTicker(flushInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-r.stop:
+				r.flush(true)
+				return
+			case <-t.C:
+				r.Rollup(time.Now()) // 顺带做粒度折叠（含超期裁剪）
+				r.flush(false)
+			}
+		}
+	}()
+}
+
+// Stop 停止后台协程并最终落盘（进程退出前调用）。
+func (r *Recorder) Stop() {
+	if r == nil {
+		return
+	}
+	r.stopOnce.Do(func() {
+		close(r.stop)
+		<-r.done
+	})
+}
+
+// ---------------------------------------------------------------- 查询 ----
+
+// Series 单账号的余额序列（供面板画折线）。
+type Series struct {
+	UID     string  `json:"uid"`
+	Name    string  `json:"name,omitempty"`
+	Points  []Point `json:"points"`
+	Current int64   `json:"current"` // 最新值
+	Min     int64   `json:"min"`
+	Max     int64   `json:"max"`
+	Change  int64   `json:"change"` // 窗口内净变化（末 - 首）
+}
+
+// Snapshot 返回窗口内的余额序列。since 为零值 = 全部。
+// 每账号一条序列，点按时间升序。
+func (r *Recorder) Snapshot(since time.Time) ([]Series, time.Time) {
+	if r == nil {
+		return nil, time.Time{}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var cutoff int64
+	if !since.IsZero() {
+		cutoff = since.Unix()
+	}
+	byUID := map[string][]Point{}
+	for _, p := range r.points {
+		if cutoff > 0 && p.TS < cutoff {
+			continue
+		}
+		byUID[p.UID] = append(byUID[p.UID], p)
+	}
+	out := make([]Series, 0, len(byUID))
+	for uid, pts := range byUID {
+		sort.Slice(pts, func(i, j int) bool { return pts[i].TS < pts[j].TS })
+		s := Series{UID: uid, Name: r.names[uid], Points: pts}
+		if n := len(pts); n > 0 {
+			s.Current = pts[n-1].Credits
+			s.Min, s.Max = pts[0].Credits, pts[0].Credits
+			for _, p := range pts {
+				if p.Credits < s.Min {
+					s.Min = p.Credits
+				}
+				if p.Credits > s.Max {
+					s.Max = p.Credits
+				}
+			}
+			s.Change = pts[n-1].Credits - pts[0].Credits
+		}
+		out = append(out, s)
+	}
+	// 稳定排序：按最新值降序（主账号在前），再按 uid 保证确定性。
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Current != out[j].Current {
+			return out[i].Current > out[j].Current
+		}
+		return out[i].UID < out[j].UID
+	})
+	return out, time.Now()
+}
+
+// Describe 返回一行状态摘要（启动日志用）。
+func (r *Recorder) Describe() string {
+	if r == nil {
+		return "off"
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	uids := map[string]struct{}{}
+	raw, day := 0, 0
+	for _, p := range r.points {
+		uids[p.UID] = struct{}{}
+		if p.Day == "" {
+			raw++
+		} else {
+			day++
+		}
+	}
+	return fmt.Sprintf("%d 点（原始 %d / 日粒度 %d）, %d 账号", len(r.points), raw, day, len(uids))
+}

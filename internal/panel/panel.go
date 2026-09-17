@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/balance"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
@@ -54,7 +55,8 @@ type Config struct {
 	StickyCount func() int
 
 	// Usage 逐请求用量记录器（nil = 用量接口返回 501）。
-	Usage *usage.Recorder
+	Usage   *usage.Recorder
+	Balance *balance.Recorder // 余额趋势采样记录器（nil = 该视图返回 501）
 
 	// ProbeFile 模型输出上限探测结果文件（scripts/probe_max_tokens.py --panel-out
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
@@ -174,6 +176,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
+
+	// 余额趋势：窗口由 days 参数控制（默认 30 天，上限 30 天=detailedKeep）。
+	p.mux.HandleFunc("GET /panel/api/balance_history", p.withAuth(p.balanceHistory))
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
@@ -508,6 +513,39 @@ func (p *Panel) usageSave(w http.ResponseWriter, r *http.Request) {
 	}
 	p.cfg.Usage.Save()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// balanceHistory 返回余额采样序列，供「余额趋势」视图画折线。
+// days 查询参数控制窗口（默认 30，上限 30 = detailedKeep；更早的数据已折叠为日粒度，
+// 传更大值也只能拿到日粒度点）。
+func (p *Panel) balanceHistory(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Balance == nil {
+		writeErr(w, http.StatusNotImplemented, "balance recorder not available")
+		return
+	}
+	days := 30
+	if v := r.URL.Query().Get("days"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			days = n
+		}
+	}
+	if days > 30 {
+		days = 30
+	}
+	since := time.Now().AddDate(0, 0, -days)
+	// 昵称仅用于展示，取自池快照（不含任何凭证）；实时值优先，历史值兜底。
+	for _, st := range p.cfg.Pool.List() {
+		if st.Nickname != "" {
+			p.cfg.Balance.SetName(st.UID, st.Nickname)
+		}
+	}
+	series, now := p.cfg.Balance.Snapshot(since)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"now":    now.Format(time.RFC3339),
+		"days":   days,
+		"series": series,
+	})
 }
 
 // packages 返回全部账号的积分包构成，供「积分构成」视图对比。

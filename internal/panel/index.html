@@ -392,6 +392,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#usage" data-view="usage">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 13.5h12"/><path d="M4.5 13.5V8.2M8 13.5V3.5M11.5 13.5v-3"/></svg>
         用量</a></li>
+      <li><a href="#balhist" data-view="balhist">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 13.5V3M2 13.5h12"/><path d="M4 10.5l3-4 2.5 2.5L13 5"/></svg>
+        余额趋势</a></li>
       <li><a href="#packages" data-view="packages">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.2 5.4 8 2.5l5.8 2.9v5.2L8 13.5l-5.8-2.9z"/><path d="M2.2 5.4 8 8.3l5.8-2.9M8 8.3v5.2"/></svg>
         积分构成</a></li>
@@ -521,6 +524,48 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     </section>
 
     <!-- 积分构成 -->
+    <section class="view" id="view-balhist" hidden>
+      <div class="box">
+        <header>
+          <h3>余额趋势</h3>
+          <span class="grow"></span>
+          <span class="note" id="bhNote">—</span>
+          <select id="bhWindow" class="xs">
+            <option value="1">近 24 小时</option>
+            <option value="7">近 7 天</option>
+            <option value="30" selected>近 30 天</option>
+          </select>
+          <button class="xs" id="btnBalHist">刷新</button>
+        </header>
+        <div class="stats" id="bhStats"></div>
+        <div class="pad">
+          <div class="uschart">
+            <div class="uschart-hd">
+              <span class="lb">积分水位（每 30 分钟一点）</span>
+              <span class="grow"></span>
+              <span class="legend" id="bhLegend"></span>
+            </div>
+            <div id="bhChart" class="uschart-body"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="box">
+        <header><h3>按账号</h3><span class="grow"></span>
+          <span class="note">净变化 = 窗口末值 − 窗口首值</span></header>
+        <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr>
+              <th class="mark" aria-hidden="true"></th><th>账号</th>
+              <th class="num">当前</th><th class="num">最低</th><th class="num">最高</th>
+              <th class="num">净变化</th><th class="num">采样点</th>
+            </tr></thead>
+            <tbody id="bhAccBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
     <section class="view" id="view-packages" hidden>
       <div class="box">
         <header>

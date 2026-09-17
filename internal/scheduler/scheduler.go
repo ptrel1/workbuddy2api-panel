@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/balance"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
@@ -34,6 +35,12 @@ type Config struct {
 	// entry.creditsExpiring）。<=0 时禁用分桶（全部归长期，行为与引入前一致）。
 	// 默认建议 7*24h。
 	ExpiringSoonWindow time.Duration
+
+	// Balance 余额采样记录器（可为 nil = 不采样）。
+	// 挂在余额刷新之后：那次调用本来就拿到了新鲜余额，顺手记一点，**不额外打上游**。
+	// 采样间隔由 balance.Interval() 内部节流（30 分钟），比余额刷新（默认 5 分钟）稀，
+	// 因此多数刷新周期不会落点。
+	Balance *balance.Recorder
 
 	// CheckinDisabled 显式关闭签到排程（对应 config 的 schedule.checkin_enabled=false）。
 	// 禁用后不再有任何签到时点。旅行不再搭签到便车（已剥离为独立排程）。
@@ -387,6 +394,15 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 	var wg sync.WaitGroup
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
+			// 禁用账号不刷新（已不参与轮转），但**仍采样一个历史水位**：
+			// 禁用≠注销，保留曲线才能看出"为什么被禁"（如积分耗尽）。
+			// 采样失败静默跳过——禁用账号查询失败属预期，不打日志噪音。
+			if s.cfg.Balance != nil && st.Credits > 0 {
+				s.cfg.Balance.SetName(st.UID, st.Nickname)
+				if s.cfg.Balance.Add(st.UID, st.Credits) {
+					log.Printf("balance-sample %s: credits=%d (disabled)", st.UID, st.Credits)
+				}
+			}
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
@@ -405,6 +421,14 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 				s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring)
 			} else {
 				s.cfg.Pool.ReenableIfCredits(uid, remain, total)
+			}
+			// 余额采样：这里已拿到新鲜余额，顺手记一点（不额外打上游）。
+			// 内部按 30 分钟节流，故多数刷新周期不会落点。
+			if s.cfg.Balance != nil {
+				s.cfg.Balance.SetName(uid, st.Nickname)
+				if s.cfg.Balance.Add(uid, remain) {
+					log.Printf("balance-sample %s: credits=%d", uid, remain)
+				}
 			}
 		}(a, st.UID)
 	}
