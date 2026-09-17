@@ -369,6 +369,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     border-bottom: 1px solid var(--line-soft); font-size: 12px; }
   .uschart-hd .lb { color: var(--ink-2); font-weight: 550; }
   .uschart-hd .legend { color: var(--ink-3); font-size: 11.5px; display: flex; align-items: center; gap: 5px; }
+
+  /* 每日变化图例：与折线图例同款视觉语言 */
+  .bh-daylegend { display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+    margin-top: 8px; font-size: 12px; color: var(--ink-3); }
+  .bh-daylegend .sw { display: inline-block; width: 9px; height: 9px; border-radius: 2px;
+    margin-right: 4px; vertical-align: -1px; }
   .uschart-hd .sw { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-left: 8px; }
   .uschart-hd .sw-p { background: var(--accent); }
   .uschart-hd .sw-c { background: var(--ok); }
@@ -580,6 +586,16 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </div>
 
       <div class="box">
+        <header><h3>每日变化</h3><span class="grow"></span>
+          <span class="note" id="bhDailyNote">每账号每天一根：绿=当日净增，红=当日净减；浅色/斜纹 = 该日采样不完整</span>
+        </header>
+        <div class="pad">
+          <div id="bhDaily" class="uschart-body"></div>
+          <div class="bh-daylegend" id="bhDailyLegend"></div>
+        </div>
+      </div>
+
+      <div class="box">
         <header><h3>按账号</h3><span class="grow"></span>
           <span class="note">净变化 = 窗口末值 − 窗口首值</span></header>
         <div class="tbl-wrap">
@@ -587,7 +603,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <thead><tr>
               <th class="mark" aria-hidden="true"></th><th>账号</th>
               <th class="num">当前</th><th class="num">最低</th><th class="num">最高</th>
-              <th class="num">净变化</th><th class="num">采样点</th>
+              <th class="num">净变化</th><th class="num">今日</th><th class="num">昨日</th><th class="num">采样点</th>
             </tr></thead>
             <tbody id="bhAccBody"></tbody>
           </table>

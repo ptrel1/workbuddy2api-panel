@@ -45,6 +45,11 @@ const (
 
 	// dayLayout 日粒度键的格式（本地时区，与用户直觉一致）。
 	dayLayout = "2006-01-02"
+
+	// expectedPerDay 判定"某日采样完整"所需的最少点数。
+	// 理论值 = 24h/30min = 48；留容差取 40（服务重启/短暂停机会让点数略少，
+	// 不该因此判定整日不完整）。
+	expectedPerDay = 40
 )
 
 // Point 一次采样（某账号在某时刻的积分水位）。
@@ -338,7 +343,25 @@ type Series struct {
 	Current int64   `json:"current"` // 最新值
 	Min     int64   `json:"min"`
 	Max     int64   `json:"max"`
-	Change  int64   `json:"change"` // 窗口内净变化（末 - 首）
+	Change  int64   `json:"change"`          // 窗口内净变化（末 - 首）
+	Daily   []Daily `json:"daily,omitempty"` // 按日聚合（升序），供每日对照视图
+}
+
+// Daily 单账号某一天的余额变化（供「每日变化对照」）。
+//
+// 口径（末值 − 首值）：取该日**首次采样**与**最后采样**之差。
+//   - 含当日签到/领奖到账，也含当日消耗；不含跨零点时段的变化。
+//   - Full=false 表示该日采样不完整（当天尚未结束、或服务当日中途启用），
+//     UI 必须显式标注——否则"今天只赚了一点"会误导（其实还没采完一天）。
+type Daily struct {
+	Day    string `json:"day"`    // 2006-01-02（本地时区）
+	First  int64  `json:"first"`  // 当日首个采样值
+	Last   int64  `json:"last"`   // 当日最后一个采样值
+	Change int64  `json:"change"` // Last - First
+	Min    int64  `json:"min"`
+	Max    int64  `json:"max"`
+	N      int    `json:"n"`    // 当日采样点数
+	Full   bool   `json:"full"` // 是否为完整一天（非今日、且点数达到预期）
 }
 
 // Snapshot 返回窗口内的余额序列。since 为零值 = 全部。
@@ -377,6 +400,7 @@ func (r *Recorder) Snapshot(since time.Time) ([]Series, time.Time) {
 				}
 			}
 			s.Change = pts[n-1].Credits - pts[0].Credits
+			s.Daily = dailyOf(pts, r.clock())
 		}
 		out = append(out, s)
 	}
@@ -388,6 +412,61 @@ func (r *Recorder) Snapshot(since time.Time) ([]Series, time.Time) {
 		return out[i].UID < out[j].UID
 	})
 	return out, time.Now()
+}
+
+// dailyOf 把某账号的采样点按本地日历日聚合为每日变化。
+//
+// 口径：**末值 − 首值**（当日首个采样到最后一个采样）。
+// 为何不用「末值 − 昨日末值」：那是跨零点连续口径，会把夜间变化算进今天，
+// 与用户对"今天赚了多少"的直觉不符。首末口径更直观、可解释。
+//
+// 完整性判定：只有**非今日**且**点数达标（>= expectedPerDay）**才标记 Full。
+// 今天必然不完整（一天还没过完）；服务中途启用的那天也不完整。
+// UI 必须据此标注，否则"今天只涨了一点"会被误读成"今天赚得少"。
+func dailyOf(pts []Point, now time.Time) []Daily {
+	if len(pts) == 0 {
+		return nil
+	}
+	type acc struct {
+		first, last, min, max int64
+		n                     int
+	}
+	m := map[string]*acc{}
+	var days []string
+	for _, p := range pts {
+		day := time.Unix(p.TS, 0).In(time.Local).Format(dayLayout)
+		a, ok := m[day]
+		if !ok {
+			a = &acc{first: p.Credits, last: p.Credits, min: p.Credits, max: p.Credits}
+			m[day] = a
+			days = append(days, day)
+		}
+		a.last = p.Credits
+		if p.Credits < a.min {
+			a.min = p.Credits
+		}
+		if p.Credits > a.max {
+			a.max = p.Credits
+		}
+		a.n++
+	}
+	sort.Strings(days)
+	today := now.In(time.Local).Format(dayLayout)
+	out := make([]Daily, 0, len(days))
+	for _, day := range days {
+		a := m[day]
+		out = append(out, Daily{
+			Day:    day,
+			First:  a.first,
+			Last:   a.last,
+			Change: a.last - a.first,
+			Min:    a.min,
+			Max:    a.max,
+			N:      a.n,
+			Full:   day != today && a.n >= expectedPerDay,
+		})
+	}
+	return out
 }
 
 // Describe 返回一行状态摘要（启动日志用）。

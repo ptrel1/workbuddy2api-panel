@@ -308,3 +308,108 @@ func TestReloadRestoresPerAccountThrottle(t *testing.T) {
 		t.Error("A 满 30 分钟应放行")
 	}
 }
+
+// 每日聚合：口径 = 末值 − 首值；跨日要正确切分。
+func TestDailyOfBasic(t *testing.T) {
+	d1 := time.Date(2026, 9, 16, 8, 0, 0, 0, time.Local)
+	d2 := time.Date(2026, 9, 17, 8, 0, 0, 0, time.Local)
+	pts := []Point{
+		{TS: d1.Unix(), Credits: 1000},
+		{TS: d1.Add(30 * time.Minute).Unix(), Credits: 900},
+		{TS: d1.Add(time.Hour).Unix(), Credits: 800}, // 9/16 末值 800 → 变化 -200
+		{TS: d2.Unix(), Credits: 1200},
+		{TS: d2.Add(30 * time.Minute).Unix(), Credits: 1100}, // 9/17 末值 1100 → 变化 -100
+	}
+	now := time.Date(2026, 9, 18, 10, 0, 0, 0, time.Local) // 站在 9/18 看，两天都已过完
+	got := dailyOf(pts, now)
+	if len(got) != 2 {
+		t.Fatalf("应 2 天, 得到 %d", len(got))
+	}
+	if got[0].Day != "2026-09-16" || got[1].Day != "2026-09-17" {
+		t.Errorf("日期错误: %s / %s", got[0].Day, got[1].Day)
+	}
+	if got[0].First != 1000 || got[0].Last != 800 || got[0].Change != -200 {
+		t.Errorf("9/16 聚合错误: first=%d last=%d change=%d", got[0].First, got[0].Last, got[0].Change)
+	}
+	if got[0].Min != 800 || got[0].Max != 1000 {
+		t.Errorf("9/16 min/max 错误: %d/%d", got[0].Min, got[0].Max)
+	}
+	if got[1].Change != -100 {
+		t.Errorf("9/17 变化应为 -100, 得到 %d", got[1].Change)
+	}
+}
+
+// ⭐ 关键边界：今日必须标记为「不完整」——否则"今天只涨一点"会被误读。
+func TestDailyOfTodayNotFull(t *testing.T) {
+	now := time.Date(2026, 9, 17, 10, 0, 0, 0, time.Local)
+	// 今日只采了 3 点（远少于 expectedPerDay=40）
+	pts := []Point{
+		{TS: now.Add(-2 * time.Hour).Unix(), Credits: 500},
+		{TS: now.Add(-time.Hour).Unix(), Credits: 450},
+		{TS: now.Unix(), Credits: 400},
+	}
+	got := dailyOf(pts, now)
+	if len(got) != 1 {
+		t.Fatalf("应 1 天, 得到 %d", len(got))
+	}
+	if got[0].Full {
+		t.Error("今日必须标记为不完整（Full=false），否则读数会被误读")
+	}
+}
+
+// 历史完整日（点数达标）应标记 Full=true。
+func TestDailyOfPastFullDay(t *testing.T) {
+	day := time.Date(2026, 9, 16, 0, 0, 0, 0, time.Local)
+	var pts []Point
+	for i := 0; i < 48; i++ { // 全天 48 点
+		pts = append(pts, Point{TS: day.Add(time.Duration(i) * 30 * time.Minute).Unix(), Credits: 1000 - int64(i)})
+	}
+	now := time.Date(2026, 9, 17, 12, 0, 0, 0, time.Local)
+	got := dailyOf(pts, now)
+	if len(got) != 1 || !got[0].Full {
+		t.Errorf("48 点的历史日应 Full=true, 得到 %+v", got)
+	}
+}
+
+// 点数不足的历史日（服务中途启用）也应标记不完整。
+func TestDailyOfPastPartialDay(t *testing.T) {
+	day := time.Date(2026, 9, 16, 20, 0, 0, 0, time.Local)
+	pts := []Point{
+		{TS: day.Unix(), Credits: 100},
+		{TS: day.Add(30 * time.Minute).Unix(), Credits: 90},
+	}
+	now := time.Date(2026, 9, 17, 12, 0, 0, 0, time.Local)
+	got := dailyOf(pts, now)
+	if len(got) != 1 {
+		t.Fatalf("应 1 天, 得到 %d", len(got))
+	}
+	if got[0].Full {
+		t.Error("仅 2 点的历史日应标记不完整")
+	}
+}
+
+func TestDailyOfEmpty(t *testing.T) {
+	if got := dailyOf(nil, time.Now()); got != nil {
+		t.Errorf("空输入应返回 nil, 得到 %v", got)
+	}
+}
+
+// Snapshot 应把 daily 一并带出（前端每日对照视图的数据来源）。
+func TestSnapshotIncludesDaily(t *testing.T) {
+	base := time.Date(2026, 9, 16, 8, 0, 0, 0, time.Local)
+	r := New("")
+	r.points = []Point{
+		{TS: base.Unix(), UID: "u1", Credits: 1000},
+		{TS: base.Add(time.Hour).Unix(), UID: "u1", Credits: 1200},
+	}
+	got, _ := r.Snapshot(time.Time{})
+	if len(got) != 1 {
+		t.Fatalf("应 1 序列")
+	}
+	if len(got[0].Daily) != 1 {
+		t.Fatalf("应带出 1 天 daily, 得到 %d", len(got[0].Daily))
+	}
+	if got[0].Daily[0].Change != 200 {
+		t.Errorf("daily 变化应为 +200, 得到 %d", got[0].Daily[0].Change)
+	}
+}

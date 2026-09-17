@@ -1428,6 +1428,117 @@ function renderBalanceChart(series) {
     esc(s.name || s.uid.slice(0, 8))).join(' ');
 }
 
+
+/* renderDailyBars 画「每日变化」分组柱状图：x = 日期，每账号一根。
+   与余额折线的区别：折线看"水位随时间"，这里看"每天的净变化量"（涨跌方向 + 幅度）。
+   不完整日（今日 / 服务中途启用那天）用低透明度 + 虚线描边标出 —— 否则
+   「今天只涨了一点」会被误读成「今天赚得少」，其实是当天还没采完。 */
+function renderDailyBars(series) {
+  const host = $('bhDaily');
+  if (!host) return;
+  // 收集所有日期（并集，升序）
+  const daySet = new Set();
+  series.forEach(s => (s.daily || []).forEach(d => daySet.add(d.day)));
+  const days = [...daySet].sort();
+  if (!days.length) {
+    host.innerHTML = '<div class="us-empty">暂无按日数据（需跨过零点后才出现第一天）。</div>';
+    const lg = $('bhDailyLegend');
+    if (lg) lg.innerHTML = '';
+    return;
+  }
+  // 每个账号每天的变化值，以及是否有任一不完整
+  const map = new Map(); // uid -> {day: {change, full}}
+  const fullMap = new Map();
+  series.forEach(s => {
+    const m = {};
+    (s.daily || []).forEach(d => { m[d.day] = d.change; if (!d.full) fullMap.set(s.uid + '|' + d.day, true); });
+    map.set(s.uid, m);
+  });
+  // y 轴范围：正负分开，零轴居中
+  let hi = 0, lo = 0;
+  series.forEach(s => (s.daily || []).forEach(d => {
+    if (d.change > hi) hi = d.change;
+    if (d.change < lo) lo = d.change;
+  }));
+  const span = Math.max(1, Math.max(hi, -lo));
+  hi = span; lo = -span;
+
+  const W = 760, H = 180, PL = 56, PR = 12, PT = 14, PB = 34;
+  const iw = W - PL - PR, ih = H - PT - PB;
+  const Y = v => PT + ih - ih * ((v - lo) / (hi - lo));
+  const zeroY = Y(0);
+
+  const nAcc = Math.max(1, series.length);
+  const groupW = iw / days.length;
+  const bw = Math.max(2, Math.min(14, (groupW - 8) / nAcc));
+
+  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" role="img">';
+  // 网格（4 档）+ 零轴加粗
+  for (let i = 0; i <= 4; i++) {
+    const v = lo + (hi - lo) * i / 4;
+    const y = Y(v);
+    const isZero = Math.abs(v) < span / 8;
+    out += '<line class="' + (isZero ? 'ax' : 'gl') + '" x1="' + PL + '" y1="' + y.toFixed(1) +
+      '" x2="' + (W - PR) + '" y2="' + y.toFixed(1) + '"/>';
+    out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5).toFixed(1) + '" text-anchor="end">' +
+      (v > 0 ? '+' : '') + fmtNum(Math.round(v)) + '</text>';
+  }
+  // 每日一组柱
+  days.forEach((day, di) => {
+    const gx = PL + di * groupW;
+    series.forEach((s, si) => {
+      const v = (map.get(s.uid) || {})[day];
+      if (v === undefined) return;
+      const color = BH_COLORS[si % BH_COLORS.length];
+      const x = gx + (groupW - bw * nAcc) / 2 + si * bw;
+      const y0 = Math.min(zeroY, Y(v)), h = Math.max(1, Math.abs(Y(v) - zeroY));
+      const incomplete = fullMap.get(s.uid + '|' + day);
+      // 零值画一条中性底痕（与 buka 规范一致：0 值也要可见）
+      if (v === 0) {
+        out += '<rect x="' + x.toFixed(1) + '" y="' + (zeroY - 1).toFixed(1) + '" width="' + bw.toFixed(1) +
+          '" height="2" fill="var(--line)" rx="1"/>';
+      } else {
+        out += '<rect x="' + x.toFixed(1) + '" y="' + y0.toFixed(1) + '" width="' + bw.toFixed(1) +
+          '" height="' + h.toFixed(1) + '" fill="' + (v > 0 ? 'var(--ok)' : 'var(--bad)') + '"' +
+          (incomplete ? ' opacity=".38" stroke="' + color + '" stroke-width="1" stroke-dasharray="2 2"' : '') +
+          ' rx="1.5"/>';
+      }
+      out += '<title>' + esc(s.name || s.uid.slice(0, 8)) + '  ' + esc(day) + '\n' +
+        (v > 0 ? '+' : '') + fmtNum(v) + (incomplete ? '\n⚠️ 该日采样不完整（当天未结束或中途启用）' : '') + '</title>';
+    });
+    // x 轴日期标签（稀疏）
+    const every = Math.ceil(days.length / 10);
+    if (di % every === 0) {
+      out += '<text class="tk" x="' + (gx + groupW / 2).toFixed(1) + '" y="' + (H - 12) +
+        '" text-anchor="middle">' + esc(day.slice(5)) + '</text>';
+    }
+  });
+  out += '</svg>';
+  host.innerHTML = out;
+
+  const lg = $('bhDailyLegend');
+  if (lg) lg.innerHTML = series.map((s, i) =>
+    '<i class="sw" style="background:' + BH_COLORS[i % BH_COLORS.length] + '"></i>' +
+    esc(s.name || s.uid.slice(0, 8))).join(' ');
+}
+
+/* 取某账号的「今日/昨日」变化（用于表格列）。 */
+function dayChangeOf(s, which) {
+  const d = s.daily || [];
+  if (!d.length) return null;
+  if (which === 'today') return d[d.length - 1];
+  return d.length >= 2 ? d[d.length - 2] : null;
+}
+
+function fmtChange(v, full) {
+  if (v === null || v === undefined) return '—';
+  const txt = (v > 0 ? '+' : '') + fmtNum(v);
+  const color = v > 0 ? 'var(--ok)' : v < 0 ? 'var(--bad)' : 'inherit';
+  // 不完整日用虚线底 + 提示，避免与完整日直接比较
+  return '<span style="color:' + color + (full ? '' : '; opacity:.6') + '"' +
+    (full ? '' : ' title="该日采样不完整（当天未结束或中途启用），不宜与完整日直接比较"') + '>' + txt + '</span>';
+}
+
 function fmtNum(v) {
   const n = Number(v) || 0;
   return n.toLocaleString('zh-CN');
@@ -1445,6 +1556,7 @@ async function loadBalance() {
     const d = await api('balance_history?days=' + days);
     const rows = d.series || [];
     renderBalanceChart(rows);
+    renderDailyBars(rows);
     let total = 0, delta = 0;
     rows.forEach(s => { total += Number(s.current || 0); delta += Number(s.change || 0); });
     const st = $('bhStats');
@@ -1462,8 +1574,13 @@ async function loadBalance() {
       '<td class="num">' + fmtNum(s.max) + '</td>' +
       '<td class="num" style="color:' + (s.change > 0 ? 'var(--ok)' : s.change < 0 ? 'var(--bad)' : 'inherit') + '">' +
         (s.change > 0 ? '+' : '') + fmtNum(s.change) + '</td>' +
+      (function () {
+        const t = dayChangeOf(s, 'today'), y = dayChangeOf(s, 'yesterday');
+        return '<td class="num">' + fmtChange(t && t.change, t && t.full) + '</td>' +
+               '<td class="num">' + fmtChange(y && y.change, y && y.full) + '</td>';
+      })() +
       '<td class="num">' + (s.points || []).length + '</td></tr>').join('')
-      : '<tr><td colspan="7"><div class="empty"><div class="big">暂无采样</div>' +
+      : '<tr><td colspan="9"><div class="empty"><div class="big">暂无采样</div>' +
         '服务每 30 分钟自动记录一点余额</div></td></tr>';
     const note = $('bhNote');
     if (note) note.textContent = '更新于 ' + new Date(d.now).toLocaleTimeString('zh-CN', { hour12: false });
