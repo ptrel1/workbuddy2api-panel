@@ -347,9 +347,28 @@ function renderMdRealmSeg(accounts) {
   });
 }
 
+/* availCell 渲染「可用性」列。
+   未测（无记录）显示灰色——**必须与「测了但不可用」区分**，
+   否则用户分不清“没测过”还是“测了不行”。 */
+function availCell(a) {
+  if (!a) return '<td class="num"><span style="color:var(--ink-3)" title="尚未测试（点右上角「测可用性」）">—</span></td>';
+  const d = probeDays(a.tested_at);
+  const stale = d !== null && d > 7 ? ' · ' + d + ' 天前' : '';
+  if (a.ok) {
+    return '<td class="num" title="' + esc('延迟 ' + a.latency_ms + 'ms' + (a.tokens ? ' · 消耗 ' + a.tokens + ' token' : '') + stale) +
+      '"><span style="color:var(--ok)">✓ 可用</span>' +
+      '<div class="note">' + a.latency_ms + 'ms' + stale + '</div></td>';
+  }
+  const why = a.kind || ('HTTP ' + (a.status || '?'));
+  return '<td class="num" title="' + esc((a.msg || '') + stale) + '">' +
+    '<span style="color:var(--bad)">✗ ' + esc(why) + '</span>' +
+    (a.status ? '<div class="note">HTTP ' + a.status + stale + '</div>' : (stale ? '<div class="note">' + stale + '</div>' : '')) +
+    '</td>';
+}
+
 async function loadModels() {
   const tb = $('mdBody');
-  tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
+  tb.innerHTML = '<tr><td colspan="8"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
     // 账号列表用于画域切换（无号域提前禁用，避免点了才 503）
     let accts = [];
@@ -358,17 +377,21 @@ async function loadModels() {
     const realm = mdRealm || 'cn';
 
     // 探测数据是可选增强：拉取失败不影响模型列表本身
-    const [d, pr] = await Promise.all([
+    const [d, pr, av] = await Promise.all([
       api('models?realm=' + encodeURIComponent(realm)),
       api('model_probes').catch(() => ({})),
+      api('model_availability').catch(() => ({})),
     ]);
     const list = d.models || [];
-    if (!list.length) { tb.innerHTML = '<tr><td colspan="7"><div class="empty">该域上游未返回模型</div></td></tr>'; return; }
+    if (!list.length) { tb.innerHTML = '<tr><td colspan="8"><div class="empty">该域上游未返回模型</div></td></tr>'; return; }
     const probes = pr.probes || {};
     // 探测键带域前缀（cn:glm-5.2）。**必须按当前域精确匹配**，不能用
     // endsWith(':'+id) 模糊找 —— 跨域同名模型（如两域都有 deepseek-v4.1）
     // 时 find() 只会命中第一个，导致 global 表格显示 cn 的探测结果。
     const probeOf = id => probes[realm + ':' + id] || probes[id];
+    // 可用性结果也带域前缀，同样精确匹配（跨域同名不得串用）。
+    const avails = av.results || {};
+    const availOf = id => avails[realm + ':' + id];
     tb.innerHTML = list.map(m => {
       const eff = (m.supported_efforts || []).slice();
       if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
@@ -387,15 +410,41 @@ async function loadModels() {
         '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
         '<td class="efs" style="white-space:normal">' + effs + '</td>' +
         '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
-        outCell(m, probeOf(m.id)) + '</tr>';
+        outCell(m, probeOf(m.id)) + availCell(availOf(m.id)) + '</tr>';
     }).join('');
     const hit = list.filter(m => probeOf(m.id)).length;
     $('mdNote').textContent = realmLabel(realm) + ' · ' + list.length + ' 个模型' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
   } catch (e) {
-    tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="8"><div class="empty">' + esc(e.message) + '</div></td></tr>';
   }
 }
 $('btnModels').onclick = loadModels;
+
+/* 手动触发可用性探测。结果由后端持久化，完成后重画表格。
+   为何不自动跑：虽单模型成本极低（1~10 token），但“自动烧额度”
+   应是显式选择而非默认。且探测会串行限流（并发拉高会自造 429），耗时不短。 */
+if ($('btnProbeAvail')) $('btnProbeAvail').onclick = async function () {
+  const b = this;
+  const realm = mdRealm || 'cn';
+  const old = b.textContent;
+  b.disabled = true;
+  b.textContent = '测试中…';
+  const note = $('mdAvailNote');
+  if (note) note.textContent = '';
+  try {
+    const d = await api('model_availability/probe?realm=' + encodeURIComponent(realm), { method: 'POST' });
+    if (note) {
+      note.textContent = '已测 ' + d.tested + ' 个 · 可用 ' + d.available + ' 个' +
+        (d.warn ? ' · ' + d.warn : '');
+    }
+    await loadModels(); // 重拉：同时刷新模型列表与可用性列
+  } catch (e) {
+    if (note) note.textContent = '测试失败：' + e.message;
+  } finally {
+    b.disabled = false;
+    b.textContent = old;
+  }
+};
 
 /* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
 let logCh = 'all';

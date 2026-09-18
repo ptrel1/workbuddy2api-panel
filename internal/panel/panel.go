@@ -184,6 +184,9 @@ func (p *Panel) routes() {
 	// 余额趋势：窗口由 days 参数控制（默认 30 天，上限 30 天=detailedKeep）。
 	p.mux.HandleFunc("GET /panel/api/balance_history", p.withAuth(p.balanceHistory))
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
+	// 模型可用性探测（手动触发 + 结果持久化，见 availability.go）
+	p.mux.HandleFunc("GET /panel/api/model_availability", p.withAuth(p.modelAvailability))
+	p.mux.HandleFunc("POST /panel/api/model_availability/probe", p.withAuth(p.probeAvailability))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 }
