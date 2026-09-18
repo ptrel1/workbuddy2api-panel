@@ -581,7 +581,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     <section class="view" id="view-models" hidden>
       <div class="box">
         <header>
-          <h3>模型能力 <span class="hint">官方返回的最大输出仅为参考——实测多数模型实际被限制在 40K 左右（如 deepseek-v4.1-flash 仅 32K），配置 max_tokens 时请自行留意，以免长输出被静默截断</span></h3>
+          <h3>模型能力 <span class="hint">最大输出为上游声称值，<b>仅供参考</b>——本项未做可靠性验证。实测：同一模型在不同客户端下上限可能不同，本页取<b>较大值</b>；实测到 13.9K tokens 未见截断，但未验证更高区间。配置 max_tokens 时请自行留意。</span></h3>
           <span class="grow"></span>
           <span class="seg" id="mdRealmSeg"></span>
           <span class="note" id="mdNote">实时查询上游</span>

@@ -491,3 +491,35 @@ func xmlDecode(s string) (any, error) {
 		}
 	}
 }
+
+// TestModelHintNoStaleModelName 模型页提示语不得硬编码**具体模型名与数值**。
+//
+// 事故背景（20260917）：提示原文写「实测多数模型被限制在 40K 左右（如
+// deepseek-v4.1-flash 仅 32K）」，但随后模型目录改为双 UA 并集，
+// deepseek-v4.1-flash 的显示值变成 393216 —— **提示与列表自相矛盾**，
+// 且该模型当时甚至不在列表里（只在 CLI 目录）。
+//
+// 判据：提示只描述**口径与不确定性**，不引用会随上游变动的具体事实。
+func TestModelHintNoStaleModelName(t *testing.T) {
+	html := readIndexHTML(t)
+	i := strings.Index(html, "模型能力")
+	if i < 0 {
+		t.Fatal("未找到模型页标题")
+	}
+	j := strings.Index(html[i:], "</h3>")
+	hint := html[i : i+j]
+
+	for _, bad := range []string{"40K", "deepseek", "32K"} {
+		if strings.Contains(hint, bad) {
+			t.Errorf("模型页提示含硬编码的具体事实 %q（会随后续改动失真，与列表矛盾）:\n%s", bad, hint)
+		}
+	}
+	// 必须保留「仅供参考/未验证」的不确定性声明 —— 这是我们诚实的边界
+	if !strings.Contains(hint, "参考") {
+		t.Error("提示丢失「仅供参考」声明：会把声称值当保证值")
+	}
+	// 必须说明本页取较大值（否则用户不知道为何与官方不同）
+	if !strings.Contains(hint, "较大值") {
+		t.Error("提示未说明「取较大值」口径（用户会疑惑为何与官方不同）")
+	}
+}
