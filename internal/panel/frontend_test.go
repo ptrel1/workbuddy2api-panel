@@ -523,3 +523,40 @@ func TestModelHintNoStaleModelName(t *testing.T) {
 		t.Error("提示未说明「取较大值」口径（用户会疑惑为何与官方不同）")
 	}
 }
+
+// TestAvailabilityUIFullyWired 可用性功能的**每个 UI 要素**都必须在
+// index.html 与 app.js 两侧都存在。
+//
+// 为何需要这条（20260918 实踩）：我此前只加了 thead 的「可用性」列与 app.js 的
+// 渲染逻辑，**按钮与结果摘要位漏加**（编辑脚本的 assert 锚点因上下文变化静默失配），
+// 结果后端接口已上线、列头也有，但**用户根本找不到触发入口**。
+// 源码级断言抓不到"两侧不配对"，故这条**逐个要素核对双侧存在性**。
+func TestAvailabilityUIFullyWired(t *testing.T) {
+	html := readIndexHTML(t)
+	js := readAppJS(t)
+
+	// 必须在 index.html 存在的 DOM 锚点
+	for _, id := range []string{"btnProbeAvail", "mdAvailNote"} {
+		if !strings.Contains(html, `id="`+id+`"`) {
+			t.Errorf("index.html 缺少 #%s（可用性功能入口/摘要缺失）", id)
+		}
+		// 且 app.js 必须真的用了它（只加 DOM 不接线 = 死按钮）
+		if !strings.Contains(js, id) {
+			t.Errorf("app.js 未引用 #%s（DOM 存在但无逻辑，等于死按钮）", id)
+		}
+	}
+	// 表头列
+	if !strings.Contains(html, "可用性</th>") {
+		t.Error("index.html 表头缺少「可用性」列")
+	}
+	// 渲染函数与后端调用
+	for _, want := range []string{"function availCell(", "model_availability/probe", "model_availability'"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js 缺少 %q", want)
+		}
+	}
+	// 按钮必须真的绑定了 handler（不能只有 DOM）
+	if !strings.Contains(js, "$('btnProbeAvail').onclick") {
+		t.Error("按钮未绑定 onclick —— 点击无反应")
+	}
+}

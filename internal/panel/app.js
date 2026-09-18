@@ -1,3 +1,35 @@
+  // y 轴下界（20260918 用户反馈"丑"的真实根因）。
+  //
+  // 现象：截图上坐标轴 1854~7499，但两条线都在 2400 以上 —— **底部一大片空白**。
+  // 根因：`lo = Math.max(0, lo - pad)` 把下界夹到 0。夹 0 本身是对的
+  //       （§十：余额非负，不能画负刻度），但代价是**最低值离 0 很远时底部全空**。
+  //
+  // 关键区分（我一开始诊断错了，也把这段写错过一次）：
+  //   - 所谓"中间空档"实测只有 440/7833 = 5.6%，**不是问题**；
+  //   - 真正的浪费是 **0 ~ 最低值 这段（这里 30.6%）**。
+  //
+  // 修法：下界取 `max(0, 最低值 - 留白)`，但**不再无条件拉到 0**。
+  //   只有最低值本身就贴近 0（< 轴高的 15%）时才拉到 0（那时拉到 0 更自然，
+  //   也符合"余额从 0 起"的直觉）；否则从最低值下方留白处起步。
+  //
+  // 为什么可以这样（不违反 §十）：下界仍是**真实存在过的值域下沿**，
+  // 只是不把 0 纳入视野。轴标签显示的是真实余额数字，不产出任何
+  // "物理上不可能的刻度"。若把下界压到**低于**数据最小值且无依据，那才是错的。
+  //
+  // 代价与补偿：轴不从 0 起，读者可能低估相对差距 —— 故在 y 轴左下角
+  //   加一个"轴不从 0 起"的显式标记（见下方 axisBreak 绘制）。
+  const AXIS_ZERO_SNAP = 0.15; // 最低值低于轴高 15% 时才贴 0
+  const dataLo = lo;           // 记录真实最低值（供标记与断言用）
+  const rawLo = Math.max(0, lo - pad);
+  lo = (dataLo <= (hi - rawLo) * AXIS_ZERO_SNAP) ? 0 : rawLo;
+
+  // 坐标系 1:1：W 取容器实际宽度，文字/线宽不再被 CSS 缩放（见 measureWidth 注释）。
+  const W = measureWidth(host), H = 200, PL = 52, PR = 12, PT = 12, PB = 26;
+  const iw = W - PL - PR, ih = H - PT - PB;
+  const X = t => PL + iw * ((t - t0) / (t1 - t0));
+  // Y 映射：单段线性（不压缩空档 —— 实测空档仅 5.6%，压缩反而放大它）。
+  const Y = c => PT + ih - ih * ((c - lo) / (hi - lo));
+
 'use strict';
 /* ── 状态 ─────────────────────────────────────────────────────────── */
 const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
@@ -1380,7 +1412,8 @@ function renderUsageChart(series) {
     host.innerHTML = '<div class="us-empty">暂无用量数据。发起一次对话后再刷新。</div>';
     return;
   }
-  const W = 760, H = 170, PL = 46, PR = 10, PT = 12, PB = 26;
+  // 坐标系 1:1（同余额折线，见 measureWidth 注释）。
+  const W = measureWidth(host), H = 170, PL = 46, PR = 10, PT = 12, PB = 26;
   const iw = W - PL - PR, ih = H - PT - PB;
 
   const max = Math.max(1, ...series.map(p => Number(p.total_tokens || 0)));
@@ -1446,6 +1479,35 @@ const BH_REALMS = [
 /* bhRealm 当前选中的域。null = 尚未初始化（首次加载时按数据自动选一个非空域）。 */
 let bhRealm = null;
 
+/* ── 自绘图表的坐标系基础设施 ──────────────────────────
+   为什么需要：以前用固定 viewBox（760×200）+ CSS width:100%，
+   浏览器会**等比放大整个 SVG（包括文字）**。
+   实测：容器 1060px 时放大 1.39 倍 → CSS 写的 10px 刻度字
+   实际渲染成 13.9px，**比正文 12.5px 还大**——视觉权重倒置。
+   且 lineWidth/r 等排版尺寸也被拉粗，图形看起来很重。
+
+   修法（对齐 buka-wms 沉淀的「**图形长度可缩放，排版尺寸
+   不行**」）：**坐标系 1:1**——量出容器实际像素宽，
+   viewBox 直接用该像素值，不再靠 CSS 缩放。文字于是
+   恒为设计字号，不随容器变化。
+   容器无法量（display:none / 尚未布局）时回退到设计宽 760。 */
+const CHART_FALLBACK_W = 760;
+
+/* measureWidth 量容器内容宽（去掉 padding）。
+   为什么用 clientWidth-padding 而不用 getBoundingClientRect：
+   后者包含 border、且受 CSS transform 影响，算出来的坐标系
+   会与 CSS 布局尺寸不一致（一个被 transform 缩放的容器会让图表
+   再次被非等比拉伸）。 */
+function measureWidth(el) {
+  if (!el) return CHART_FALLBACK_W;
+  const cs = getComputedStyle(el);
+  const pl = parseFloat(cs.paddingLeft) || 0;
+  const pr = parseFloat(cs.paddingRight) || 0;
+  const w = el.clientWidth - pl - pr;
+  return w > 40 ? Math.round(w) : CHART_FALLBACK_W;
+}
+
+
 /* realmOf 归一化账号域：空/未知归入 'other'（不静默丢弃，让它可见）。 */
 function realmOf(s) {
   const r = (s && s.realm) || '';
@@ -1498,10 +1560,39 @@ function renderBalanceChart(series) {
   lo = Math.max(0, lo - pad);
   hi += pad;
 
-  const W = 760, H = 200, PL = 52, PR = 12, PT = 12, PB = 26;
+  // 多账号「上下分居」时的中间空档压缩（20260918 用户反馈"丑"）。
+  //
+  // 现象：两个账号水位差得远（如 5243~6953 与 2400~4803），共享 y 轴后
+  // 一条占上半、一条占下半，中间 440 的空档**完全没数据**——
+  // 格式塔「接近性」会把它们知觉成两个无关图形，而不是"同一池子的两个号"，
+  // 且两条线的波动幅度被这截空白压扁，看谁都"很平"。
+  //
+  // 修法：对**中间无数据的整段**做压缩映射（分段线性 y 轴）。
+  // 只压"确实空着"的区间，不动有数据的部分 —— 故不会失真，
+  // 只是把无效空白折叠掉（这属于「图形长度可缩放」的合法范围）。
+  //
+  // 边界：所有序列两两不重叠才压；有任何重叠就原样（重叠时无空档可压，
+  // 强行压会破坏"它们水位接近"这个事实）。
+
+  // 坐标系 1:1：W 取容器实际宽度，文字/线宽不再被 CSS 缩放（见 measureWidth 注释）。
+  const W = measureWidth(host), H = 200, PL = 52, PR = 12, PT = 12, PB = 26;
   const iw = W - PL - PR, ih = H - PT - PB;
   const X = t => PL + iw * ((t - t0) / (t1 - t0));
-  const Y = c => PT + ih - ih * ((c - lo) / (hi - lo));
+
+  // Y 映射：分段线性。空档内按压缩比挤压，空档外保持原比例。
+  // 单调性保证：映射后仍严格随 c 递增（否则折线会自交，属"不可能的值"）。
+  const Y = compressTo === null
+    ? (c => PT + ih - ih * ((c - lo) / (hi - lo)))
+    : (function () {
+        const total = (gapLo - lo) + compressTo + (hi - gapHi);
+        return function (c) {
+          let v; // 距底部的显示高度（会再换算成 y）
+          if (c < gapLo) v = c - lo;
+          else if (c <= gapHi) v = (gapLo - lo) + compressTo * ((c - gapLo) / (gapHi - gapLo));
+          else v = (gapLo - lo) + compressTo + (c - gapHi);
+          return PT + ih - ih * (v / total);
+        };
+      })();
 
   let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" role="img">';
   for (let i = 0; i <= 4; i++) {              // y 轴 4 档刻度
@@ -1512,6 +1603,16 @@ function renderBalanceChart(series) {
       fmtNum(Math.round(v)) + '</text>';
   }
   out += '<line class="ax" x1="' + PL + '" y1="' + (PT + ih) + '" x2="' + (W - PR) + '" y2="' + (PT + ih) + '"/>';
+
+  // 轴不从 0 起时**必须显式标注**（§十一：口径不标注会被误读）。
+  // 不标的话，读者会把"两线贴得很近/很远"按 0 基线理解，从而**高估相对差距**。
+  // 这里画一个标准的"截断轴"符号（轴左下两道斜杠）+ 文字说明。
+  if (lo > 0) {
+    const yb = PT + ih;
+    out += '<path class="axbreak" d="M' + (PL - 4) + ' ' + (yb - 3) + ' l4 -6 M' + (PL + 1) + ' ' +
+      (yb - 3) + ' l4 -6" fill="none" stroke-width="1.4"/>';
+    out += '<text class="tk" x="' + (PL + 9) + '" y="' + (yb - 4) + '" text-anchor="start">轴不从 0 起</text>';
+  }
 
   const spanDays = (t1 - t0) / 86400000;      // x 轴标签：首/中/末三点
   const fmtT = t => {
@@ -1531,16 +1632,29 @@ function renderBalanceChart(series) {
     const pts = s.points.map(p => ({ x: X(Number(p.t) * 1000), y: Y(Number(p.c)), c: Number(p.c), t: Number(p.t) * 1000, g: p.d }));
     out += '<polyline fill="none" stroke="' + color + '" stroke-width="1.8" stroke-linejoin="round" ' +
       'stroke-linecap="round" points="' + pts.map(p => p.x.toFixed(1) + ',' + p.y.toFixed(1)).join(' ') + '"/>';
+    // 点标记：**只标"显著变化"**，不是每个点都画圈。
+    //
+    // 为何改（20260918 用户反馈"丑"）：原先 delta !== 0 就画圈，151 个采样点
+    // × 2 账号 ≈ 300 个绿/红圆点。折线本身已表达趋势，圆点是**重复编码**；
+    // 而鲜艳小圆点是人眼**前注意加工**最易捕捉的特征 —— 结果注意力被 300 个点
+    // 抓走，反而看不见"线"（想看的趋势）。且相邻点间距 ~7px、圆点直径 6px，
+    // 已经糊成一条花带，退化为噪音。
+    //
+    // 阈值取该账号**自身跨度**的 3%（而非固定值）：水位 4000 的号与 400 的号，
+    // "显著"的绝对量不同，用相对值才等价可比。跨度极小时保底 1，避免永不标记。
+    const span = Math.max(1, hi - lo);
+    const markMin = Math.max(1, span * 0.03);
     pts.forEach((p, i) => {
       const prev = i > 0 ? pts[i - 1] : null;
       const delta = prev ? p.c - prev.c : 0;
-      if (prev && delta !== 0) {              // 涨跌标记：涨=实心绿、跌=小号红
+      const sig = prev && Math.abs(delta) >= markMin;
+      if (sig) {                              // 显著变化才标记：涨=绿、跌=红
         const up = delta > 0;
-        out += '<circle cx="' + p.x.toFixed(1) + '" cy="' + p.y.toFixed(1) + '" r="' + (up ? 3 : 2.2) +
-          '" fill="' + (up ? 'var(--ok)' : 'var(--bad)') + '" stroke="' + color + '" stroke-width="1"/>';
-      } else if (!prev) {
-        out += '<circle cx="' + p.x.toFixed(1) + '" cy="' + p.y.toFixed(1) + '" r="2.2" fill="' + color + '"/>';
+        out += '<circle cx="' + p.x.toFixed(1) + '" cy="' + p.y.toFixed(1) + '" r="2.6" ' +
+          'fill="' + (up ? 'var(--ok)' : 'var(--bad)') + '"/>';
       }
+      // title 仍然**每点都给**（悬停可查任意点）—— 减少的是视觉噪音，
+      // 不是信息量。这是"降噪"与"减信息"的关键区别。
       const when = new Date(p.t).toLocaleString('zh-CN', { hour12: false });
       const head = esc(s.name || s.uid.slice(0, 8)) + '  ' + esc(when) + (p.g ? '（日粒度）' : '');
       out += '<title>' + head + '\n余额 ' + fmtNum(p.c) +
@@ -1604,7 +1718,8 @@ function renderDailyBars(series) {
   if (lo < 0 && hi === 0) hi = Math.max(1, -lo * 0.15);
   if (hi === 0 && lo === 0) { hi = 1; lo = -1; }
 
-  const W = 760, H = 180, PL = 56, PR = 12, PT = 14, PB = 34;
+  // 坐标系 1:1（同余额折线，见 measureWidth 注释）。
+  const W = measureWidth(host), H = 180, PL = 56, PR = 12, PT = 14, PB = 34;
   const iw = W - PL - PR, ih = H - PT - PB;
   const Y = v => PT + ih - ih * ((v - lo) / (hi - lo));
   const zeroY = Y(0);

@@ -414,6 +414,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .uschart-body .ax { stroke: var(--line-soft); stroke-width: 1; }
   .uschart-body .gl { stroke: var(--line-soft); stroke-width: 1; stroke-dasharray: 2 3; opacity: .7; }
   .uschart-body .tk { fill: var(--ink-3); font: 10px var(--mono); }
+  /* 截断轴标记（y 轴不从 0 起时的斜杠 + 说明），用 warn 色提示"注意基线" */
+  .uschart-body .axbreak { stroke: var(--warn); }
+  .uschart-body .axbreak-note { fill: var(--warn); font: 9.5px var(--sans); }
   .uschart-body .us-empty { padding: 28px 0; text-align: center; color: var(--ink-3); font-size: 12.5px; }
   /* 用量表内的 prompt/completion 小条。必须限定在 .us-wrapbar 内：账号池积分条
      也叫 .bar（块级容器 + 百分比内条），同优先级下这里的全局 .bar 会覆盖它，
@@ -585,6 +588,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="grow"></span>
           <span class="seg" id="mdRealmSeg"></span>
           <span class="note" id="mdNote">实时查询上游</span>
+          <span class="note" id="mdAvailNote"></span>
+          <button class="xs" id="btnProbeAvail" title="对该域每个模型发一次最小请求（约 14~32 token/个），确认能否真调通；结果持久化，下次打开直接可见">测可用性</button>
           <button class="xs" id="btnModels">重新获取</button>
         </header>
         <div class="tbl-wrap">
