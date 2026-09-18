@@ -560,3 +560,50 @@ func TestAvailabilityUIFullyWired(t *testing.T) {
 		t.Error("按钮未绑定 onclick —— 点击无反应")
 	}
 }
+
+// TestAppJSStartsWithUseStrict app.js 必须以 'use strict' 开头（第 1 行）。
+//
+// 事故（20260918，严重）：我用脚本"回退"一段错误实现时，`index()` 匹配到了
+// **另一处**同名代码，结果删错范围 —— 把正确实现的函数体**整段搬到了文件顶部**，
+// 留在 'use strict' 之前。因此处仍是合法 JS（只是顶层多了一段孤立代码），
+// **node --check 与所有 Go 测试全绿**，但运行时 `'use strict'` 不再是首条语句，
+// 且原函数体已空 —— **整个面板白屏、什么都加载不出来**。
+//
+// 判据：这类"文件结构被破坏但语法仍合法"的缺陷，只有**结构断言**能抓到。
+// 语法检查（TestAppJSSyntax）抓不到，因为它只验证"能否解析"。
+func TestAppJSStartsWithUseStrict(t *testing.T) {
+	raw, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(raw), "\n")
+	if len(lines) == 0 {
+		t.Fatal("app.js 为空")
+	}
+	if strings.TrimSpace(lines[0]) != "'use strict';" {
+		t.Errorf("app.js 第 1 行 = %q，want 'use strict';"+
+			"（前面有游离代码说明文件结构被破坏——运行时可能整体失效）",
+			strings.TrimSpace(lines[0]))
+	}
+	// 反向守卫：'use strict' 只能出现一次（重复出现是被搬移的迹象）
+	if n := strings.Count(string(raw), "'use strict';"); n != 1 {
+		t.Errorf("'use strict' 出现 %d 次，want 1（重复 = 代码被搬移/复制）", n)
+	}
+}
+
+// TestChartFunctionsHaveBody 每个自绘图表函数体内必须**真的有坐标系定义**。
+//
+// 与上一条互补：这条防"函数体被挖空"（定义为空壳但语法合法）。
+// 事故同源：搬移后 renderBalanceChart 的体被清空，函数仍存在、仍可解析，
+// 但一调用就不产出图形。
+func TestChartFunctionsHaveBody(t *testing.T) {
+	for _, fn := range []string{"function renderBalanceChart(", "function renderDailyBars(", "function renderUsageChart("} {
+		body := funcBody(t, fn)
+		// 每个图表都必须：量宽取 W、算出 iw/ih、构造 svg
+		for _, need := range []string{"measureWidth(host)", "const iw =", "viewBox="} {
+			if !strings.Contains(body, need) {
+				t.Errorf("%s 的体内缺少 %q（函数可能被挖空）", fn, need)
+			}
+		}
+	}
+}
