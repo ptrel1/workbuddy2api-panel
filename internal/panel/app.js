@@ -143,9 +143,61 @@ function go(v) {
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
 go((location.hash || '#accounts').slice(1) in TITLES ? (location.hash || '#accounts').slice(1) : 'accounts');
 
+/* plansMap 套餐分类：短 uid → {kind, evidence, packages}。
+   独立接口获取（逐个账号查上游 billing，慢），故**不随 overview 轮询**，
+   仅进入账号池页时拉一次 + 可手动刷新。 */
+let plansMap = {};
+let planFilter = '';
+
+/* PLAN_LABEL 套餐类型展示名（kind → 中文 + CSS 类）。 */
+const PLAN_LABEL = {
+  free:     { t: '免费版', c: 'plan-free' },
+  trial:    { t: '体验版', c: 'plan-trial' },
+  activity: { t: '活动号', c: 'plan-activity' },
+  standard: { t: '标准版', c: 'plan-standard' },
+  unknown:  { t: '未分类', c: 'plan-unknown' },
+};
+
+/* loadPlans 拉取套餐分类（可重复调用刷新）。 */
+async function loadPlans() {
+  try {
+    const d = await api('plans');
+    plansMap = d.plans || {};
+    const n = $('planNote');
+    if (n) n.textContent = '套餐查询于 ' + (d.updated_at || '—');
+    if (overviewData) renderAccounts(overviewData.accounts || []);
+  } catch (e) {
+    const n = $('planNote');
+    if (n) n.textContent = '套餐查询失败：' + e.message;
+  }
+}
+
+/* planTag 渲染套餐标记。悬停给**完整套餐清单** —— 分类靠关键词匹配，
+   用户应能核对依据（不吞原始信息）。 */
+function planTag(uid) {
+  const short = uid && uid.length > 8 ? uid.slice(0, 8) : uid;
+  const p = plansMap[short];
+  if (!p) return '';
+  const lb = PLAN_LABEL[p.kind] || PLAN_LABEL.unknown;
+  const packs = (p.packages || []);
+  const tip = (p.evidence ? '依据：' + p.evidence + '\n' : '') +
+    (packs.length ? '共 ' + packs.length + ' 个包：\n' + packs.slice(0, 12).join('\n') +
+      (packs.length > 12 ? '\n… 还有 ' + (packs.length - 12) + ' 个' : '') : '无包信息');
+  return '<span class="plan-tag ' + lb.c + '" title="' + esc(tip) + '">' + esc(lb.t) + '</span>';
+}
+
 /* ── 账号池 ───────────────────────────────────────────────────────── */
 function renderAccounts(list) {
   const tb = $('accBody');
+  // 套餐筛选（用户要求"按套餐排序/筛选"）。
+  // 在**渲染前**过滤，保证统计卡与表格一致（否则会"表里 2 个、卡说 4 个"）。
+  if (planFilter) {
+    list = (list || []).filter(s => {
+      const short = s.uid && s.uid.length > 8 ? s.uid.slice(0, 8) : s.uid;
+      const p = plansMap[short];
+      return p && p.kind === planFilter;
+    });
+  }
   if (!list.length) {
     tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
     return;
@@ -157,28 +209,52 @@ function renderAccounts(list) {
     const dg = (new Date(s.degrade_until || 0) - Date.now()) / 1000;
     const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0, dg > 0 ? dg : 0);
     let cls = '', tag;
-    if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
+    if (s.disabled) {
+      cls = 'off';
+      // 禁用必须说明「该怎么办」—— 三种情况动作完全不同（revive.go 的 DisableInfo）：
+      // 人工禁用 → 点解冻；临时禁用 → 等自动重试；凭证失效 → 需重新登录。
+      // 只给"已禁用"用户不知道该干什么。
+      const dh = s.disable_hint || {};
+      tag = '<span class="tag bad">已禁用</span>' +
+        (dh.hint ? '<div class="dhint">' + esc(dh.hint) + '</div>' : '');
+    }
     else if (cool > 0) {
       cls = 'cool';
       const kind = bl > Math.max(s.cool_remaining_sec || 0, dg > 0 ? dg : 0) ? '熔断'
         : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
-      // 限流详情：哪些模型被限、各自何时恢复（backend 的 RateLimitedModels）。
-      // 此前只显示"限流冷却·22h"四个字，运维看不出**是哪个模型**被限——
-      // 而 6004 是模型级限流，同一账号其他模型仍可用（可切模型绕开）。
-      const rlm = s.rate_limited_models || [];
-      if (rlm.length) {
-        tag += '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' +
-          rlm.map(r => {
-            // reset_at 是上游权威重置墙钟（未截断）；until 是本地截断后的冷却截止。
-            // 展示 reset_at 优先（那是"真正什么时候能再用"）。
-            const at = r.reset_at || r.until;
-            const t = at ? new Date(at) : null;
-            const when = t && !isNaN(t) ? t.toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '?';
-            return '⛔ ' + esc(r.model || '?') + ' → 恢复 ' + esc(when);
-          }).join('<br>') + '</div>';
-      }
-    } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
+    } else {
+      // 模型级限流时账号**并非完全可用** —— 至少有一个模型用不了。
+      // 仍显示绿色"可用"会与下方的"⛔ 模型限流"自相矛盾（用户无法判断到底能不能用）。
+      // 故：有模型被限 → 黄标"部分受限"，并注明还剩几个模型可用。
+      const rlmN = (s.rate_limited_models || []).length;
+      tag = rlmN
+        ? '<span class="tag warn">部分受限</span>'
+        : '<span class="tag ok">可用</span>';
+    }
+
+    // 模型级限流详情（**独立于 cooling**）。
+    //
+    // 为何必须独立（用户实测反馈"不能在账号池里写哪个账号哪个模型有限流吗"）：
+    // 6004 是**模型级**限流 —— 写 modelCooldowns，**不设账号级 until**
+    // （cooldown.go 注释："不写 until（全账号级冷却不受模型级限流污染）"）。
+    // 故 cooling 仍为 false 而该模型**实际不可用**。
+    // 首版把它嵌在 `else if (cool > 0)` 里 → **模型级限流永远不会显示**。
+    const rlm = s.rate_limited_models || [];
+    if (rlm.length && !s.disabled) {
+      const rlmLines = rlm.map(r => {
+        // reset_at 是上游权威重置墙钟；until 是本地截断后的截止。
+        // 展示 reset_at 优先（那才是"真正什么时候能再用"）。
+        const at = r.reset_at || r.until;
+        const t = at ? new Date(at) : null;
+        const when = t && !isNaN(t)
+          ? t.toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+          : '?';
+        return esc(r.model || '?') + ' → ' + esc(when);
+      }).join('<br>');
+      tag += '<div class="rlm" title="该模型被上游限流；同账号其他模型不受影响，可切模型绕开">' +
+        '<b>⛔ 模型限流</b><br>' + rlmLines + '</div>';
+    }
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     const cred = s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits));
@@ -203,7 +279,7 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + planTag(s.uid) + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -349,6 +425,10 @@ $('accBody').addEventListener('click', async ev => {
   finally { b.disabled = false; loadOverview(true); }
 });
 
+if ($('accPlanFilter')) $('accPlanFilter').onchange = function () {
+  planFilter = this.value;
+  if (overviewData) renderAccounts(overviewData.accounts || []);
+};
 $('btnCheckinAll').onclick = async () => {
   try { await api('checkin_all', { method: 'POST' }); toast('全部签到已开始，结果见日志', 'ok'); }
   catch (e) { toast(e.message, 'err'); }
@@ -852,7 +932,7 @@ $('btnRefresh').onclick = async () => {
 
 /* ── 轮询 ─────────────────────────────────────────────────────────── */
 function refreshVisible() {
-  if (view === 'accounts') loadOverview(true);
+  if (view === 'accounts') { loadOverview(true); if (!Object.keys(plansMap).length) loadPlans(); }
   else if (view === 'logs') loadLogs();
   else if (view === 'taskscenter') pollQueueOnce();
 }

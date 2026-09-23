@@ -782,3 +782,104 @@ func TestErrorAccountShowsNickname(t *testing.T) {
 		t.Error("loadOverview 未重建昵称映射（改昵称后错误汇总不更新）")
 	}
 }
+
+// TestModelRateLimitShownInAccountPool 模型级限流必须显示在**账号池**的状态列。
+//
+// 用户实测反馈「不能在账号池里写哪个账号哪个模型有限流吗」。
+// 根因：6004 是**模型级**限流 —— 它写 `modelCooldowns`，
+// **不设账号级 until**（cooldown.go 注释明写"不写 until（全账号级冷却不受
+// 模型级限流污染）"）。所以 `cooling` 仍为 false，而账号对该模型**实际不可用**。
+// 首版把限流详情嵌在 `else if (cool > 0)` 分支里 → **模型级限流永远不显示**。
+//
+// 断言方式：**逐字符跟踪花括号深度**，确认 rlm 块与 cooling 分支**同深度**
+// （即在其之外），而不是被嵌进去。
+// ⚠️ 我第一版用「括号计数 > 」的粗判据，误报了一次 —— 必须精确跟踪深度。
+func TestModelRateLimitShownInAccountPool(t *testing.T) {
+	src := readAppJS(t)
+	i := strings.Index(src, "function renderAccounts(")
+	if i < 0 {
+		t.Fatal("renderAccounts 不存在")
+	}
+	body := src[i:]
+	if j := strings.Index(body, "\n}\n"); j > 0 {
+		body = body[:j]
+	}
+	if !strings.Contains(body, "rate_limited_models") {
+		t.Fatal("账号池未读取 rate_limited_models")
+	}
+
+	// 逐字符跟踪深度：记录 cooling 分支的深度与 rlm 块的深度
+	depth := 0
+	coolDepth, rlmDepth := -1, -1
+	lines := strings.Split(body, "\n")
+	for _, ln := range lines {
+		// 进入该行前先看它属于哪个深度
+		if strings.Contains(ln, "else if (cool > 0)") && coolDepth < 0 {
+			coolDepth = depth
+		}
+		if strings.Contains(ln, "const rlm = s.rate_limited_models") && rlmDepth < 0 {
+			rlmDepth = depth
+		}
+		depth += strings.Count(ln, "{") - strings.Count(ln, "}")
+	}
+	if coolDepth < 0 {
+		t.Fatal("未找到 cooling 分支")
+	}
+	if rlmDepth < 0 {
+		t.Fatal("未找到 rlm 块")
+	}
+	if rlmDepth > coolDepth {
+		t.Errorf("限流块深度 %d > cooling 分支深度 %d —— 它被嵌在 cooling 内，"+
+			"而模型级限流不设账号级 until（cooling 恒 false）→ **永远不显示**",
+			rlmDepth, coolDepth)
+	}
+}
+
+// TestPartialLimitStatusTag 有模型被限时状态标签不得是绿色"可用"。
+//
+// 判据（§十 同源）：不得产出与事实矛盾的展示 ——
+// "可用"紧挨"⛔ 模型限流"就是自相矛盾，用户无法判断到底能不能用。
+func TestPartialLimitStatusTag(t *testing.T) {
+	body := funcBody(t, "function renderAccounts(")
+	if !strings.Contains(body, "部分受限") {
+		t.Error("有模型被限时仍显示绿色「可用」（与下方的⛔限流自相矛盾）")
+	}
+}
+
+// TestPlanUIFullyWired 套餐标记 + 筛选器的每个要素必须**双侧存在且被调用**。
+func TestPlanUIFullyWired(t *testing.T) {
+	html := readIndexHTML(t)
+	js := readAppJS(t)
+	if !strings.Contains(html, `id="accPlanFilter"`) {
+		t.Error("index.html 缺少套餐筛选器 #accPlanFilter")
+	}
+	for _, fn := range []string{"function planTag(", "function loadPlans("} {
+		if !strings.Contains(js, fn) {
+			t.Errorf("app.js 缺少 %s", fn)
+		}
+	}
+	// 必须真的被用（定义≠生效）
+	if !strings.Contains(js, "planTag(s.uid)") {
+		t.Error("renderAccounts 未调用 planTag（套餐标记不会显示）")
+	}
+	if !strings.Contains(js, "loadPlans()") {
+		t.Error("loadPlans 未被调用（套餐数据永不加载）")
+	}
+	if !strings.Contains(js, "$('accPlanFilter').onchange") {
+		t.Error("筛选器未绑定 onchange（选了没反应）")
+	}
+}
+
+// TestPlanFilterAppliedBeforeRender 套餐筛选必须**在渲染前**过滤，
+// 否则统计卡与表格会不一致（表里 2 个、卡说 4 个）。
+func TestPlanFilterAppliedBeforeRender(t *testing.T) {
+	body := funcBody(t, "function renderAccounts(")
+	iFilter := strings.Index(body, "planFilter")
+	iRender := strings.Index(body, "tb.innerHTML =")
+	if iFilter < 0 {
+		t.Fatal("renderAccounts 未实现套餐筛选")
+	}
+	if iRender >= 0 && iFilter > iRender {
+		t.Error("套餐筛选在渲染之后才做 —— 统计卡与表格会不一致")
+	}
+}

@@ -48,6 +48,7 @@ func (e *entry) clearCoolingLocked() {
 func (p *Pool) disableLocked(e *entry, reason string) {
 	e.clearCoolingLocked()
 	e.disabled = true
+	e.disabledAt = time.Now() // 供「临时禁用到期自动重试」计算
 	e.reason = reason
 	p.dirty.Store(true)
 }

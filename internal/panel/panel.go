@@ -187,6 +187,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	// 模型可用性探测（手动触发 + 结果持久化，见 availability.go）
 	p.mux.HandleFunc("GET /panel/api/model_availability", p.withAuth(p.modelAvailability))
+	p.mux.HandleFunc("GET /panel/api/plans", p.withAuth(p.plans))
 	p.mux.HandleFunc("POST /panel/api/model_availability/probe", p.withAuth(p.probeAvailability))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
@@ -218,6 +219,58 @@ func (p *Panel) apiKey() string {
 		return p.cfg.Live.Load().APIKey
 	}
 	return p.cfg.APIKey
+}
+
+// plans 返回各账号的套餐分类（供账号池标记「免费版/活动号/标准版」）。
+//
+// 为何独立接口而非并入 overview：套餐信息要**逐个账号向上游查询**（billing 接口），
+// 单账号 ~300ms；并入 overview 会让主页面（每 5 秒轮询）变慢。
+// 故拆成独立接口，前端**按需调用一次**（不轮询），并在面板上显示"查询于 XX"。
+//
+// 查询失败/无数据的账号返回 unknown —— **不猜**（§十）。
+func (p *Panel) plans(w http.ResponseWriter, r *http.Request) {
+	accts := p.cfg.Pool.List()
+	out := make(map[string]any, len(accts))
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	sem := make(chan struct{}, 3) // 并发上限：避免瞬时打满上游限流
+	for _, st := range accts {
+		wg.Add(1)
+		go func(uid string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			a := p.cfg.Pool.AuthByUID(uid)
+			if a == nil {
+				return
+			}
+			packs, remain, size, err := p.cfg.Upstream.CreditPackages(a)
+			names := make([]string, 0, len(packs))
+			for _, pk := range packs {
+				names = append(names, pk.Name)
+			}
+			kind, evidence := pool.ClassifyPlan(names)
+			rec := map[string]any{
+				"kind":     string(kind),
+				"evidence": evidence,
+				"packages": names,
+				"remain":   remain,
+				"size":     size,
+			}
+			if err != nil {
+				rec["error"] = err.Error()
+			}
+			mu.Lock()
+			out[uid] = rec
+			mu.Unlock()
+		}(st.UID)
+	}
+	wg.Wait()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"plans":      out,
+		"updated_at": time.Now().Format("15:04:05"),
+	})
 }
 
 // ---------------------------------------------------------------------------

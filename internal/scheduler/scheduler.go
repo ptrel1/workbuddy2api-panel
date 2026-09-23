@@ -427,11 +427,46 @@ func (s *Scheduler) RunKeepaliveNow() {
 	}
 }
 
+// RetryTransientDisabled 对「临时禁用到期」的账号各**试一次**恢复。
+//
+// 语义（详见 pool/revive.go 的策略说明）：
+//   - 只挑 DisableTransient（会话连续失效，疑网络/上游抖动）且已过冷却期的号；
+//   - **必须先验证再恢复**：refresh 成功才 Revive（放回池子）；否则
+//     NoteTransientRetryFailed 升级为「需重新登录」，**不再自动重试** ——
+//     避免每 30 分钟无限重试一个确认失效的号、反复骚扰上游；
+//   - **人工禁用永不自动解**（候选阶段已排除 DisableManual）。
+//
+// 为何挂在余额刷新里：它每 5 分钟跑一次，天然提供"到期检查"的节拍，
+// 无需新增定时器（极简运维：复用既有循环，不加依赖）。
+func (s *Scheduler) RetryTransientDisabled() {
+	now := time.Now()
+	for _, uid := range s.cfg.Pool.TransientRetryCandidates(now) {
+		a := s.cfg.Pool.AuthByUID(uid)
+		if a == nil {
+			continue
+		}
+		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
+			log.Printf("transient-retry %s: refresh failed, escalating to re-login: %v", uid, err)
+			s.cfg.Pool.NoteTransientRetryFailed(uid)
+			continue
+		}
+		if err := a.SaveAtomic(); err != nil {
+			// 刷新成功但落盘失败：不恢复（下次启动会用旧 token），留痕
+			log.Printf("transient-retry %s: save auth failed: %v", uid, err)
+			continue
+		}
+		s.cfg.Pool.Revive(uid) // refresh 成功 = 会话确实恢复了，放回池子
+		log.Printf("transient-retry %s: refresh ok, account revived", uid)
+	}
+}
+
 // RunBalanceRefreshNow 并发对所有非禁用账号查询余额并更新池内 credits。
 // 解冻语义与签到一致（ReenableIfCredits：余额 > 0 的冷却账号自动解冻），
 // 但不做签到、不刷新 token——只让"积分"这个观测量保持新鲜。
 // 供两类入口复用：后台周期任务（StartBalanceRefresh）与面板手动全量刷新。
 func (s *Scheduler) RunBalanceRefreshNow() {
+	// 顺带处理「临时禁用到期」的账号（复用本循环的 5 分钟节拍，不新增定时器）。
+	s.RetryTransientDisabled()
 	var wg sync.WaitGroup
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {

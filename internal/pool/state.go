@@ -489,6 +489,10 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 	if st.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。
 		st.DisabledReason = e.reason
+		// 禁用说明：性质（人工/临时/需重登）+ 下一步动作 + 自动重试时刻。
+		// 面板据此显示"该怎么办"，而不是只给一个"已禁用"。
+		info := describeDisable(e.reason, e.disabledAt)
+		st.DisableHint = &info
 	}
 	if st.Cooling {
 		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。

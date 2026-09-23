@@ -77,14 +77,18 @@ type Status struct {
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
 	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
 	// 供面板/状态接口按域分组展示。
-	Realm           string     `json:"realm,omitempty"`
-	Disabled        bool       `json:"disabled"`
-	DisabledReason  string     `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
-	SuccessCount    int64      `json:"success_count,omitempty"`
-	ErrTotal        int64      `json:"err_total,omitempty"`
-	LastSuccessTime time.Time  `json:"last_success,omitempty"`
-	LastErrTime     time.Time  `json:"last_err,omitempty"`
-	TokenUsage      TokenUsage `json:"token_usage,omitempty"`
+	Realm          string `json:"realm,omitempty"`
+	Disabled       bool   `json:"disabled"`
+	DisabledReason string `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	// DisableHint 禁用说明（性质 + 下一步动作 + 自动重试时刻）。
+	// 为何需要：只给"已禁用"用户不知道该干什么 —— 需重登 / 会自动重试 / 人工禁的，
+	// 三种情况动作完全不同（见 revive.go）。
+	DisableHint     *DisableInfo `json:"disable_hint,omitempty"`
+	SuccessCount    int64        `json:"success_count,omitempty"`
+	ErrTotal        int64        `json:"err_total,omitempty"`
+	LastSuccessTime time.Time    `json:"last_success,omitempty"`
+	LastErrTime     time.Time    `json:"last_err,omitempty"`
+	TokenUsage      TokenUsage   `json:"token_usage,omitempty"`
 	// ModelCosts 每模型实测成本台账（P1-anti-monopoly 可观测性）：运维据此自查
 	//「为什么总选它」——tier 0（免费）垄断 / tier 2 单价排序一眼可见。
 	// 仅 modelCostTTL 内的有效观测，每模型一行（cost_per_1k + last_seen +
@@ -173,6 +177,7 @@ type entry struct {
 	coolKind        CoolKind
 	until           time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
 	disabled        bool
+	disabledAt      time.Time // 禁用时刻（「临时禁用到期自动重试」用）
 	reason          string
 	lastUsed        time.Time // 最近被选中时刻（防并发撞号）
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
@@ -356,6 +361,7 @@ type stateAccount struct {
 	Credits      int64     `json:"credits"`
 	CreditsTotal int64     `json:"credits_total,omitempty"`
 	Disabled     bool      `json:"disabled"`
+	DisabledAt   time.Time `json:"disabled_at,omitempty"` // 供「临时禁用到期自动重试」
 	Reason       string    `json:"reason,omitempty"`
 	Until        time.Time `json:"until,omitempty"`
 	CoolKind     CoolKind  `json:"cool_kind"`

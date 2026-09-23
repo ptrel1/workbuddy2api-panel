@@ -418,6 +418,30 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   table.acc.err td.kind { font-weight: 550; }
   table.acc.err .why { color: var(--ink-3); font-size: 11px; margin-top: 2px; }
 
+  /* 套餐标记（账号名旁的 pill）：免费/活动/体验/标准 四种语义色。
+     为何用色 + 文字双编码：颜色供**前注意扫描**（一眼看出哪些号"额度不稳"），
+     文字保证色盲用户与打印场景仍可读（不可只靠颜色传达信息）。 */
+  .plan-tag { display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 4px;
+    font-size: 10.5px; font-weight: 550; vertical-align: 1px; white-space: nowrap; }
+  .plan-free { background: var(--bad-soft); color: var(--bad); }
+  .plan-trial { background: var(--warn-soft); color: var(--warn); }
+  .plan-activity { background: var(--accent-soft); color: var(--accent); }
+  .plan-standard { background: var(--ok-soft); color: var(--ok); }
+  .plan-unknown { background: var(--surface-2); color: var(--ink-3); }
+
+  /* 禁用说明（账号池状态列内）：告诉用户"下一步做什么"。
+     用中性灰而非红色 —— 红色表示"出事了"，而这里要传达的是"该怎么做"。 */
+  .dhint { margin-top: 3px; font-size: 11px; line-height: 1.5; color: var(--ink-3); }
+
+  /* 模型级限流块（账号池状态列内）：
+     为何给底色而不是纯文字 —— 它表示"该账号对该模型不可用"这一**状态**，
+     而状态需要与"可用"在视觉上**可区分**（前注意加工：色块比文字更快被扫到）。
+     用 warn 而非 bad：账号本身没坏（其他模型仍可用），只是该模型被限。 */
+  .rlm { margin-top: 4px; padding: 4px 7px; border-radius: 5px;
+    background: var(--warn-soft); border-left: 2px solid var(--warn);
+    font-size: 11px; line-height: 1.55; color: var(--ink-2); }
+  .rlm b { color: var(--warn); font-weight: 600; }
+
   /* 池子健康横幅（黄条）：只在 healthy 偏低时出现 */
   .pool-alert { margin: 10px 12px 0; padding: 9px 12px; border-radius: 8px;
     background: var(--warn-soft); border: 1px solid rgba(245,181,68,.35);
@@ -559,6 +583,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button class="xs" id="btnTravelAll">旅行巡检</button>
           <button class="xs" id="btnActivityAll">活跃上报</button>
           <button class="xs" id="btnKeepaliveAll">全部保活</button>
+          <select class="xs" id="accPlanFilter" title="按套餐类型筛选账号">
+            <option value="">全部套餐</option>
+            <option value="standard">标准版</option>
+            <option value="activity">活动号</option>
+            <option value="trial">体验版</option>
+            <option value="free">免费版</option>
+            <option value="unknown">未分类</option>
+          </select>
+          <span class="note" id="planNote"></span>
         </header>
         <!-- 池子健康横幅：healthy<=1 时亮黄条。
              为何需要：此前池子枯竭（如 3 个号全被 6004 限流）时，用户只能
