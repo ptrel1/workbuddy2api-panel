@@ -732,3 +732,53 @@ func TestErrorsRenderUntilTime(t *testing.T) {
 		t.Error("未区分「全局错误」与「账号错误」——会把全局问题栽给某个账号")
 	}
 }
+
+// TestErrHandlerPassesTimestamp errorsHandler 必须把 Ring 的 TS **传给**聚合函数。
+//
+// 变异测试暴露：只测聚合函数（AggregateErrors）咬不住这个 ——
+// 把 handler 里的 `TS: e.TS` 删掉（重放原始 bug），聚合函数的单测仍全绿，
+// 但生产路径的「最近」列会再次恒空。**必须在 handler 层面钉住。**
+func TestErrHandlerPassesTimestamp(t *testing.T) {
+	path, _ := filepath.Abs("panel.go")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(b)
+	i := strings.Index(src, "func (p *Panel) errorsHandler(")
+	if i < 0 {
+		t.Fatal("errorsHandler 不存在")
+	}
+	j := strings.Index(src[i:], "\n}\n")
+	body := src[i : i+j]
+	if !strings.Contains(body, "e.TS") {
+		t.Error("errorsHandler 未把 LogEntry.TS 传给聚合（Ring 的 Text 已剥时间戳 → 「最近」列会恒空）")
+	}
+}
+
+// TestErrorAccountShowsNickname 错误汇总的账号列必须优先显示**昵称**。
+//
+// 用户实测反馈「怎么没写哪个账号」：只显示 8 位 uid（1aeaf3ba）
+// 等于让用户自己做「哈希 → 人」的映射，这是把认知负担推给用户。
+// 昵称（周五口/pt/汪羽杰）才是用户认知里的"账号"。
+func TestErrorAccountShowsNickname(t *testing.T) {
+	js := readAppJS(t)
+	body := funcBody(t, "function renderErrors(")
+	if !strings.Contains(body, "uidNames") {
+		t.Error("renderErrors 未查昵称映射（只显示 uid，用户认不出是哪个账号）")
+	}
+	if !strings.Contains(body, "uidName") {
+		t.Error("renderErrors 未使用昵称变量")
+	}
+	// 必须真的把昵称渲染出来（只查不改 = 白查）
+	if !strings.Contains(body, "esc(uidName)") {
+		t.Error("renderErrors 查了昵称但未渲染（只查不用）")
+	}
+	// 昵称映射必须从 overview 重建（昵称可能在面板里被改）
+	if !strings.Contains(js, "refreshUIDNames(") {
+		t.Error("缺少 refreshUIDNames（昵称映射未建立/未刷新）")
+	}
+	if !strings.Contains(js, "refreshUIDNames(d.accounts") {
+		t.Error("loadOverview 未重建昵称映射（改昵称后错误汇总不更新）")
+	}
+}

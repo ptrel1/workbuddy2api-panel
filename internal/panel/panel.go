@@ -258,9 +258,11 @@ func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
 // 汇总回答"是不是有问题"，明细回答"具体怎么了"（见 errors.go 的设计说明）。
 func (p *Panel) errorsHandler(w http.ResponseWriter, r *http.Request) {
 	entries := p.logs.Snapshot()
-	lines := make([]string, 0, len(entries))
+	// 传结构化条目（带 TS）——Ring 的 Text 已剥时间戳，只有 TS 才是真实时刻；
+	// 首版只传 Text，「最近」列恒空（实测被用户发现）。
+	lines := make([]LogLine, 0, len(entries))
 	for _, e := range entries {
-		lines = append(lines, e.Text)
+		lines = append(lines, LogLine{Text: e.Text, TS: e.TS})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":         true,

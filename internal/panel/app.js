@@ -314,6 +314,7 @@ async function loadOverview(quiet) {
     $('accNote').textContent = d.in_flight_full ? d.in_flight_full + ' 个账号在途占满' : '';
     const up = Math.floor(d.uptime_sec);
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
+    refreshUIDNames(d.accounts || []);
     renderAccounts(d.accounts || []);
   } catch (e) { if (!quiet) toast(e.message, 'err'); }
 }
@@ -545,6 +546,23 @@ function isErrLine(text) {
   return t.startsWith('WARN') || t.startsWith('ERR');
 }
 
+/* uidNames 短 uid → 昵称 映射（供错误汇总显示"人认得"的账号名）。
+   数据来自 overview 的 accounts（每个都带 nickname）。
+   为何用短 uid 做键：后端 errors 接口返回的就是短 uid（8 位），保持一致。
+   刷新时机：loadOverview 每次都会重建（昵称可能在面板里被改）。 */
+let uidNames = {};
+
+/* refreshUIDNames 从 overview 数据重建 uid→昵称 映射。 */
+function refreshUIDNames(accounts) {
+  const m = {};
+  (accounts || []).forEach(a => {
+    if (!a || !a.uid) return;
+    const short = a.uid.length > 8 ? a.uid.slice(0, 8) : a.uid;
+    if (a.nickname) m[short] = a.nickname;
+  });
+  uidNames = m;
+}
+
 /* renderErrors 画错误汇总表。
    设计要点（见 index.html 的注释）：严重度色条 + 次数等宽大字 + 解除时间。 */
 function renderErrors(stats, updatedAt) {
@@ -559,10 +577,20 @@ function renderErrors(stats, updatedAt) {
   }
   tb.innerHTML = stats.map(st => {
     const uid = st.uid || '';
-    // 账号列：有 uid 显示短 uid（面板其它处同口径），无 uid 明确标注
-    //（如"模型目录拉取失败"是全局的，不该伪装成某个账号的问题）
+    // 账号列：**优先显示昵称**（与账号池页同口径），短 uid 作副行。
+    //
+    // 为何不能只显示 uid（用户实测反馈"怎么没写哪个账号"）：
+    // uid 是 8 位十六进制（1aeaf3ba），**人记不住也认不出**；
+    // 而昵称（周五口 / pt / 汪羽杰）才是用户认知里的"账号"。
+    // 只给 uid = 让用户自己去做一次"哈希 → 人"的映射，这是把认知负担
+    // 推给用户（对齐 dev-principles：信息可解释）。
+    // 昵称缺失时才退回 uid（不编造）。
+    const uidName = uid ? (uidNames[uid] || '') : '';
     const who = uid
-      ? '<span class="mono" style="font-size:11.5px">' + esc(uid) + '</span>'
+      ? (uidName
+          ? '<div class="nm" style="font-size:12.5px">' + esc(uidName) + '</div>' +
+            '<div class="mono" style="font-size:11px;color:var(--ink-3)">' + esc(uid) + '</div>'
+          : '<span class="mono" style="font-size:11.5px">' + esc(uid) + '</span>')
       : '<span style="color:var(--ink-3)">（全局）</span>';
     const model = st.model ? '<div class="why">模型 ' + esc(st.model) + '</div>' : '';
     const code = st.code ? '<div class="why">code ' + esc(st.code) + '</div>' : '';

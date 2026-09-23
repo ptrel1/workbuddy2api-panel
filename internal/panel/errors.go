@@ -120,17 +120,41 @@ func kindOf(line string) (kind, code string, sev errSeverity) {
 	return kind, code, sev
 }
 
+// LogLine 聚合输入：日志文本 + 该行时刻。
+//
+// 为何需要独立的时刻字段：Ring 存的 Text **已剥离时间戳**（详见 ring.go），
+// 故不能从文本里解析时刻；而 TS 是 Ring 记录的真实时刻。
+// 首版只传 Text → 「最近」列恒为空（实测被用户发现）。
+type LogLine struct {
+	Text string
+	TS   time.Time
+}
+
 // AggregateErrors 把日志行聚合为「账号 × (类型,模型)」统计。
 //
 // 只统计 WARN/ERR 行 —— INFO 不是错误（但 kindOf 会过滤掉无法归类的行）。
 // 输出按 严重度 → 次数 降序：**最该看的排最前**（视觉权重与重要性一致）。
-func AggregateErrors(lines []string) []ErrStat {
+// AggregateErrors 聚合日志行（带时刻，生产路径用这个）。
+func AggregateErrors(lines []LogLine) []ErrStat {
+	return aggregateErrors(lines)
+}
+
+// AggregateErrorsText 聚合纯文本行（无时刻）—— 仅供测试与离线分析。
+func AggregateErrorsText(lines []string) []ErrStat {
+	conv := make([]LogLine, 0, len(lines))
+	for _, l := range lines {
+		conv = append(conv, LogLine{Text: l})
+	}
+	return aggregateErrors(conv)
+}
+
+func aggregateErrors(lines []LogLine) []ErrStat {
 	type key struct{ uid, kind, model string }
 	agg := map[key]*ErrStat{}
 	order := []key{}
 
-	for _, line := range lines {
-		txt := strings.TrimSpace(line)
+	for _, ln := range lines {
+		txt := strings.TrimSpace(ln.Text)
 		// 剥离可选的行首时间戳（并顺便取出时刻）。Ring 已剥过，日志文件未剥。
 		at := ""
 		if m := reErrTS.FindStringSubmatch(txt); m != nil {
@@ -171,7 +195,11 @@ func AggregateErrors(lines []string) []ErrStat {
 		if until != "" {
 			st.Until = until // 后来的覆盖（更接近当前状态）
 		}
-		if at != "" {
+		// 「最近」优先用 Ring 的真实时刻（生产路径）；
+		// 无时刻时退回行首解析（离线分析纯文本日志）。
+		if !ln.TS.IsZero() {
+			st.Last = ln.TS.Format("15:04:05")
+		} else if at != "" {
 			st.Last = at
 		}
 	}

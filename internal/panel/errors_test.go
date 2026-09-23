@@ -3,6 +3,7 @@ package panel
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // 真实日志样本（取自生产日志，含各类错误形态）。
@@ -21,7 +22,7 @@ var realErrLines = []string{
 // TestAggregateErrorsGroupsByAccountAndKind 聚合必须按「账号 × 类型」分组，
 // 把 N 行原始日志压成 M 条（M≪N）—— 这是"能看懂"的前提。
 func TestAggregateErrorsGroupsByAccountAndKind(t *testing.T) {
-	stats := AggregateErrors(realErrLines)
+	stats := AggregateErrorsText(realErrLines)
 	if len(stats) == 0 {
 		t.Fatal("未聚合出任何错误")
 	}
@@ -49,7 +50,7 @@ func TestAggregateErrorsGroupsByAccountAndKind(t *testing.T) {
 // TestAggregateErrorsSortedBySeverityThenCount 排序必须「严重度优先，其次次数」——
 // 最该看的排最前（视觉权重与重要性一致）。
 func TestAggregateErrorsSortedBySeverityThenCount(t *testing.T) {
-	stats := AggregateErrors(realErrLines)
+	stats := AggregateErrorsText(realErrLines)
 	rank := map[string]int{"bad": 0, "warn": 1, "info": 2}
 	for i := 1; i < len(stats); i++ {
 		a, b := stats[i-1], stats[i]
@@ -64,7 +65,7 @@ func TestAggregateErrorsSortedBySeverityThenCount(t *testing.T) {
 
 // TestAggregateErrorsIgnoresNonErrors INFO/正常行不得计入（否则统计被稀释）。
 func TestAggregateErrorsIgnoresNonErrors(t *testing.T) {
-	stats := AggregateErrors([]string{
+	stats := AggregateErrorsText([]string{
 		`2026/09/17 08:00:00 INFO: [upstream] balance-sample abc: credits=100`,
 		`2026/09/17 08:00:01 loaded 4 account(s) from ./auths`,
 		`| #001 | 16:52:06 | cn:deepseek | sync | 200 | uid=685754d3 | TTFB=1.2s |`,
@@ -76,7 +77,7 @@ func TestAggregateErrorsIgnoresNonErrors(t *testing.T) {
 
 // TestAggregateErrorsModelBlocked 11102 必须识别为「模型不可用」并带模型名。
 func TestAggregateErrorsModelBlocked(t *testing.T) {
-	stats := AggregateErrors(realErrLines)
+	stats := AggregateErrorsText(realErrLines)
 	var found *ErrStat
 	for i := range stats {
 		if stats[i].Code == "11102" {
@@ -93,7 +94,7 @@ func TestAggregateErrorsModelBlocked(t *testing.T) {
 
 // TestAggregateErrorsTransportFailures 传输层失败无业务码，也必须被归类。
 func TestAggregateErrorsTransportFailures(t *testing.T) {
-	stats := AggregateErrors(realErrLines)
+	stats := AggregateErrorsText(realErrLines)
 	var found bool
 	for _, s := range stats {
 		if s.Kind == "传输失败" && s.UID == "685754d3" {
@@ -102,5 +103,41 @@ func TestAggregateErrorsTransportFailures(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("未归类传输失败: %+v", stats)
+	}
+}
+
+// TestAggregateErrorsUsesRingTimestamp 「最近」时刻必须取自 Ring 的 TS 字段。
+//
+// 事故（用户实测发现"最近"列恒为 —）：Ring 存的 Text **已剥离时间戳**
+// （ring.go 的 tsPrefixRe），所以从文本里解析时刻**永远解析不到**。
+// 首版只把 Text 传给聚合 → 「最近」列恒空。
+// 必须传结构化 LogLine{Text, TS}。
+func TestAggregateErrorsUsesRingTimestamp(t *testing.T) {
+	ts := time.Date(2026, 9, 23, 16, 40, 56, 0, time.Local)
+	// 模拟 Ring 的输出：Text 无时间戳，TS 单独带
+	lines := []LogLine{{
+		Text: `WARN: [upstream] chat_stream uid=32256b6a: upstream 429 soft_rate body={"code":6004}`,
+		TS:   ts,
+	}}
+	stats := AggregateErrors(lines)
+	if len(stats) != 1 {
+		t.Fatalf("want 1 stat, got %d", len(stats))
+	}
+	if stats[0].Last != "16:40:56" {
+		t.Errorf("Last = %q, want 16:40:56（必须用 TS 字段，不能从已剥时间戳的 Text 里解析）", stats[0].Last)
+	}
+}
+
+// TestAggregateErrorsTextFallback 纯文本入口（离线分析）仍能从行首解析时刻 ——
+// 但不能因此以为生产路径也能解析（生产走 Ring，Text 已剥）。
+func TestAggregateErrorsTextFallback(t *testing.T) {
+	stats := AggregateErrorsText([]string{
+		`2026/09/23 16:40:56 WARN: [upstream] chat_stream uid=abc12345: upstream 429 soft_rate body={"code":6004}`,
+	})
+	if len(stats) != 1 {
+		t.Fatalf("want 1, got %d", len(stats))
+	}
+	if stats[0].Last != "16:40:56" {
+		t.Errorf("Last = %q, want 16:40:56（纯文本入口应从行首解析）", stats[0].Last)
 	}
 }
