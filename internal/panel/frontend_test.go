@@ -607,3 +607,66 @@ func TestChartFunctionsHaveBody(t *testing.T) {
 		}
 	}
 }
+
+// TestPoolHealthUIFullyWired 池子健康横幅与负载倾斜条必须**双侧存在**。
+// （教训：v1.17 曾出现"后端+列头都有、按钮漏加"，故逐个要素核对。）
+func TestPoolHealthUIFullyWired(t *testing.T) {
+	html := readIndexHTML(t)
+	js := readAppJS(t)
+	for _, id := range []string{"poolAlert", "skewBar"} {
+		if !strings.Contains(html, `id="`+id+`"`) {
+			t.Errorf("index.html 缺少 #%s", id)
+		}
+	}
+	for _, fn := range []string{"function renderPoolHealth(", "function renderSkew("} {
+		if !strings.Contains(js, fn) {
+			t.Errorf("app.js 缺少 %s", fn)
+		}
+	}
+	// 必须真的被 renderAccounts 调用（只定义不调用 = 死代码）
+	if !strings.Contains(js, "renderPoolHealth(list)") || !strings.Contains(js, "renderSkew(list)") {
+		t.Error("renderAccounts 未调用 renderPoolHealth/renderSkew（定义了却不生效）")
+	}
+}
+
+// TestRateLimitDetailRendered 限流详情必须渲染 `rate_limited_models`。
+//
+// 背景：后端 pool.Status 早有 RateLimitedModels（注释写明"运维据此看到账号 A 的
+// 模型 X 还在限额中，预计 Z 时间恢复"），但前端**从未渲染** —— 用户只看到
+// "限流冷却·22h"四个字，不知道是**哪个模型**被限，也就想不到可以切模型绕开。
+func TestRateLimitDetailRendered(t *testing.T) {
+	js := readAppJS(t)
+	if !strings.Contains(js, "rate_limited_models") {
+		t.Error("前端未渲染 rate_limited_models（后端有数据、运维看不到是哪个模型被限）")
+	}
+	// 必须展示恢复时间（reset_at 是上游权威墙钟）
+	if !strings.Contains(js, "reset_at") {
+		t.Error("限流详情未展示恢复时间（reset_at）——用户无法判断何时能再用")
+	}
+}
+
+// TestSkewComputedPerRealm 负载倾斜必须**按域分组**计算。
+//
+// 为何（真实数据验证）：global 号与 cn 号不共享负载（不同上游 base/模型目录）。
+// 实测 cn 三号 2059/2780/7114、global 号仅 27 次 —— 混算会把倾斜度从 1.79×
+// 虚高到 2.38×，误导运维以为 cn 也不均衡。
+func TestSkewComputedPerRealm(t *testing.T) {
+	body := funcBody(t, "function renderSkew(")
+	if !strings.Contains(body, "realm") {
+		t.Fatal("renderSkew 未按 realm 分组")
+	}
+	// 必须有按域分组的动作（groups[realm] 或等价结构）
+	if !strings.Contains(body, "groups[") {
+		t.Error("renderSkew 未按域隔离统计（混算会让 global 号拉偏 cn 的倾斜度）")
+	}
+	// 关键：分组的**键**必须真的来自 s.realm。
+	// 变异测试暴露——只查 `groups[` 咬不住：把键换成常量 'all'（即混算）
+	// 后 `groups[` 依然存在，测试仍绿。必须钉住“键由 realm 派生”。
+	if !strings.Contains(body, "s.realm") {
+		t.Error("renderSkew 的分组键未取自 s.realm（用常量键 = 实际是混算，指标会失真）")
+	}
+	// 单账号域不该画倾斜条（无"分布"可言）
+	if !strings.Contains(body, "length < 2") {
+		t.Error("renderSkew 未跳过单账号域（单号无倾斜度可言，画出来是噪音）")
+	}
+}

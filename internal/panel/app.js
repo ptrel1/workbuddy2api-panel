@@ -163,6 +163,21 @@ function renderAccounts(list) {
       const kind = bl > Math.max(s.cool_remaining_sec || 0, dg > 0 ? dg : 0) ? '熔断'
         : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
+      // 限流详情：哪些模型被限、各自何时恢复（backend 的 RateLimitedModels）。
+      // 此前只显示"限流冷却·22h"四个字，运维看不出**是哪个模型**被限——
+      // 而 6004 是模型级限流，同一账号其他模型仍可用（可切模型绕开）。
+      const rlm = s.rate_limited_models || [];
+      if (rlm.length) {
+        tag += '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' +
+          rlm.map(r => {
+            // reset_at 是上游权威重置墙钟（未截断）；until 是本地截断后的冷却截止。
+            // 展示 reset_at 优先（那是"真正什么时候能再用"）。
+            const at = r.reset_at || r.until;
+            const t = at ? new Date(at) : null;
+            const when = t && !isNaN(t) ? t.toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '?';
+            return '⛔ ' + esc(r.model || '?') + ' → 恢复 ' + esc(when);
+          }).join('<br>') + '</div>';
+      }
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
@@ -209,6 +224,73 @@ function renderAccounts(list) {
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
       '</td></tr>';
   }).join('');
+  renderPoolHealth(list);
+  renderSkew(list);
+}
+
+/* renderPoolHealth 池子健康横幅（③ 前置告警）。
+   仅在「可用账号过少」时出现 —— 因为**只剩 1 个号时，它一被限就全挂**：
+   实测 2026-09-23 三个 cn 号相继被 6004 限流，导致 503 持续 77 分钟才被发现。
+   把「还能挨几次限流」提前说出来，比事后查 503 有用。 */
+function renderPoolHealth(list) {
+  const host = $('poolAlert');
+  if (!host) return;
+  const usable = list.filter(s => !s.disabled && !(s.cool_remaining_sec > 0));
+  const n = usable.length;
+  if (n >= 2) { host.hidden = true; host.innerHTML = ''; return; }
+  host.hidden = false;
+  if (n === 0) {
+    host.className = 'pool-alert bad';
+    host.innerHTML = '<b>⛔ 无可用账号</b> —— 所有请求将返回 <code>503 no_healthy_account</code>。' +
+      '请等待限流重置（见下表恢复时间）或添加新账号。';
+  } else {
+    host.className = 'pool-alert';
+    host.innerHTML = '<b>⚠️ 仅剩 ' + n + ' 个可用账号</b> —— 一旦它被限流/禁用，' +
+      '全部请求将立即返回 503。建议尽快添加账号。';
+  }
+}
+
+/* renderSkew 负载倾斜条（②）。
+   ⚠️ **必须按域分别计算**：cn 与 global 账号不共享负载（不同上游 base、
+   不同模型目录），混在一起算会让指标失真——实测 global 号仅 27 次成功，
+   混入后 cn 的倾斜度被虚高。故按 realm 分组，各自看倾斜。 */
+function renderSkew(list) {
+  const host = $('skewBar');
+  if (!host) return;
+  const groups = {};
+  list.forEach(s => {
+    if (s.disabled) return;
+    const r = s.realm === 'global' ? 'global' : 'cn';
+    (groups[r] = groups[r] || []).push(s);
+  });
+  const parts = [];
+  ['cn', 'global'].forEach(realm => {
+    const g = groups[realm] || [];
+    if (g.length < 2) return;                    // 单账号无"倾斜"可言
+    const tot = g.reduce((a, s) => a + (s.success_count || 0), 0);
+    if (!tot) return;                            // 全零：无数据不画
+    const ideal = tot / g.length;
+    const max = Math.max(...g.map(s => s.success_count || 0));
+    const skew = ideal > 0 ? max / ideal : 0;
+    const rows = g.map(s => ({ s: s, v: s.success_count || 0, pct: (s.success_count || 0) / tot * 100 }))
+      .sort((a, b) => b.v - a.v);
+    const warn = skew >= 2;
+    parts.push(
+      '<div class="skew-hd"><b>' + realmLabel(realm) + '</b> 负载分布' +
+      '<span class="' + (warn ? 'skew-warn' : '') + '">倾斜 ' + skew.toFixed(2) + '×' +
+      (warn ? '（偏斜过大，易被单点限流打穿）' : '（均衡）') + '</span></div>' +
+      '<div class="skew-track">' + rows.map((r, i) =>
+        '<div class="skew-seg" style="width:' + r.pct.toFixed(1) + '%;background:' + BH_COLORS[i % BH_COLORS.length] + '"' +
+        ' title="' + esc((r.s.nickname || r.s.uid.slice(0, 8)) + '：' + r.v + ' 次（' + r.pct.toFixed(1) + '%）') + '"></div>'
+      ).join('') + '</div>' +
+      '<div class="skew-legend">' + rows.map((r, i) =>
+        '<span><i style="background:' + BH_COLORS[i % BH_COLORS.length] + '"></i>' +
+        esc(r.s.nickname || r.s.uid.slice(0, 8)) + ' ' + r.v + ' 次（' + r.pct.toFixed(0) + '%）</span>'
+      ).join('') + '</div>');
+  });
+  if (!parts.length) { host.hidden = true; host.innerHTML = ''; return; }
+  host.hidden = false;
+  host.innerHTML = parts.join('<div style="height:10px"></div>');
 }
 
 async function loadOverview(quiet) {

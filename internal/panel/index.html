@@ -402,6 +402,25 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .bh-daylegend .lg-key { display: inline-flex; align-items: center; }
   .bh-daylegend .lg-sep { width: 1px; height: 12px; background: var(--line); }
   .bh-daylegend .lg-order { color: var(--ink-3); }
+  /* 池子健康横幅（黄条）：只在 healthy 偏低时出现 */
+  .pool-alert { margin: 10px 12px 0; padding: 9px 12px; border-radius: 8px;
+    background: var(--warn-soft); border: 1px solid rgba(245,181,68,.35);
+    color: var(--ink); font-size: 12.5px; line-height: 1.6; }
+  .pool-alert.bad { background: var(--bad-soft); border-color: rgba(240,101,95,.4); }
+  .pool-alert b { color: var(--warn); }
+  .pool-alert.bad b { color: var(--bad); }
+
+  /* 负载倾斜条：每账号一段，宽度=占比；悬停给明细 */
+  .skew { margin: 10px 12px 0; font-size: 11.5px; color: var(--ink-3); }
+  .skew-hd { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+  .skew-warn { color: var(--warn); font-weight: 550; }
+  .skew-track { display: flex; height: 7px; border-radius: 4px; overflow: hidden;
+    background: var(--surface-2); border: 1px solid var(--line-soft); }
+  .skew-seg { height: 100%; }
+  .skew-legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 5px; }
+  .skew-legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px;
+    margin-right: 4px; vertical-align: -1px; }
+
   /* 合计行：与正文行用顶边线分隔，数值加粗；"—"表示该列不可相加 */
   table.acc tfoot td { border-top: 1px solid var(--line); padding-top: 9px;
     font-weight: 550; color: var(--ink); }
@@ -525,6 +544,17 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button class="xs" id="btnActivityAll">活跃上报</button>
           <button class="xs" id="btnKeepaliveAll">全部保活</button>
         </header>
+        <!-- 池子健康横幅：healthy<=1 时亮黄条。
+             为何需要：此前池子枯竭（如 3 个号全被 6004 限流）时，用户只能
+             等请求返回 503 才知道——实测曾持续 77 分钟无人察觉。
+             这里把「还能撑几个号被限」提前说出来。 -->
+        <div class="pool-alert" id="poolAlert" hidden></div>
+
+        <!-- 负载倾斜条：按域统计各账号成功数占比。
+             ⚠️ 必须按域算——global 号与 cn 号不共享负载，混算会把指标拉偏
+             （实测：global 号仅 27 次，混入后倾斜度虚高）。 -->
+        <div class="skew" id="skewBar" hidden></div>
+
         <div class="tbl-wrap">
         <table class="acc">
           <thead><tr>
