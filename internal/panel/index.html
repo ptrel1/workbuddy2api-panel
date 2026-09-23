@@ -402,6 +402,22 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .bh-daylegend .lg-key { display: inline-flex; align-items: center; }
   .bh-daylegend .lg-sep { width: 1px; height: 12px; background: var(--line); }
   .bh-daylegend .lg-order { color: var(--ink-3); }
+  /* 错误汇总行：左侧色条表达严重度（语义化色彩，不靠文字）。
+     单色条 = 人眼可**前注意**扫描，无需逐行阅读文字即可定位严重项。 */
+  table.acc.err tbody tr { position: relative; }
+  table.acc.err td:first-child + td { padding-left: 12px; }
+  table.acc.err tbody tr::before { content: ''; position: absolute; left: 0; top: 0;
+    bottom: 0; width: 2px; border-radius: 0 1px 1px 0; }
+  table.acc.err tbody tr.sev-bad::before { background: var(--bad); }
+  table.acc.err tbody tr.sev-warn::before { background: var(--warn); }
+  table.acc.err tbody tr.sev-info::before { background: var(--line); }
+  /* 次数用等宽数字 + 大字号：数量级是首要信息 */
+  table.acc.err td.cnt { font: 600 13px var(--mono); font-variant-numeric: tabular-nums; }
+  table.acc.err tr.sev-bad td.cnt { color: var(--bad); }
+  table.acc.err tr.sev-warn td.cnt { color: var(--warn); }
+  table.acc.err td.kind { font-weight: 550; }
+  table.acc.err .why { color: var(--ink-3); font-size: 11px; margin-top: 2px; }
+
   /* 池子健康横幅（黄条）：只在 healthy 偏低时出现 */
   .pool-alert { margin: 10px 12px 0; padding: 9px 12px; border-radius: 8px;
     background: var(--warn-soft); border: 1px solid rgba(245,181,68,.35);
@@ -935,6 +951,33 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
     <!-- 日志 -->
     <section class="view" id="view-logs" hidden>
+      <!-- 错误汇总：按「账号 × 类型」聚合。
+           为何与下面的原始日志并存而非替代（设计心理学）：
+             · 组块化（米勒定律 7±2）：原始日志 100+ 行同质噪音**无法被理解**，
+               聚合后压成 M 条才进入工作记忆的容量范围；
+             · 前注意加工：真正重要的差异是"某账号报错 44 次 vs 另一账号 0 次"，
+               在逐行日志里完全不可见，聚合表里一眼可见；
+             · 层级：汇总在前（看全貌）+ 明细在下（需要时下钻），
+               避免"要么全淹没、要么看不到"的两难。 -->
+      <div class="box" id="errBox">
+        <header>
+          <h3>错误汇总 <span class="hint">按「账号 × 类型」聚合，严重度优先、次数降序</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="errNote">—</span>
+          <button class="xs" id="btnErrors">刷新</button>
+        </header>
+        <div class="tbl-wrap">
+          <table class="acc err">
+            <thead><tr>
+              <th class="mark" aria-hidden="true"></th>
+              <th>账号</th><th>错误类型</th><th class="num">次数</th>
+              <th>最近</th><th>解除时间</th>
+            </tr></thead>
+            <tbody id="errBody"></tbody>
+          </table>
+        </div>
+      </div>
+
       <div class="box">
         <header>
           <h3>运行日志</h3>
@@ -944,6 +987,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <button class="xs chip" data-ch="task">任务</button>
             <button class="xs chip" data-ch="chat">对话</button>
             <button class="xs chip" data-ch="sys">系统</button>
+            <button class="xs chip" data-ch="err">错误</button>
           </span>
           <span class="note" id="logNote">最近 500 行</span>
           <button class="xs" id="btnLogPin">自动滚动：开</button>

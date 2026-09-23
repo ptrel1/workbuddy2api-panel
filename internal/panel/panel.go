@@ -151,6 +151,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/logo.js", p.logoPreviewJS)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
+	p.mux.HandleFunc("GET /panel/api/errors", p.withAuth(p.errorsHandler))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
@@ -248,6 +249,25 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 // logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys）。
 func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"entries": p.logs.Snapshot()})
+}
+
+// errorsHandler 错误聚合：按「账号 × 错误类型」统计 WARN/ERR 行。
+//
+// 与 /panel/api/logs（原始行）的分工：日志页适合"逐行追因"，
+// 这里适合"一眼看谁有问题"。两者并存而非替代 ——
+// 汇总回答"是不是有问题"，明细回答"具体怎么了"（见 errors.go 的设计说明）。
+func (p *Panel) errorsHandler(w http.ResponseWriter, r *http.Request) {
+	entries := p.logs.Snapshot()
+	lines := make([]string, 0, len(entries))
+	for _, e := range entries {
+		lines = append(lines, e.Text)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"stats":      AggregateErrors(lines),
+		"scanned":    len(lines),
+		"updated_at": errorsUpdatedAt(),
+	})
 }
 
 // models 实时查询上游模型列表与 reasoning 实际档位（直连上游，不读路由层 1h 缓存）：

@@ -670,3 +670,65 @@ func TestSkewComputedPerRealm(t *testing.T) {
 		t.Error("renderSkew 未跳过单账号域（单号无倾斜度可言，画出来是噪音）")
 	}
 }
+
+// TestErrorsUIFullyWired 错误汇总的每个 UI 要素必须**双侧存在**。
+// （教训：v1.17 曾出现"后端+列头都有、按钮漏加"→ 用户找不到入口。）
+func TestErrorsUIFullyWired(t *testing.T) {
+	html := readIndexHTML(t)
+	js := readAppJS(t)
+	for _, id := range []string{"errBox", "errBody", "errNote", "btnErrors"} {
+		if !strings.Contains(html, `id="`+id+`"`) {
+			t.Errorf("index.html 缺少 #%s", id)
+		}
+	}
+	for _, fn := range []string{"function renderErrors(", "async function loadErrors(", "function isErrLine("} {
+		if !strings.Contains(js, fn) {
+			t.Errorf("app.js 缺少 %s", fn)
+		}
+	}
+	// 必须真的被调用（定义≠生效）
+	if !strings.Contains(js, "loadErrors()") {
+		t.Error("loadErrors 未被调用（定义了却不生效）")
+	}
+	if !strings.Contains(js, "$('btnErrors').onclick") {
+		t.Error("刷新按钮未绑定 onclick —— 点击无反应")
+	}
+	// 错误频道 chip 必须在（否则看不到逐行错误）
+	if !strings.Contains(html, `data-ch="err"`) {
+		t.Error("日志页缺少「错误」频道 chip")
+	}
+}
+
+// TestErrChannelFilterIsStrict 错误频道必须用严格口径（WARN/ERR 开头），
+// 不得用 /error|失败/ 模糊匹配 —— 后者会把正常行的"0 个失败"也算成错误。
+func TestErrChannelFilterIsStrict(t *testing.T) {
+	body := funcBody(t, "function isErrLine(")
+	if !strings.Contains(body, "startsWith('WARN')") || !strings.Contains(body, "startsWith('ERR')") {
+		t.Error("isErrLine 未用严格的 WARN/ERR 前缀判定")
+	}
+	if strings.Contains(body, "test(") {
+		t.Error("isErrLine 用了正则模糊匹配（会把正常行误判为错误）")
+	}
+}
+
+// TestErrorsRenderUntilTime 汇总必须展示「解除时间」—— 这是运维最关心的问题
+// （"什么时候能恢复"），后端已从上游文案抽出，前端不得丢弃。
+func TestErrorsRenderUntilTime(t *testing.T) {
+	body := funcBody(t, "function renderErrors(")
+	// 关键：必须把 **st.until 的值**渲染出来，而不是只出现 "until" 这个字样。
+	// 变异测试暴露——原先只查 `"until"` 存在，把整段换成常量 '—' 后仍绿。
+	if !strings.Contains(body, "st.until") {
+		t.Error("renderErrors 未读取 st.until（解除时间未被展示，用户无法判断何时恢复）")
+	}
+	if !strings.Contains(body, "esc(st.until)") {
+		t.Error("renderErrors 读取了 st.until 但未渲染其值（只读不用 = 白读）")
+	}
+	// 无 until 时必须显式显示 —，不得留空（留空会被读成"没有这个问题"）
+	if !strings.Contains(body, "'—'") && !strings.Contains(body, `"—"`) {
+		t.Error("无解除时间时未显式标注 —（留空会被误读）")
+	}
+	// 无 uid 的错误（如全局 fetch 失败）必须与"某账号有问题"区分
+	if !strings.Contains(body, "全局") {
+		t.Error("未区分「全局错误」与「账号错误」——会把全局问题栽给某个账号")
+	}
+}

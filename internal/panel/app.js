@@ -134,7 +134,7 @@ function go(v) {
   $('ttl').textContent = TITLES[v];
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'config') loadConfig();
-  if (v === 'logs') loadLogs();
+  if (v === 'logs') { loadLogs(); loadErrors(); }
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
   if (v === 'balhist') loadBalance();
@@ -537,17 +537,79 @@ $('logChips').addEventListener('click', ev => {
   document.querySelectorAll('#logChips .chip').forEach(c => c.classList.toggle('on', c === b));
   loadLogs();
 });
+/* isErrLine 判定一行是否为「值得注意的错误」。
+   口径与后端 errors.go 的 kindOf 对齐：WARN/ERR 开头（ring 已剥时间戳）。
+   注意不能用 /error|失败/ 这种模糊匹配 —— 会把正常行的"0 个失败"也算进来。 */
+function isErrLine(text) {
+  const t = String(text || '').trim();
+  return t.startsWith('WARN') || t.startsWith('ERR');
+}
+
+/* renderErrors 画错误汇总表。
+   设计要点（见 index.html 的注释）：严重度色条 + 次数等宽大字 + 解除时间。 */
+function renderErrors(stats, updatedAt) {
+  const tb = $('errBody');
+  if (!tb) return;
+  if (!stats || !stats.length) {
+    tb.innerHTML = '<tr><td colspan="6"><div class="empty"><div class="big">近期无错误</div>' +
+      '日志窗口内没有 WARN / ERR 记录</div></td></tr>';
+    const n0 = $('errNote');
+    if (n0) n0.textContent = '统计截至 ' + (updatedAt || '—');
+    return;
+  }
+  tb.innerHTML = stats.map(st => {
+    const uid = st.uid || '';
+    // 账号列：有 uid 显示短 uid（面板其它处同口径），无 uid 明确标注
+    //（如"模型目录拉取失败"是全局的，不该伪装成某个账号的问题）
+    const who = uid
+      ? '<span class="mono" style="font-size:11.5px">' + esc(uid) + '</span>'
+      : '<span style="color:var(--ink-3)">（全局）</span>';
+    const model = st.model ? '<div class="why">模型 ' + esc(st.model) + '</div>' : '';
+    const code = st.code ? '<div class="why">code ' + esc(st.code) + '</div>' : '';
+    // 解除时间：有则显示（模型限流的真正恢复时刻），无则 —（不编造）
+    const until = st.until
+      ? '<span style="color:var(--warn)">' + esc(st.until) + '</span>'
+      : '<span style="color:var(--ink-3)">—</span>';
+    return '<tr class="sev-' + esc(st.sev || 'warn') + '" title="' + esc(st.sample || '') + '">' +
+      '<td class="mark" aria-hidden="true"></td>' +
+      '<td>' + who + '</td>' +
+      '<td class="kind">' + esc(st.kind || '?') + model + code + '</td>' +
+      '<td class="num cnt">' + st.count + '</td>' +
+      '<td class="num" style="color:var(--ink-3)">' + esc(st.last || '—') + '</td>' +
+      '<td class="num">' + until + '</td></tr>';
+  }).join('');
+  const n = $('errNote');
+  if (n) n.textContent = stats.length + ' 类 · 统计截至 ' + (updatedAt || '—');
+}
+
+async function loadErrors() {
+  try {
+    const d = await api('errors');
+    renderErrors(d.stats || [], d.updated_at);
+  } catch (e) {
+    const tb = $('errBody');
+    if (tb) tb.innerHTML = '<tr><td colspan="6"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+  }
+}
+
 async function loadLogs() {
   const box = $('logBox');
   const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
   try {
     const d = await api('logs');
-    const entries = (d.entries || []).filter(e => logCh === 'all' || e.ch === logCh);
+    // ch='err' 是**跨频道的错误视图**（ring 本身没有 err 频道）：
+    // 按行内容判定，而不是按 ring 的归类 —— 因为错误可能出现在任何频道里
+    // （chat_stream / task / sys 都有），只看单个频道会漏。
+    const entries = (d.entries || []).filter(e => {
+      if (logCh === 'all') return true;
+      if (logCh === 'err') return isErrLine(e.text);
+      return e.ch === logCh;
+    });
     box.innerHTML = entries.length
       ? entries.map(e => {
         const lvl = /error|失败|错误/.test(e.text) ? ' e' : /warn|冷却|熔断/.test(e.text) ? ' w' : '';
         const t = e.ts ? new Date(e.ts).toLocaleTimeString('zh-CN', { hour12: false }) : '';
-        const ch = logCh === 'all' ? '<i class="lch c-' + esc(e.ch) + '">' + ({ task: '任务', chat: '对话', sys: '系统' }[e.ch] || e.ch) + '</i>' : '';
+        const ch = (logCh === 'all' || logCh === 'err') ? '<i class="lch c-' + esc(e.ch) + '">' + ({ task: '任务', chat: '对话', sys: '系统' }[e.ch] || e.ch) + '</i>' : '';
         return '<span class="ln' + lvl + '">' + ch + esc(t + ' ' + e.text) + '</span>';
       }).join('')
       : '<span style="color:var(--ink-3)">暂无日志</span>';
@@ -556,9 +618,10 @@ async function loadLogs() {
     for (const e of (d.entries || [])) counts[e.ch] = (counts[e.ch] || 0) + 1;
     $('logNote').textContent = logCh === 'all'
       ? '任务 ' + (counts.task || 0) + ' · 对话 ' + (counts.chat || 0) + ' · 系统 ' + (counts.sys || 0)
-      : (logCh === 'task' ? '任务' : logCh === 'chat' ? '对话' : '系统') + ' ' + entries.length + ' 行';
+      : ({ task: '任务', chat: '对话', sys: '系统', err: '错误' }[logCh] || logCh) + ' ' + entries.length + ' 行';
   } catch (e) { /* 概览已提示 */ }
 }
+$('btnErrors').onclick = loadErrors;
 $('btnLogPin').onclick = () => {
   logPin = !logPin;
   $('btnLogPin').textContent = '自动滚动：' + (logPin ? '开' : '关');
