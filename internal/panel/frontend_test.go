@@ -883,3 +883,43 @@ func TestPlanFilterAppliedBeforeRender(t *testing.T) {
 		t.Error("套餐筛选在渲染之后才做 —— 统计卡与表格会不一致")
 	}
 }
+
+// TestQuotaUIFullyWired 额度评估视图的每个要素必须**双侧存在且被调用**。
+// （这条断言此前救过一次：plan_js.py 脚本中途失败只落一半改动，是它先报红。）
+func TestQuotaUIFullyWired(t *testing.T) {
+	html := readIndexHTML(t)
+	js := readAppJS(t)
+	for _, id := range []string{"view-quota", "quotaBody", "quotaCaveat", "quotaStats", "btnQuota"} {
+		if !strings.Contains(html, `id="`+id+`"`) {
+			t.Errorf("index.html 缺少 #%s", id)
+		}
+	}
+	if !strings.Contains(html, `data-view="quota"`) {
+		t.Error("侧栏缺少「额度评估」导航项（页面存在但进不去）")
+	}
+	for _, fn := range []string{"function renderQuota(", "async function loadQuota(", "function fmtTokens("} {
+		if !strings.Contains(js, fn) {
+			t.Errorf("app.js 缺少 %s", fn)
+		}
+	}
+	if !strings.Contains(js, "if (v === 'quota') loadQuota()") {
+		t.Error("路由未接 loadQuota（点导航没反应）")
+	}
+	if !strings.Contains(js, "$('btnQuota').onclick") {
+		t.Error("刷新按钮未绑定 onclick")
+	}
+}
+
+// TestQuotaCaveatRenderedFromServer 口径声明必须**由服务端下发并原样渲染**。
+//
+// 为何不能在服务端写死字符串、前端自己拼：那样两边可能漂移（改了一边忘另一边），
+// 而这段文案是本模块**诚实性的载体** —— 少了它，峰值会被当成官方额度。
+func TestQuotaCaveatRenderedFromServer(t *testing.T) {
+	body := funcBody(t, "function renderQuota(")
+	if !strings.Contains(body, "rep.caveat") {
+		t.Fatal("renderQuota 未使用服务端下发的 caveat（口径声明可能缺失或前端自造）")
+	}
+	if !strings.Contains(body, "esc(rep.caveat") {
+		t.Error("caveat 未渲染出来（读了不用）")
+	}
+}

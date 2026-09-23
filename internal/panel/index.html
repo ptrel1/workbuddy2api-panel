@@ -418,6 +418,24 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   table.acc.err td.kind { font-weight: 550; }
   table.acc.err .why { color: var(--ink-3); font-size: 11px; margin-top: 2px; }
 
+  /* 额度评估的口径声明：琥珀色底 + 显眼位置（首因效应）。
+     为何不用脚注：读者会先看数字再看说明，那时已把峰值当官方额度了。 */
+  .quota-caveat { margin: 10px 12px 0; padding: 9px 12px; border-radius: 8px;
+    background: var(--warn-soft); border: 1px solid rgba(245,181,68,.32);
+    color: var(--ink-2); font-size: 12px; line-height: 1.65; }
+  .quota-caveat b { color: var(--warn); }
+  /* 套餐对比条：横向长度=峰值相对值（图形长度可缩放，符合规范） */
+  .qbar { display: inline-block; height: 6px; border-radius: 3px;
+    background: var(--accent); vertical-align: middle; min-width: 2px; }
+  .qtier { display: flex; align-items: center; gap: 10px; padding: 7px 0;
+    border-bottom: 1px solid var(--line-soft); }
+  .qtier:last-child { border-bottom: none; }
+  .qtier .nm { width: 74px; font-weight: 550; font-size: 12.5px; }
+  .qtier .val { width: 118px; font: 600 12.5px var(--mono);
+    font-variant-numeric: tabular-nums; }
+  .qtier .track { flex: 1; min-width: 60px; }
+  .qtier .sub { color: var(--ink-3); font-size: 11.5px; width: 148px; text-align: right; }
+
   /* 套餐标记（账号名旁的 pill）：免费/活动/体验/标准 四种语义色。
      为何用色 + 文字双编码：颜色供**前注意扫描**（一眼看出哪些号"额度不稳"），
      文字保证色盲用户与打印场景仍可读（不可只靠颜色传达信息）。 */
@@ -528,6 +546,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#balhist" data-view="balhist">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 13.5V3M2 13.5h12"/><path d="M4 10.5l3-4 2.5 2.5L13 5"/></svg>
         余额趋势</a></li>
+      <li><a href="#quota" data-view="quota">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 12.5a10 10 0 0 1 12 0"/><path d="M8 12.5V8"/><circle cx="8" cy="12.5" r="1"/></svg>
+        额度评估</a></li>
       <li><a href="#packages" data-view="packages">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.2 5.4 8 2.5l5.8 2.9v5.2L8 13.5l-5.8-2.9z"/><path d="M2.2 5.4 8 8.3l5.8-2.9M8 8.3v5.2"/></svg>
         积分构成</a></li>
@@ -676,6 +697,37 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th><th>默认档</th><th>支持的思考档位</th><th>上下文长度</th><th>最大输出</th><th class="num" title="真实发一次最小请求验证能否调通（目录里有 ≠ 能用）。结果持久化，点「测可用性」刷新。">可用性</th></tr></thead>
           <tbody id="mdBody"></tbody>
         </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 额度评估：由实测用量反推各套餐能力上界。
+         设计心理学：这是**推断结果**而非事实，故把「口径与不确定性」放在
+         最上方（而非脚注）—— 首因效应下，用户读到的第一句就是"这不是官方额度"，
+         避免把峰值当成官方上限。 -->
+    <section class="view" id="view-quota" hidden>
+      <div class="box">
+        <header>
+          <h3>额度评估 <span class="hint">按套餐对比实测能力上界</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="quotaNote">—</span>
+          <button class="xs" id="btnQuota">重新评估</button>
+        </header>
+        <!-- 口径声明：必须显眼（琥珀色底），内容由服务端下发 -->
+        <div class="quota-caveat" id="quotaCaveat"></div>
+        <div class="stats" id="quotaStats"></div>
+        <div class="pad">
+          <div class="tbl-wrap">
+            <table class="acc">
+              <thead><tr>
+                <th class="mark" aria-hidden="true"></th>
+                <th>账号</th><th>套餐</th>
+                <th class="num">峰值用量</th><th class="num">请求数</th>
+                <th class="num">观测天数</th><th>峰值日</th><th>当前状态</th>
+              </tr></thead>
+              <tbody id="quotaBody"></tbody>
+            </table>
+          </div>
         </div>
       </div>
     </section>

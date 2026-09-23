@@ -126,7 +126,7 @@ $('btnKey').onclick = async () => {
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', usage: '用量', balhist: '余额趋势', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', balhist: '余额趋势', quota: '额度评估', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -138,6 +138,7 @@ function go(v) {
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
   if (v === 'balhist') loadBalance();
+  if (v === 'quota') loadQuota();
   if (v === 'taskscenter') { loadSchoolStatus(true); pollQueueOnce(); }
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
@@ -582,6 +583,8 @@ async function loadModels() {
   }
 }
 $('btnModels').onclick = loadModels;
+
+if ($('btnQuota')) $('btnQuota').onclick = loadQuota;
 
 /* 手动触发可用性探测。结果由后端持久化，完成后重画表格。
    为何不自动跑：虽单模型成本极低（1~10 token），但“自动烧额度”
@@ -2031,6 +2034,81 @@ function fmtNum(v) {
 function bhCard(k, v, tone) {
   return '<div class="st"><span class="k">' + esc(k) + '</span><span class="v' +
     (tone ? ' ' + tone : '') + '">' + esc(v) + '</span></div>';
+}
+
+/* fmtTokens 人类可读 token 量（额度评估的数量级都是"亿"）。 */
+function fmtTokens(n) {
+  n = Number(n) || 0;
+  if (n >= 1e8) return (n / 1e8).toFixed(2) + ' 亿';
+  if (n >= 1e4) return (n / 1e4).toFixed(1) + ' 万';
+  return String(n);
+}
+
+/* renderQuota 画额度评估。
+   设计要点：
+   - **口径声明置顶**（用服务端下发的 caveat，前端不得改写）——
+     首因效应：读者第一句就知道"这不是官方额度"，避免把峰值当上限；
+   - 套餐对比用**横向条**（图形长度可缩放，排版尺寸固定）；
+   - 每行标注**观测天数**（样本量）—— 少样本的结论一眼可辨。 */
+function renderQuota(rep) {
+  const body = $('quotaBody');
+  if (!body) return;
+  const cv = $('quotaCaveat');
+  if (cv) cv.innerHTML = '<b>⚠️ 口径说明：</b>' + esc(rep.caveat || '');
+  const note = $('quotaNote');
+  if (note) note.textContent = '观测窗口 ' + (rep.window || '—');
+
+  const tiers = rep.tiers || [];
+  const rows = rep.rows || [];
+  const maxTok = Math.max(1, ...tiers.map(t => t.peak_tokens || 0));
+
+  const st = $('quotaStats');
+  if (st) {
+    st.innerHTML = tiers.length
+      ? tiers.map(t => {
+          const pct = Math.round((t.peak_tokens || 0) / maxTok * 100);
+          const med = t.median_tokens
+            ? '中位 ' + fmtTokens(t.median_tokens)
+            : (t.accounts < 2 ? '样本不足' : '');
+          return '<div class="qtier">' +
+            '<span class="nm">' + esc(t.label || t.plan) + '</span>' +
+            '<span class="val">' + fmtTokens(t.peak_tokens) + '</span>' +
+            '<span class="track"><i class="qbar" style="width:' + pct + '%"></i></span>' +
+            '<span class="sub">' + t.accounts + ' 账号 · ' + esc(med) + '</span>' +
+            '</div>';
+        }).join('')
+      : '<div class="empty">暂无数据（需先有实际请求产生用量）</div>';
+  }
+
+  body.innerHTML = rows.length
+    ? rows.map(r => {
+        const planCls = 'plan-' + (r.plan || 'unknown');
+        const status = r.limited
+          ? '<span class="tag warn">限流中</span><div class="why">恢复 ' + esc(r.recover_at || '?') + '</div>'
+          : '<span class="tag ok">正常</span>';
+        return '<tr>' +
+          '<td class="mark" aria-hidden="true"></td>' +
+          '<td><span class="mono" style="font-size:11.5px">' + esc(r.uid) + '</span></td>' +
+          '<td><span class="plan-tag ' + esc(planCls) + '">' + esc(r.label || '未分类') + '</span></td>' +
+          '<td class="num" style="font-weight:600">' + fmtTokens(r.peak_tokens) + '</td>' +
+          '<td class="num">' + (r.peak_reqs || 0) + '</td>' +
+          '<td class="num" title="参与统计的有效天数（单日成功请求 >= 20 才计入）">' + (r.observed_days || 0) + '</td>' +
+          '<td style="color:var(--ink-3)">' + esc(r.peak_day || '—') + '</td>' +
+          '<td>' + status + '</td></tr>';
+      }).join('')
+    : '<tr><td colspan="8"><div class="empty"><div class="big">暂无数据</div>' +
+      '需先有实际请求产生用量记录</div></td></tr>';
+}
+
+async function loadQuota() {
+  const body = $('quotaBody');
+  if (body) body.innerHTML = '<tr><td colspan="8"><div class="empty">正在查询上游套餐…</div></td></tr>';
+  try {
+    const d = await api('quota');
+    renderQuota(d.report || {});
+  } catch (e) {
+    if (body) body.innerHTML = '<tr><td colspan="8"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+  }
 }
 
 async function loadBalance() {

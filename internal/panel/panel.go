@@ -188,6 +188,7 @@ func (p *Panel) routes() {
 	// 模型可用性探测（手动触发 + 结果持久化，见 availability.go）
 	p.mux.HandleFunc("GET /panel/api/model_availability", p.withAuth(p.modelAvailability))
 	p.mux.HandleFunc("GET /panel/api/plans", p.withAuth(p.plans))
+	p.mux.HandleFunc("GET /panel/api/quota", p.withAuth(p.quota))
 	p.mux.HandleFunc("POST /panel/api/model_availability/probe", p.withAuth(p.probeAvailability))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
@@ -228,6 +229,78 @@ func (p *Panel) apiKey() string {
 // 故拆成独立接口，前端**按需调用一次**（不轮询），并在面板上显示"查询于 XX"。
 //
 // 查询失败/无数据的账号返回 unknown —— **不猜**（§十）。
+// quota 额度评估：由实测用量 + 套餐分类反推「各套餐能扛多少」。
+//
+// ⚠️ 产出是**实测推断值**，非上游官方额度 —— 口径说明随响应一起返回
+// （quota.Caveat），前端必须原样展示（见 quota.go 的定位声明）。
+func (p *Panel) quota(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Usage == nil {
+		writeErr(w, http.StatusNotImplemented, "usage recorder not available")
+		return
+	}
+	// 套餐分类：查上游 billing（与 /panel/api/plans 同一来源）。
+	// 为何不缓存到池状态：套餐名会变（新活动包随时发放），且本接口不是高频调用；
+	// 多打一次上游换取"始终最新"是划算的（单账号 ~300ms，并发 3）。
+	plans := map[string]string{}
+	labels := map[string]string{
+		"standard": "标准版", "trial": "体验版", "activity": "活动号",
+		"free": "免费版", "unknown": "未分类",
+	}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 3)
+	for _, st := range p.cfg.Pool.List() {
+		wg.Add(1)
+		go func(uid string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			a := p.cfg.Pool.AuthByUID(uid)
+			if a == nil {
+				return
+			}
+			packs, _, _, err := p.cfg.Upstream.CreditPackages(a)
+			if err != nil {
+				return // 查不到 → 保持 unknown（不猜）
+			}
+			names := make([]string, 0, len(packs))
+			for _, pk := range packs {
+				names = append(names, pk.Name)
+			}
+			kind, _ := pool.ClassifyPlan(names)
+			short := uid
+			if len(short) > 8 {
+				short = short[:8]
+			}
+			mu.Lock()
+			plans[short] = string(kind)
+			mu.Unlock()
+		}(st.UID)
+	}
+	wg.Wait()
+
+	// 当前限流状态：取自池快照（已是内存数据，无需上游调用）
+	limited := map[string]string{}
+	for _, st := range p.cfg.Pool.List() {
+		if len(st.RateLimitedModels) == 0 {
+			continue
+		}
+		short := st.UID
+		if len(short) > 8 {
+			short = short[:8]
+		}
+		at := st.RateLimitedModels[0].ResetAt
+		if at.IsZero() {
+			at = st.RateLimitedModels[0].Until
+		}
+		if !at.IsZero() {
+			limited[short] = at.Format("01-02 15:04")
+		}
+	}
+	rep := BuildQuotaReport(p.cfg.Usage.DailyUsage(), plans, labels, limited)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "report": rep})
+}
+
 func (p *Panel) plans(w http.ResponseWriter, r *http.Request) {
 	accts := p.cfg.Pool.List()
 	out := make(map[string]any, len(accts))
