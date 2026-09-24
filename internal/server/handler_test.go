@@ -172,6 +172,7 @@ func TestChatBodyReadErrorIs400(t *testing.T) {
 type errReader struct{}
 
 func (errReader) Read([]byte) (int, error) { return 0, errors.New("client disconnected") }
+
 // TestChatBadParamsRotatesWithoutPenalty 上游 400 + Unmarshal chat params failed（11101）
 // → 该类归 ErrBadParams：不罚账号（无冷却/无禁用/无熔断计数/无 errTotal），但**仍然轮转**
 // （换号重试可能命中不同权限的账号）。端到端断言 bad 失败、good 成功、账号完好。

@@ -784,7 +784,7 @@ func TestCostExploreExplicit(t *testing.T) {
 // TestCostExploreZeroDisables "0" 必须被当成**显式关停**而非"未配置回落默认"。
 //
 // 这是本键最容易写错的地方：本地其它 pool 键的归一逻辑都是"空/0 → 回落默认"
-//（如 expiring_soon 的"空/0 = 禁用分桶"），若照抄，用户填的 "0" 会被静默改成 30m，
+// （如 expiring_soon 的"空/0 = 禁用分桶"），若照抄，用户填的 "0" 会被静默改成 30m，
 // 表现为"我明明关了，路由却还在改道"。
 func TestCostExploreZeroDisables(t *testing.T) {
 	dir := t.TempDir()
