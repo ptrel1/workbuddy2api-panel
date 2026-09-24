@@ -6,6 +6,13 @@ let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null;
 let refTimer = null;
+// mToggleUID 模型开关 modal 当前操作的账号 uid（空 = 未打开）。
+// ⚠️ 必须声明在此（文件顶部状态区）：go() 在文件中部顶层被调用（见下方
+// `go((location.hash || '#accounts')...)`），其同步链路 `go → closeModelToggle`
+// 会写本变量。若把声明留在下方（曾位于 plansMap/planFilter 旁），顶层执行时
+// 声明尚未初始化 → TDZ ReferenceError 中断整个脚本：后续 onclick 全失效、
+// start() 不执行，表现为「非 #accounts 页面刷新即崩」。TestAppJSTopLevelSmoke 守此。
+let mToggleUID = '';
 
 const $ = id => document.getElementById(id);
 
@@ -152,7 +159,6 @@ go((location.hash || '#accounts').slice(1) in TITLES ? (location.hash || '#accou
    仅进入账号池页时拉一次 + 可手动刷新。 */
 let plansMap = {};
 let planFilter = '';
-let mToggleUID = '';  // 模型开关抽屉当前操作的账号
 
 /* PLAN_LABEL 套餐类型展示名（kind → 中文 + CSS 类）。 */
 const PLAN_LABEL = {
@@ -1586,6 +1592,24 @@ function fmtMs(ms) {
 }
 function fmtRate(r) { return r ? Number(r).toFixed(1) + ' tok/s' : '—'; }
 
+/* 性能均值的最小可信样本数。低于此值不显数字、只显 "—"（悬停可见实际样本数）。
+   为什么是 3：延迟/速率的均值按样本加权（后端 aggAcc.finish），样本极少时抖动可达
+   数倍——把「8 个请求的均值」当「该模型的速度」展示属误导。3 是"至少看过几次"的
+   下限，兼顾冷门模型仍能显示。 */
+const PERF_MIN_SAMPLES = 3;
+
+/* fmtPerf 渲染性能均值 + 样本数判据。n 为有效样本数（后端 latency_samples /
+   tps_samples）；样本不足或无样本一律 "—"，并在 title 里说明原因（不静默隐藏数据）。 */
+function fmtPerf(v, n, kind) {
+  const cnt = Number(n || 0);
+  const t = cnt ? '样本 ' + cnt + ' 次' : '无样本';
+  if (cnt < PERF_MIN_SAMPLES) {
+    return '<span class="dim" title="' + esc(t + '，不足 ' + PERF_MIN_SAMPLES + ' 次不显示') + '">—</span>';
+  }
+  const txt = kind === 'rate' ? fmtRate(v) : fmtMs(v);
+  return '<span title="' + esc(t) + '">' + txt + '</span>';
+}
+
 function usStat(v, k, cls) {
   return '<div class="stat ' + (cls || '') + '"><div class="v">' + esc(v) +
          '</div><div class="k">' + esc(k) + '</div></div>';
@@ -1603,9 +1627,10 @@ function usBar(prompt, completion, total) {
 }
 
 /* usRow 生成一行。mid 是插在「名称」之后、请求数之前的额外单元格（如「域」列）。
-   withPerf 控制是否追加延迟/速率两列——只有「按账号」表的表头带这两列；
-   模型表与域表没有，多输出会造成列错位。早先靠「mid 是否为 undefined」隐式
-   判断，调用方稍一改动就会错列，故改为显式参数。 */
+   withPerf 控制是否追加延迟/速率两列——「按账号」表与「按模型」表的表头都带这两列；
+   域表没有，多输出会造成列错位。早先靠「mid 是否为 undefined」隐式判断，调用方稍一
+   改动就会错列，故改为显式参数。**改这里必须同步 index.html 的表头与 colspan**。
+   两列均经 fmtPerf 做样本数判据（少样本显示 "—"，避免拿个位数样本当模型速度）。 */
 function usRow(name, sub, a, mid, withPerf) {
   return '<tr>' +
     '<td class="mark" aria-hidden="true"></td>' +
@@ -1617,8 +1642,8 @@ function usRow(name, sub, a, mid, withPerf) {
     '<td class="num">' + fmtTok(a.completion_tokens) + '</td>' +
     '<td class="num">' + fmtTok(a.total_tokens) + '</td>' +
     (withPerf
-      ? '<td class="num">' + fmtMs(a.avg_latency_ms) + '</td>' +
-        '<td class="num">' + fmtRate(a.avg_tokens_per_second) + '</td>'
+      ? '<td class="num">' + fmtPerf(a.avg_latency_ms, a.latency_samples, 'ms') + '</td>' +
+        '<td class="num">' + fmtPerf(a.avg_tokens_per_second, a.tps_samples, 'rate') + '</td>'
       : '') +
     '</tr>';
 }
@@ -1642,8 +1667,10 @@ function renderUsage(d) {
       '<td class="num">' + esc(x.realm || '') + '</td>', true)
   ).join('') || '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
 
+  // 模型表：带延迟/速率列（withPerf=true），表头见 index.html「平均延迟 / 速度」。
+  // 这两列让"哪个模型快、哪个慢"直接可读——此前只有账号表有，按模型统计看不到速度。
   $('usModelBody').innerHTML = (d.by_model || []).map(x =>
-    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+    usRow(x.key, '', x, '', true)).join('') || '<tr><td colspan="9" class="empty">暂无数据</td></tr>';
 
   $('usRealmBody').innerHTML = (d.by_realm || []).map(x =>
     usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';

@@ -317,6 +317,14 @@ type Agg struct {
 	TotalTokens   int64   `json:"total_tokens"`
 	AvgLatencyMs  float64 `json:"avg_latency_ms"`
 	AvgTPS        float64 `json:"avg_tokens_per_second"`
+	// LatSamples / TPSSamples 是上面两项均值的**有效样本数**，供前端判断均值是否可信。
+	// 为什么必须透出：均值是按样本加权算的（见 finish），但样本数与请求数不等价——
+	// 延迟/速率只在流式请求拿到真实计时才有样本（HasTPS），短窗口或冷门模型可能只有
+	// 个位数样本。此时均值本身没错，但**展示它会被读成"该模型的速度"**，而小样本的
+	// 抖动可达数倍（如 8 个请求的均值）。透出样本数让前端能对少样本显示 "—" 而非
+	// 一个有误导性的具体数字——属"数据不会报错但会误导人"的一类缺陷（同 §余额完整性标注）。
+	LatSamples int64 `json:"latency_samples"`
+	TPSSamples int64 `json:"tps_samples"`
 }
 
 // aggAcc 是聚合过程中的累加器：Agg 只放已算好的结果，均值需要样本数才能
@@ -343,6 +351,10 @@ func (g *aggAcc) add(b *bucket) {
 
 func (g *aggAcc) finish() Agg {
 	a := g.Agg
+	// 样本数无条件透出（含 0）：前端靠它区分「无样本」与「样本少」，
+	// 0 样本时均值保持零值、由前端渲染成 "—"。
+	a.LatSamples = g.latSamples
+	a.TPSSamples = g.tpsSamples
 	if g.latSamples > 0 {
 		a.AvgLatencyMs = float64(g.latSum) / float64(g.latSamples)
 	}

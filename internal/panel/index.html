@@ -297,6 +297,9 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 
 .empty { padding: 40px 20px; text-align: center; color: var(--ink-3); }
 .empty .big { font-size: 14px; color: var(--ink-2); margin-bottom: 6px; }
+/* dim：数值存在但因样本不足而不展示时的占位（如按模型表的"均延迟/均速率"）。
+   用最弱墨色而非隐藏——"有数据但不够可信"与"没有数据"是两回事，前者要能看出差别。 */
+.dim { color: var(--ink-3); }
 
 /* ── 日志（终端质感）────────────────────────────────────────────── */
 #logBox {
@@ -920,13 +923,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </div>
 
       <div class="box">
-        <header><h3>按模型</h3></header>
+        <header><h3>按模型</h3><span class="grow"></span>
+          <span class="note">均延迟 / 均速率按有效样本加权；样本不足 3 次显示 —</span></header>
         <div class="tbl-wrap">
           <table class="acc">
             <thead><tr>
               <th class="mark" aria-hidden="true"></th><th>模型</th>
               <th class="num">请求</th><th class="num">失败</th>
               <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
+              <th class="num">均延迟</th><th class="num">均速率</th>
             </tr></thead>
             <tbody id="usModelBody"></tbody>
           </table>

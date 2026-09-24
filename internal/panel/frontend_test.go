@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"bytes"
 	"encoding/json"
 	"encoding/xml"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -36,6 +37,84 @@ func TestAppJSSyntax(t *testing.T) {
 	out, err := exec.Command(node, "--check", path).CombinedOutput()
 	if err != nil {
 		t.Fatalf("app.js syntax error:\n%s", out)
+	}
+}
+
+// TestAppJSTopLevelSmoke app.js 顶层求值冒烟（运行时闸门，与 TestAppJSSyntax 互补）：
+// node + DOM 桩真正**执行** app.js 顶层代码（含按 hash 落到各视图的 go() 顶层调用），
+// 捕捉 TDZ / ReferenceError 类运行时错误。
+//
+// 为什么需要（不是重复 TestAppJSSyntax）：语法检查对运行时错误全盲。app.js 的顶层
+// let/const 声明散落在整个文件（plansMap@153、mToggleUID@155、queueTimer@1448…），
+// 而顶层 go() 调用在 ~148 行——任何在 go() 同步调用链上被提前访问的晚期声明都会抛
+// TDZ ReferenceError，使**整个脚本从该行起停止求值**：后续 onclick 全失效、start()
+// 不执行，用户看到的是刷新即崩的面板。本项目已两度踩坑（上游 v1.11.3/v1.11.4 两连炸、
+// 本地 e5802d1 白屏事故），且 v1.24.0 又引入一例（mToggleUID@2279），故入册为常驻闸门。
+//
+// 判据：全视图 hash 逐个执行，任一视图未到 EOF 即失败。**视图清单必须与实际路由
+// （app.js 的 TITLES）保持一致**——只测部分视图会漏掉分支特有的 TDZ。
+// 无 node 环境跳过（不阻塞无 Node 的构建机）。
+func TestAppJSTopLevelSmoke(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not available; skipping JS top-level smoke")
+	}
+	// harness：在 vm 沙箱里求值 app.js。DOM/网络全部用惰性 Proxy 兜住——本测试
+	// 只关心"顶层求值能否走到末行"，不关心渲染结果，故无需真实 DOM 实现。
+	// app.js 顶层 start() 里的 setInterval 会让 node 事件循环不退出，成功路径显式 exit(0)。
+	harness := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const inert = new Proxy(function () {}, {
+  get(t, k) { if (k === Symbol.toPrimitive) return () => ''; return inert; },
+  set() { return true; },
+  apply() { return inert; },
+  construct() { return inert; },
+  has() { return true; },
+});
+const sandbox = new Proxy({
+  location: { hash: process.env.SMOKE_HASH || '#accounts' },
+  history: { replaceState() {} },
+  localStorage: { getItem: () => null, setItem() {} },
+  navigator: { clipboard: { writeText: () => Promise.resolve() } },
+  document: { querySelectorAll: () => [], querySelector: () => inert, getElementById: () => inert, addEventListener() {}, documentElement: inert, head: inert, body: inert, createElement: () => inert, cookie: '' },
+  fetch: () => new Promise(() => {}),
+  addEventListener() {}, removeEventListener() {},
+  matchMedia: () => ({ matches: false, addEventListener() {} }),
+  setInterval, clearInterval, setTimeout, clearTimeout,
+  console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set, RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent, decodeURIComponent, URL, Symbol, Proxy, Reflect,
+}, { get(t, k) { return t[k]; }, has() { return true; } });
+sandbox.window = sandbox; sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+try {
+  vm.runInContext(src, sandbox, { filename: 'app.js' });
+  console.log('SMOKE OK');
+  process.exit(0);
+} catch (e) {
+  console.log('SMOKE FAIL:', (e && e.stack ? e.stack : e).toString().split('\n').slice(0, 5).join('\n'));
+  process.exit(1);
+}
+`
+	hf, err := os.CreateTemp(t.TempDir(), "smoke-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hf.WriteString(harness); err != nil {
+		t.Fatal(err)
+	}
+	hf.Close()
+	// 9 个视图全覆盖（对齐 app.js 的 TITLES）。空 hash 也测一次——那是默认落地路径。
+	for _, hash := range []string{"", "#accounts", "#usage", "#balhist", "#quota", "#packages", "#taskscenter", "#models", "#config", "#logs"} {
+		cmd := exec.Command(node, hf.Name(), "app.js")
+		cmd.Dir = "." // 测试工作目录 = internal/panel
+		cmd.Env = append(os.Environ(), "SMOKE_HASH="+hash)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("app.js 顶层求值崩溃（hash=%q）: %v\n%s", hash, err, out)
+		}
+		if !bytes.Contains(out, []byte("SMOKE OK")) {
+			t.Fatalf("app.js 冒烟未通过（hash=%q）:\n%s", hash, out)
+		}
 	}
 }
 
@@ -1029,5 +1108,84 @@ func TestAmsDegradesWhenTooFewPoints(t *testing.T) {
 	// 点数不足时必须给降级说明而非空图
 	if !strings.Contains(js, "点数不足") {
 		t.Error("点数不足时未降级说明")
+	}
+}
+
+// TestUsageModelTablePerf 按模型表必须带「均延迟 / 均速率」两列。
+//
+// 为什么需要：此前只有「按账号」表有这两列，按模型统计看不到速度——而"哪个模型快"
+// 正是用量页最该回答的问题之一。数据后端早已聚合（KeyedAgg 内嵌 Agg），只是渲染时
+// 用 withPerf=false 关掉了，属"数据在但没接出来"。
+// 本测试同时守住**列数与 colspan 一致**：usRow 的 withPerf 多输出两列，若表头/
+// colspan 忘了同步就是列错位（usRow 注释里明确警告过这类缺陷）。
+func TestUsageModelTablePerf(t *testing.T) {
+	html := readIndexHTML(t)
+
+	// 1) 模型表渲染必须开 withPerf（否则两列永远不输出）。
+	body := funcBody(t, "function renderUsage(")
+	mIdx := strings.Index(body, "$('usModelBody').innerHTML")
+	if mIdx < 0 {
+		t.Fatal("renderUsage 未渲染 usModelBody")
+	}
+	// 该赋值语句跨行（usRow(...) 在下一行），取到下一个空行为止再判定。
+	line := body[mIdx:]
+	if end := strings.Index(line, "\n\n"); end >= 0 {
+		line = line[:end]
+	}
+	if !strings.Contains(line, ", true)") {
+		t.Errorf("模型表未开启 withPerf（均延迟/均速率列不会显示）:\n%s", line)
+	}
+
+	// 2) 表头必须有这两列，且措辞与账号表一致（统一视觉语言）。
+	seg := html
+	if i := strings.Index(html, `id="usModelBody"`); i > 0 {
+		seg = html[:i]
+	}
+	if j := strings.LastIndex(seg, "<table"); j >= 0 {
+		seg = seg[j:]
+	}
+	for _, h := range []string{">均延迟<", ">均速率<"} {
+		if !strings.Contains(seg, h) {
+			t.Errorf("按模型表头缺少 %s（表头与行会错位）", h)
+		}
+	}
+
+	// 3) 空行 colspan 必须等于列数：mark + 模型 + 5 数据列 + 2 性能列 = 9。
+	if !strings.Contains(body, `colspan="9"`) {
+		t.Error(`模型表空行 colspan 应为 9（mark+模型+请求/失败/Prompt/Completion/合计+均延迟+均速率）`)
+	}
+}
+
+// TestPerfSampleGate 性能均值必须过样本数闸门，不得裸展示。
+//
+// 为什么需要：均值按样本加权，但样本数可能只有个位数（冷门模型/短窗口）。把
+// 「8 个请求的均值」当「该模型的速度」展示是误导——数据不会报错但会误导人。
+// 前端必须：① 经 fmtPerf 渲染 ② 低于阈值显示 "—" ③ 悬停可见样本数（不静默隐藏）。
+func TestPerfSampleGate(t *testing.T) {
+	js := readAppJS(t)
+
+	if !strings.Contains(js, "const PERF_MIN_SAMPLES") {
+		t.Fatal("缺少 PERF_MIN_SAMPLES 阈值常量")
+	}
+	if !strings.Contains(js, "function fmtPerf(") {
+		t.Fatal("缺少 fmtPerf（样本数判据渲染函数）")
+	}
+	// usRow 的两列必须走 fmtPerf，且传入后端样本数字段。
+	row := funcBody(t, "function usRow(")
+	for _, want := range []string{"fmtPerf(a.avg_latency_ms, a.latency_samples", "fmtPerf(a.avg_tokens_per_second, a.tps_samples"} {
+		if !strings.Contains(row, want) {
+			t.Errorf("usRow 未按样本数闸门渲染: 缺少 %s", want)
+		}
+	}
+	// 不得回退成裸 fmtRate/fmtMs（那会绕过闸门）。
+	if strings.Contains(row, "fmtMs(a.avg_latency_ms)") {
+		t.Error("usRow 仍裸调 fmtMs(avg_latency_ms) —— 绕过了样本数闸门")
+	}
+	if strings.Contains(row, "fmtRate(a.avg_tokens_per_second)") {
+		t.Error("usRow 仍裸调 fmtRate(avg_tokens_per_second) —— 绕过了样本数闸门")
+	}
+	// 样本数不足时要有明确占位与说明，不能静默输出空串。
+	if !strings.Contains(js, "不足") {
+		t.Error("fmtPerf 未对少样本给出说明文案（会静默显示 —，用户不知为何）")
 	}
 }

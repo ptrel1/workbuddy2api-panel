@@ -108,3 +108,48 @@ func TestLifecycleFlush(t *testing.T) {
 		t.Fatalf("Stop 后应有落盘文件: %v", err)
 	}
 }
+
+// 样本数透出 + 均值按样本加权（不是对各桶均值再取平均）。
+//
+// 为什么单独测：按模型表的均速率/均延迟用来回答"哪个模型快"。若均值口径错成
+// "各桶均值的简单平均"，一个只有 1 次样本的桶会和 1000 次样本的桶等权，数字失真。
+// 同时样本数必须透出——前端靠它决定少样本时显示 "—" 而不是一个有误导性的数字。
+func TestAvgPerfWeightedBySamples(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	// 同一模型两个桶：桶 A 1 次样本 100 tok/s，桶 B 3 次样本 10 tok/s。
+	// 加权正确 = (100*1 + 10*3) / 4 = 32.5；简单平均会是 (100+10)/2 = 55。
+	r.Add(now, "cn", "u1", "m1", Delta{TokensPerSecond: 100, HasTPS: true, LatencyMs: 1000, HasLatency: true}, true)
+	// 换账号落到另一个桶（按 uid 分桶），保证是两个独立样本数。
+	r.Add(now, "cn", "u2", "m1", Delta{TokensPerSecond: 10, HasTPS: true, LatencyMs: 100, HasLatency: true}, true)
+	r.Add(now, "cn", "u3", "m1", Delta{TokensPerSecond: 10, HasTPS: true, LatencyMs: 100, HasLatency: true}, true)
+
+	s := r.Snapshot(24, nil)
+	if len(s.ByModel) != 1 {
+		t.Fatalf("by_model 应有 1 项（m1），得 %d", len(s.ByModel))
+	}
+	got := s.ByModel[0]
+	// 注意：同账号同模型的多次 Add 会落进同一个桶，故这里 3 个不同 uid = 3 个桶。
+	if got.TPSSamples != 3 || got.LatSamples != 3 {
+		t.Fatalf("样本数 = tps:%d lat:%d, want 3/3", got.TPSSamples, got.LatSamples)
+	}
+	want := (100.0 + 10.0 + 10.0) / 3
+	if diff := got.AvgTPS - want; diff > 0.001 || diff < -0.001 {
+		t.Fatalf("avg_tps = %v, want %v（按样本加权，非简单平均）", got.AvgTPS, want)
+	}
+}
+
+// 无样本时样本数为 0、均值为零值——前端据此渲染 "—"（而非显示 0 tok/s 误导）。
+func TestNoPerfSamplesMeansZero(t *testing.T) {
+	r := New("")
+	// 失败尝试：无 usage → 无延迟/速率样本。
+	r.Add(time.Now(), "cn", "u1", "m1", Delta{}, false)
+
+	s := r.Snapshot(24, nil)
+	if s.Totals.TPSSamples != 0 || s.Totals.LatSamples != 0 {
+		t.Fatalf("无样本时样本数应为 0，得 tps:%d lat:%d", s.Totals.TPSSamples, s.Totals.LatSamples)
+	}
+	if s.Totals.AvgTPS != 0 || s.Totals.AvgLatencyMs != 0 {
+		t.Fatalf("无样本时均值应为零值，得 tps:%v lat:%v", s.Totals.AvgTPS, s.Totals.AvgLatencyMs)
+	}
+}
