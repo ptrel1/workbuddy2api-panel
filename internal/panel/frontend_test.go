@@ -115,10 +115,15 @@ func TestRealmSegregatedViewsFrontend(t *testing.T) {
 // （不过滤）不会让本测试变红，但会让 §1 的 rows 断言语义失效——故两者必须同时存在。
 func TestNoCrossRealmTotal(t *testing.T) {
 	src := readAppJS(t)
-	if strings.Contains(src, "all.reduce(") {
-		t.Error("疑似对未过滤的全量账号求和（跨域总计）——cn/global 积分不可相加")
+	// ⚠️ 判据要精确到「求和」而非「出现 all.reduce(」——
+	// 实证误报：新加的账号×模型折线图用 all.reduce(Math.min/max) 求
+	// **时间戳范围**（不是求和），被这条粗判据误报。
+	// 故改为：只揪「把值累加」的写法（a + ...），放行 min/max/比较类。
+	for _, bad := range []string{"all.reduce((a, s) => a +", "all.reduce((a, p) => a +"} {
+		if strings.Contains(src, bad) {
+			t.Errorf("疑似对未过滤的全量账号求和（跨域总计）：%q —— cn/global 积分不可相加", bad)
+		}
 	}
-	// 合计行必须显式声明"合计（某域）"，让用户知道这是域内小计而非全局
 	if !strings.Contains(src, "esc(realmLabel(bhRealm))") {
 		t.Error("合计行未标注所属域，会被误读为全局总计")
 	}
@@ -929,12 +934,13 @@ func TestQuotaCaveatRenderedFromServer(t *testing.T) {
 func TestModelToggleUIFullyWired(t *testing.T) {
 	html := readIndexHTML(t)
 	js := readAppJS(t)
-	for _, id := range []string{"mToggle", "mToggleBody", "mToggleWho", "btnMToggleClose"} {
+	for _, id := range []string{"mToggleVeil", "mToggleBody", "mToggleWho", "btnMToggleClose",
+		"btnMToggleAllOn", "btnMToggleAllOff"} {
 		if !strings.Contains(html, `id="`+id+`"`) {
 			t.Errorf("index.html 缺少 #%s", id)
 		}
 	}
-	for _, fn := range []string{"function openModelToggle(", "function renderModelToggle(", "function toggleModel("} {
+	for _, fn := range []string{"function openModelToggle(", "function renderModelToggle(", "function toggleModel(", "function toggleAllModels("} {
 		if !strings.Contains(js, fn) {
 			t.Errorf("app.js 缺少 %s", fn)
 		}
@@ -965,5 +971,63 @@ func TestToggleRollbackOnFailure(t *testing.T) {
 	// 必须把状态改回去（而不是只弹个 toast）
 	if !strings.Contains(body, "chip.classList.toggle('off', wasOff)") {
 		t.Error("失败后未回滚 UI 状态 —— 用户会以为开关已生效")
+	}
+}
+
+// TestModelToggleHidesOnlyPermanentlyUnavailable 只隐藏**永久不可用**（11102
+// model_blocked），必须**保留**临时限流（soft_rate）等其他 kind。
+//
+// 为何关键：实测主力模型 deepseek-v4.1-flash 曾因 429 限流被判 ok=false，
+// 若按「不可用就隐藏」一刀切，**用户会看不到自己的主力模型**（而它几小时后
+// 就能用）。判据必须精确到 kind。
+func TestModelToggleHidesOnlyPermanentlyUnavailable(t *testing.T) {
+	body := funcBody(t, "async function openModelToggle(")
+	if !strings.Contains(body, "model_blocked") {
+		t.Fatal("未按 model_blocked 过滤（不可用模型会被列出）")
+	}
+	if !strings.Contains(body, "a.kind === 'model_blocked'") {
+		t.Error("过滤条件未精确到 kind（一刀切会隐藏临时限流的模型）")
+	}
+	// 必须只在 !a.ok 且 kind=model_blocked 时隐藏
+	if !strings.Contains(body, "!a.ok") {
+		t.Error("未检查 a.ok —— 会把可用模型也隐藏")
+	}
+}
+
+// TestModelToggleGhostStateGuarded 筛选/切页时必须关掉模型开关 modal ——
+// 否则用户会看到"一个已不在表里的账号"的开关（对象身份与视图不一致）。
+func TestModelToggleGhostStateGuarded(t *testing.T) {
+	src := readAppJS(t)
+	// ① 切页时关
+	if !strings.Contains(src, "if (v !== 'accounts') closeModelToggle()") {
+		t.Error("切页时未关 modal（离开再回来它还开着，用户已忘了点的哪个账号）")
+	}
+	// ② 筛选后账号不可见时关
+	body := funcBody(t, "function renderAccounts(")
+	if !strings.Contains(body, "closeModelToggle()") {
+		t.Error("筛选后未检查抽屉所属账号是否仍可见（幽灵状态）")
+	}
+}
+
+// TestAmsDegradesWhenTooFewPoints 账号×模型折线图必须**区分**够画与不够画 ——
+// 实测 30 个组合中仅 3 个 ≥7 点，其余 1~2 点连不成线（画出来像故障）。
+func TestAmsDegradesWhenTooFewPoints(t *testing.T) {
+	js := readAppJS(t)
+	// 关键：必须**真的用它做过滤**，而不是只出现 s.enough 这个字样。
+	// 变异实证：把 `series.filter(s => s.enough)` 改成 `series` 后，
+	// 只查符号存在的断言仍绿。
+	if !strings.Contains(js, "series.filter(s => s.enough)") {
+		t.Error("未用 enough 过滤（1~2 点的组合也会被画成折线，看起来像故障）")
+		if !strings.Contains(js, "function loadAms(") || !strings.Contains(js, "function renderAms(") {
+			t.Error("缺少 loadAms/renderAms")
+		}
+	}
+	// 必须显式告知"可画 N / 共 M"（否则读者不知道为什么只有几条线）
+	if !strings.Contains(js, "可画 ") {
+		t.Error("未标注可画条数（读者会以为数据缺失）")
+	}
+	// 点数不足时必须给降级说明而非空图
+	if !strings.Contains(js, "点数不足") {
+		t.Error("点数不足时未降级说明")
 	}
 }

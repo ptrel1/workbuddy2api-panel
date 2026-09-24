@@ -367,6 +367,87 @@ type Point struct {
 	Agg
 }
 
+// SeriesPoint 时间序列上的一个点（按小时桶）。
+type SeriesPoint struct {
+	Slot   string `json:"slot"`   // 2006-01-02T15
+	Reqs   int64  `json:"reqs"`   // 成功请求数
+	Tokens int64  `json:"tokens"` // prompt + completion
+}
+
+// Series 一条「账号 × 模型」的时序（供折线图）。
+//
+// ⚠️ 可画性：调用方**必须**检查 len(Points) —— 实测 30 个组合中仅 3 个
+// 累计到 ≥7 个小时点，其余多为 1~2 点（**画不成折线**，只能显示为孤立点）。
+// 故本结构附带 Enough 标志，由前端决定"画线 / 只显示数字"，
+// 避免产出"看起来像故障"的单点折线（§十：不得产出无意义的值）。
+type Series struct {
+	UID    string        `json:"uid"`
+	Model  string        `json:"model"`
+	Points []SeriesPoint `json:"points"`
+	Reqs   int64         `json:"reqs"`   // 窗口内合计
+	Tokens int64         `json:"tokens"` // 窗口内合计
+	Enough bool          `json:"enough"` // 点数是否够画折线（>= minLinePoints）
+}
+
+// minLinePoints 画折线所需的最少点数。
+//
+// 取 7：3 点连成的"线"几乎看不出趋势（两点定一线，三点只是折角）；
+// 参考 buka-wms 的折线判据「≥7 点」（见 plans/frontend.md §14.3.1）。
+const minLinePoints = 7
+
+// AccountModelSeries 按「账号 × 模型」返回小时级时序，供用量折线图。
+//
+// 只返回**有点的组合**；Enough=false 的也返回（前端可降级为"只显示合计数字"，
+// 比整条丢掉更有用 —— 用户至少知道"这个号用过这个模型"）。
+func (r *Recorder) AccountModelSeries() []Series {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	type key struct{ uid, model string }
+	agg := map[key]*Series{}
+	order := []key{}
+	for _, b := range r.buckets {
+		// 只取小时桶（日桶是折叠产物，混入会重复计数）
+		if len(b.Scope) < 2 || b.Scope[0] != 'h' {
+			continue
+		}
+		k := key{b.UID, b.Model}
+		s, ok := agg[k]
+		if !ok {
+			s = &Series{UID: b.UID, Model: b.Model}
+			agg[k] = s
+			order = append(order, k)
+		}
+		slot := b.Scope[2:] // "2006-01-02T15"
+		s.Points = append(s.Points, SeriesPoint{
+			Slot: slot, Reqs: b.Req - b.Err, Tokens: b.PT + b.CT,
+		})
+		s.Reqs += b.Req - b.Err
+		s.Tokens += b.PT + b.CT
+	}
+	out := make([]Series, 0, len(order))
+	for _, k := range order {
+		s := agg[k]
+		// 按时间升序（折线必须按时间排；桶是无序 append 的）
+		sort.Slice(s.Points, func(i, j int) bool { return s.Points[i].Slot < s.Points[j].Slot })
+		s.Enough = len(s.Points) >= minLinePoints
+		out = append(out, *s)
+	}
+	// 稳定排序：合计 token 降序（最该看的在前），同值按 uid+model
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Tokens != out[j].Tokens {
+			return out[i].Tokens > out[j].Tokens
+		}
+		if out[i].UID != out[j].UID {
+			return out[i].UID < out[j].UID
+		}
+		return out[i].Model < out[j].Model
+	})
+	return out
+}
+
 // Daily 单日单账号的用量（额度评估用）。
 type Daily struct {
 	Day     string `json:"day"` // 2006-01-02

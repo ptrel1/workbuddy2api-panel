@@ -135,10 +135,13 @@ function go(v) {
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'config') loadConfig();
   if (v === 'logs') { loadLogs(); loadErrors(); }
-  if (v === 'usage') loadUsage();
+  if (v === 'usage') { loadUsage(); loadAms(); }
   if (v === 'packages') loadPackages();
   if (v === 'balhist') loadBalance();
   if (v === 'quota') loadQuota();
+  // 切页时关掉模型开关 modal —— 否则离开再回来它还开着，
+  // 用户已忘了刚才点的是哪个账号（幽灵状态）。
+  if (v !== 'accounts') closeModelToggle();
   if (v === 'taskscenter') { loadSchoolStatus(true); pollQueueOnce(); }
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
@@ -193,6 +196,9 @@ function renderAccounts(list) {
   const tb = $('accBody');
   // 套餐筛选（用户要求"按套餐排序/筛选"）。
   // 在**渲染前**过滤，保证统计卡与表格一致（否则会"表里 2 个、卡说 4 个"）。
+  // 幽灵状态防护：筛选后若抽屉所属账号已不在可见列表，关掉抽屉 ——
+  // 否则用户会看到"一个已不在表里的账号"的开关（对象身份与视图不一致）。
+  if (mToggleUID && !(list || []).some(s => s.uid === mToggleUID)) closeModelToggle();
   if (planFilter) {
     list = (list || []).filter(s => {
       const short = s.uid && s.uid.length > 8 ? s.uid.slice(0, 8) : s.uid;
@@ -591,7 +597,13 @@ $('btnModels').onclick = loadModels;
 
 if ($('btnQuota')) $('btnQuota').onclick = loadQuota;
 
-if ($('btnMToggleClose')) $('btnMToggleClose').onclick = function () { $('mToggle').hidden = true; };
+if ($('btnMToggleClose')) $('btnMToggleClose').onclick = closeModelToggle;
+if ($('btnMToggleAllOn')) $('btnMToggleAllOn').onclick = function () { toggleAllModels(false); };
+if ($('btnMToggleAllOff')) $('btnMToggleAllOff').onclick = function () { toggleAllModels(true); };
+// 点遮罩关闭（与其它 modal 一致）
+if ($('mToggleVeil')) $('mToggleVeil').addEventListener('click', function (ev) {
+  if (ev.target === this) closeModelToggle();
+});
 // 事件委托：模型格子是动态渲染的，绑定在容器上（避免每格绑一次）
 if ($('mToggleBody')) $('mToggleBody').addEventListener('click', function (ev) {
   const chip = ev.target.closest('.mchip');
@@ -2030,9 +2042,16 @@ function fmtChange(v, full) {
    与 fmtChange 的区别：这些量不表示方向（消耗恒 >=0），故不用涨跌色，
    用中性色 + 弱化不完整日。0 显示为 "–"（无变化比 "0" 更易扫读）。 */
 function fmtFlow(v, full) {
-  if (v === null || v === undefined) return '—';
+  // 「无数据」与「零」必须用**不同符号**（§十一 口径标注）。
+  //
+  // 事故：原先零值用 en-dash「–」(U+2013)、无数据用 em-dash「—」(U+2014) ——
+  // 两者都是一条横线，12px 下仅差 6px 宽，**扫视时无法区分**。
+  // 用户看到「今日消耗 –」以为是"没数据"，实际是"今天消耗 0"（真实数据：
+  // 当天三号全被限流、无成功请求，只有签到到账）。
+  // 现改为：零值显式写 **0**（灰化，不与真实数字抢注意力），无数据才用「—」。
+  if (v === null || v === undefined) return '<span style="color:var(--ink-3)">—</span>';
   const n = Number(v);
-  if (!n) return '<span style="color:var(--ink-3)">–</span>';
+  if (!n) return '<span style="color:var(--ink-3)" title="该日无消耗记录（余额未下降过）">0</span>';
   return '<span style="color:var(--ink-2)' + (full ? '' : '; opacity:.6') + '"' +
     (full ? '' : ' title="该日采样不完整，消耗/到账均为下界估计，不宜与完整日直接比较"') + '>' +
     fmtNum(n) + '</span>';
@@ -2123,56 +2142,80 @@ async function loadQuota() {
   }
 }
 
-/* openModelToggle 展开某账号的模型开关抽屉。
-   数据来源：models（该域全量模型）+ model_availability 里的 off 清单。
-   为何只列**该域**模型：跨域模型本就不会路由到该账号，列出来是无意义的格子。 */
+/* openModelToggle 打开「模型开关」modal。
+   数据：models（该域全量）+ model_availability（可用性）+ models/off（已关清单）。
+
+   ⚠️ 关键过滤（用户要求"测试不可用的模型不用列出来"）：
+   只剔除 **永久不可用**（kind=model_blocked，即上游 11102「无此模型」）；
+   **保留** soft_rate（429 限流，临时）与其他 kind —— 否则主力模型一旦限流
+   就会从列表消失（实测 deepseek-v4.1-flash 曾因 429 被判不可用，
+   若一并剔除，用户会看不到自己的主力模型）。 */
 async function openModelToggle(uid) {
-  const box = $('mToggle');
+  const veil = $('mToggleVeil');
   const body = $('mToggleBody');
-  if (!box || !body) return;
+  const state = $('mToggleState');
+  if (!veil || !body) return;
   const st = (overviewData && (overviewData.accounts || []).find(x => x.uid === uid)) || {};
   const short = uid.length > 8 ? uid.slice(0, 8) : uid;
-  $('mToggleWho').textContent = (st.nickname || short) + ' · 模型开关';
-  box.hidden = false;
-  body.innerHTML = '<span class="mtoggle-empty">正在加载模型列表…</span>';
+  $('mToggleWho').textContent = (st.nickname || short) + '（' + short + '）';
+  veil.classList.add('on');
   mToggleUID = uid;
+  body.hidden = true;
+  state.hidden = false;
+  state.innerHTML = '<span class="dots">正在加载模型列表</span>';
 
   try {
     const realm = st.realm === 'global' ? 'global' : 'cn';
-    const [md, off] = await Promise.all([
+    const [md, off, av] = await Promise.all([
       api('models?realm=' + encodeURIComponent(realm)).catch(() => ({ models: [] })),
       api('accounts/' + encodeURIComponent(uid) + '/models/off').catch(() => ({ models: [] })),
+      api('model_availability').catch(() => ({ results: {} })),
     ]);
-    renderModelToggle((md.models || []).map(m => m.id), off.models || []);
+    const avails = av.results || {};
+    const ids = (md.models || []).map(m => m.id).filter(id => {
+      const a = avails[realm + ':' + id] || avails[id];
+      // 只剔除「上游确认无此模型」(11102)；临时限流等一律保留
+      return !(a && !a.ok && a.kind === 'model_blocked');
+    });
+    const hidden = (md.models || []).length - ids.length;
+    renderModelToggle(ids, off.models || [], hidden);
   } catch (e) {
-    body.innerHTML = '<span class="mtoggle-empty">加载失败：' + esc(e.message) + '</span>';
+    state.innerHTML = '<span style="color:var(--bad)">加载失败：' + esc(e.message) + '</span>';
   }
 }
 
-/* renderModelToggle 画模型格子。offSet 是**关闭**的组合集合。 */
-function renderModelToggle(ids, offList) {
+/* renderModelToggle 画模型格子。offList = 已关闭的组合。 */
+function renderModelToggle(ids, offList, hiddenN) {
   const body = $('mToggleBody');
+  const state = $('mToggleState');
   if (!body) return;
+  state.hidden = true;
+  body.hidden = false;
   if (!ids.length) {
     body.innerHTML = '<span class="mtoggle-empty">没有可用模型（该域无账号或目录为空）</span>';
     return;
   }
   const offMap = {};
   (offList || []).forEach(o => { offMap[o.model] = o; });
-  const ids2 = ids.slice().sort();
-  body.innerHTML = ids2.map((id, i) => {
+  const sorted = ids.slice().sort();
+  body.innerHTML = sorted.map(id => {
     const o = offMap[id];
     const isOff = !!o;
-    return '<span class="mchip' + (isOff ? ' off' : '') + '" data-m="' + esc(id) + '"' +
-      ' title="' + esc(isOff ? ('已手动关闭' + (o.since ? ' · ' + o.since : '') + (o.note ? ' · ' + o.note : '') + '\n点击恢复')
-                              : '点击关闭该账号对 ' + id + ' 的使用') + '">' +
+    const tip = isOff
+      ? ('已手动关闭' + (o.since ? ' · ' + o.since : '') + (o.note ? ' · ' + o.note : '') + '\n点击恢复')
+      : ('点击关闭该账号对 ' + id + ' 的使用');
+    return '<span class="mchip' + (isOff ? ' off' : '') + '" data-m="' + esc(id) + '" title="' + esc(tip) + '">' +
       esc(id) + '<span class="tag2">' + (isOff ? '已关' : '开') + '</span></span>';
-  }).join('') + '<span class="mtoggle-note">共 ' + ids2.length + ' 个模型 · 关闭 ' +
-    (offList || []).length + ' 个</span>';
+  }).join('');
+  const note = $('mToggleNote');
+  if (note) {
+    note.textContent = '共 ' + sorted.length + ' 个模型 · 关闭 ' + (offList || []).length + ' 个' +
+      (hiddenN > 0 ? ' · 已隐藏 ' + hiddenN + ' 个上游不支持的模型' : '');
+  }
 }
 
-/* toggleModel 切换某 (账号,模型) 开关。乐观更新：先改 UI 再发请求，
-   失败则回滚（开关类交互必须即时反馈，否则用户会以为没点上）。 */
+/* toggleModel 切换单个开关（乐观更新 + 失败回滚）。
+   失败回滚是必须的：停在乐观值上会让用户以为设置成功了，比不反馈更糟。 */
 async function toggleModel(chip) {
   const model = chip.getAttribute('data-m');
   const wasOff = chip.classList.contains('off');
@@ -2185,10 +2228,163 @@ async function toggleModel(chip) {
       body: JSON.stringify({ model, off: !wasOff }),
     });
   } catch (e) {
-    // 回滚（失败必须让用户看见真实状态，不能停在乐观值上）
     chip.classList.toggle('off', wasOff);
     if (t) t.textContent = wasOff ? '已关' : '开';
     toast('设置失败：' + e.message, 'err');
+  }
+}
+
+/* toggleAllModels 一键全开 / 全关（用户要求）。
+   off=true 全关，false 全开。串行发送（并发会瞬时打满面板自身）；
+   每个格子单独乐观更新，失败的保持原状并计数。 */
+async function toggleAllModels(off) {
+  const chips = Array.prototype.slice.call(document.querySelectorAll('#mToggleBody .mchip'));
+  if (!chips.length) return;
+  const btnOn = $('btnMToggleAllOn'), btnOff = $('btnMToggleAllOff');
+  if (btnOn) btnOn.disabled = true;
+  if (btnOff) btnOff.disabled = true;
+  let fail = 0;
+  for (const chip of chips) {
+    const isOff = chip.classList.contains('off');
+    if (isOff === off) continue;          // 已是目标状态，跳过（少发请求）
+    const model = chip.getAttribute('data-m');
+    chip.classList.toggle('off', off);
+    const t = chip.querySelector('.tag2');
+    if (t) t.textContent = off ? '已关' : '开';
+    try {
+      await api('accounts/' + encodeURIComponent(mToggleUID) + '/models/toggle', {
+        method: 'POST', body: JSON.stringify({ model, off }),
+      });
+    } catch (e) {
+      chip.classList.toggle('off', !off);   // 回滚这一格
+      if (t) t.textContent = off ? '开' : '已关';
+      fail++;
+    }
+  }
+  if (btnOn) btnOn.disabled = false;
+  if (btnOff) btnOff.disabled = false;
+  const note = $('mToggleNote');
+  if (note) {
+    const n = document.querySelectorAll('#mToggleBody .mchip.off').length;
+    note.textContent = '共 ' + chips.length + ' 个模型 · 关闭 ' + n + ' 个' +
+      (fail ? ' · ⚠️ ' + fail + ' 个失败' : '');
+  }
+  if (fail) toast(fail + ' 个模型设置失败', 'err');
+  else toast(off ? '已全部关闭' : '已全部打开', 'ok');
+}
+
+function closeModelToggle() {
+  const veil = $('mToggleVeil');
+  if (veil) veil.classList.remove('on');
+  mToggleUID = '';
+}
+
+
+/* loadAms 加载「账号 × 模型」时序。
+   数据分两类（见 index.html 的说明）：
+     plottable（≥7 点）→ 画折线；
+     sparse（<7 点）→ 只列表显示合计，不画线。 */
+async function loadAms() {
+  const body = $('amsBody');
+  const chart = $('amsChart');
+  if (body) body.innerHTML = '<tr><td colspan="7"><div class="empty">加载中…</div></td></tr>';
+  try {
+    const d = await api('usage_series');
+    renderAms(d.series || []);
+  } catch (e) {
+    if (body) body.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+    if (chart) chart.innerHTML = '<div class="us-empty">读取失败：' + esc(e.message) + '</div>';
+  }
+}
+
+/* renderAms 画「账号 × 模型」折线 + 明细表。 */
+function renderAms(series) {
+  const body = $('amsBody');
+  const chart = $('amsChart');
+  const note = $('amsNote');
+  if (!series.length) {
+    if (chart) chart.innerHTML = '<div class="us-empty">暂无用量数据。发起一次对话后再刷新。</div>';
+    if (body) body.innerHTML = '<tr><td colspan="7"><div class="empty">暂无数据</div></td></tr>';
+    if (note) note.textContent = '—';
+    return;
+  }
+  const plot = series.filter(s => s.enough);
+  const sparse = series.filter(s => !s.enough);
+  if (note) {
+    note.textContent = '可画 ' + plot.length + ' / 共 ' + series.length + ' 条' +
+      (sparse.length ? '（' + sparse.length + ' 条点数不足）' : '');
+  }
+
+  // 折线：x 按真实时间比例（与余额图同口径：什么时候用的本身是信息）
+  if (chart) {
+    if (!plot.length) {
+      chart.innerHTML = '<div class="us-empty">没有点数足够画折线的组合' +
+        '（每个组合需 ≥7 个小时点）。<br>下方表格仍列出全部组合的合计用量。</div>';
+    } else {
+      const all = [];
+      plot.forEach(s => s.points.forEach(p => all.push(p)));
+      const t0 = all.reduce((a, p) => Math.min(a, Date.parse(p.slot + ':00:00')), Infinity);
+      const t1 = all.reduce((a, p) => Math.max(a, Date.parse(p.slot + ':00:00')), -Infinity);
+      const hi = Math.max(1, ...all.map(p => p.tokens));
+      const W = measureWidth(chart), H = 210, PL = 62, PR = 14, PT = 14, PB = 30;
+      const iw = W - PL - PR, ih = H - PT - PB;
+      const span = Math.max(1, t1 - t0);
+      const X = t => PL + iw * ((t - t0) / span);
+      const Y = v => PT + ih - ih * (v / hi);
+      let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none" role="img">';
+      for (let i = 0; i <= 4; i++) {
+        const v = hi * i / 4, y = Y(v);
+        out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + y.toFixed(1) + '"/>';
+        out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5).toFixed(1) + '" text-anchor="end">' +
+          fmtTokens(v) + '</text>';
+      }
+      out += '<line class="ax" x1="' + PL + '" y1="' + (PT + ih) + '" x2="' + (W - PR) + '" y2="' + (PT + ih) + '"/>';
+      // x 轴首/中/末三点
+      [t0, (t0 + t1) / 2, t1].forEach((t, i) => {
+        const dt = new Date(t);
+        const lb = (dt.getMonth() + 1) + '-' + String(dt.getDate()).padStart(2, '0') + ' ' +
+          String(dt.getHours()).padStart(2, '0') + ':00';
+        out += '<text class="tk" x="' + X(t).toFixed(1) + '" y="' + (H - 8) +
+          '" text-anchor="' + (i === 0 ? 'start' : i === 2 ? 'end' : 'middle') + '">' + esc(lb) + '</text>';
+      });
+      plot.forEach((s, si) => {
+        const color = BH_COLORS[si % BH_COLORS.length];
+        const pts = s.points.map(p => ({
+          x: X(Date.parse(p.slot + ':00:00')), y: Y(p.tokens), p,
+        }));
+        out += '<polyline fill="none" stroke="' + color + '" stroke-width="1.8" ' +
+          'stroke-linejoin="round" points="' +
+          pts.map(q => q.x.toFixed(1) + ',' + q.y.toFixed(1)).join(' ') + '"/>';
+        pts.forEach(q => {
+          out += '<circle cx="' + q.x.toFixed(1) + '" cy="' + q.y.toFixed(1) + '" r="2.2" fill="' + color + '">' +
+            '<title>' + esc(s.uid.slice(0, 8) + ' · ' + s.model + '\n' + q.p.slot +
+              '\n' + fmtTokens(q.p.tokens) + ' tokens / ' + q.p.reqs + ' 次') + '</title></circle>';
+        });
+      });
+      out += '</svg>';
+      chart.innerHTML = out;
+      const lg = $('amsLegend');
+      if (lg) lg.innerHTML = plot.map((s, i) =>
+        '<i class="sw" style="background:' + BH_COLORS[i % BH_COLORS.length] + '"></i>' +
+        esc(s.uid.slice(0, 8) + ' ' + s.model.replace(/^[a-z]+:/, ''))).join(' ');
+    }
+  }
+
+  // 明细表：全部组合（含点数不足的）
+  if (body) {
+    body.innerHTML = series.map(s => {
+      const can = s.enough
+        ? '<span class="tag ok">可</span>'
+        : '<span class="tag" style="opacity:.6">点数不足</span>';
+      return '<tr>' +
+        '<td class="mark" aria-hidden="true"></td>' +
+        '<td><span class="mono" style="font-size:11.5px">' + esc(s.uid.slice(0, 8)) + '</span></td>' +
+        '<td><span class="mono" style="font-size:11.5px">' + esc(s.model) + '</span></td>' +
+        '<td class="num" style="font-weight:600">' + fmtTokens(s.tokens) + '</td>' +
+        '<td class="num">' + s.reqs + '</td>' +
+        '<td class="num">' + s.points.length + '</td>' +
+        '<td>' + can + '</td></tr>';
+    }).join('');
   }
 }
 
@@ -2336,6 +2532,7 @@ async function loadUsage() {
 }
 
 if ($('btnUsage')) $('btnUsage').onclick = loadUsage;
+if ($('btnAms')) $('btnAms').onclick = loadAms;
 if ($('usWindow')) $('usWindow').onchange = loadUsage;
 
 /* ── 积分构成 ─────────────────────────────────────────────────────── */

@@ -420,21 +420,25 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
   /* 模型开关抽屉：格子布局，每格 = 一个 (账号,模型) 开关。
      关闭态用「删除线 + 灰化」而非只变色 —— 语义明确且色盲可辨。 */
-  .mtoggle { margin: 10px 12px 0; padding: 10px 12px; border-radius: 8px;
-    background: var(--surface-2); border: 1px solid var(--line); }
-  .mtoggle-hd { display: flex; align-items: center; gap: 10px; margin-bottom: 9px;
-    font-size: 12.5px; }
-  .mtoggle-hd .note { color: var(--ink-3); font-size: 11.5px; }
-  .mtoggle-body { display: flex; flex-wrap: wrap; gap: 6px; }
-  .mtoggle-body .mchip { font-size: 11.5px; padding: 3px 9px; border-radius: 6px;
+  /* 模型开关（modal 内）：格子布局，每格 = 一个 (账号,模型) 开关。
+     - 关闭态用「删除线 + 灰化」而非只变色：语义明确且色盲可辨（双重编码）；
+     - 点击目标 30px（原 22px 偏小，密集点击区误触率高，菲茨定律）；
+     - 不可用模型（11102）在数据层就被剔除，这里不渲染。 */
+  .mtoggle-body { display: flex; flex-wrap: wrap; gap: 7px; }
+  .mtoggle-body .mchip { display: inline-flex; align-items: center; gap: 6px;
+    min-height: 30px; padding: 4px 11px; border-radius: 7px;
     border: 1px solid var(--line); background: var(--surface); cursor: pointer;
-    font-family: var(--mono); user-select: none; }
+    font-family: var(--mono); font-size: 12px; user-select: none;
+    transition: border-color .12s, background .12s; }
   .mtoggle-body .mchip:hover { border-color: var(--accent); }
   .mtoggle-body .mchip.off { text-decoration: line-through; opacity: .55;
     background: var(--bad-soft); border-color: rgba(240,101,95,.35); }
-  .mtoggle-body .mchip .tag2 { font-family: var(--sans); margin-left: 5px; font-size: 10.5px; }
+  .mtoggle-body .mchip .tag2 { font-family: var(--sans); font-size: 10.5px;
+    padding: 1px 5px; border-radius: 4px; background: var(--surface-2); }
+  .mtoggle-body .mchip.off .tag2 { background: var(--bad-soft); color: var(--bad); }
   .mtoggle-empty { color: var(--ink-3); font-size: 12px; }
-  .mtoggle-note { color: var(--ink-3); font-size: 11px; margin-left: 6px; }
+  .mtoggle-group { margin-bottom: 14px; }
+  .mtoggle-group .gl { font-size: 11.5px; color: var(--ink-3); margin-bottom: 7px; }
 
   /* 额度评估的口径声明：琥珀色底 + 显眼位置（首因效应）。
      为何不用脚注：读者会先看数字再看说明，那时已把峰值当官方额度了。 */
@@ -478,8 +482,18 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     font-size: 11px; line-height: 1.55; color: var(--ink-2); }
   .rlm b { color: var(--warn); font-weight: 600; }
 
+  /* 诊断区（表格下方）：接近性原则 —— 组内小间距、与主内容大间距。
+     原先三块用同样的 margin-top:10px 且下边距 0，导致
+     ① 块间无分组感（间距均一 = 零分组信息）② 表格像被粘在倾斜条上。 */
+  .diag { margin: 18px 12px 14px; padding-top: 14px;
+    border-top: 1px solid var(--line-soft); }
+  .diag-hd { font-size: 11.5px; color: var(--ink-3); letter-spacing: .04em;
+    margin-bottom: 8px; }
+  .diag > .pool-alert, .diag > .skew { margin: 0 0 8px; }
+  .diag > *:last-child { margin-bottom: 0; }
+
   /* 池子健康横幅（黄条）：只在 healthy 偏低时出现 */
-  .pool-alert { margin: 10px 12px 0; padding: 9px 12px; border-radius: 8px;
+  .pool-alert { padding: 9px 12px; border-radius: 8px;
     background: var(--warn-soft); border: 1px solid rgba(245,181,68,.35);
     color: var(--ink); font-size: 12.5px; line-height: 1.6; }
   .pool-alert.bad { background: var(--bad-soft); border-color: rgba(240,101,95,.4); }
@@ -487,7 +501,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .pool-alert.bad b { color: var(--bad); }
 
   /* 负载倾斜条：每账号一段，宽度=占比；悬停给明细 */
-  .skew { margin: 10px 12px 0; font-size: 11.5px; color: var(--ink-3); }
+  .skew { font-size: 11.5px; color: var(--ink-3); }
   .skew-hd { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
   .skew-warn { color: var(--warn); font-weight: 550; }
   .skew-track { display: flex; height: 7px; border-radius: 4px; overflow: hidden;
@@ -632,20 +646,25 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           </select>
           <span class="note" id="planNote"></span>
         </header>
-        <!-- 模型开关抽屉：点账号行的「模型」按钮展开。
-             设计（用户选定 A）：精确到 (账号 × 模型)、永久、手动优先。
-             只列**该域实际可用的模型**，避免展示一堆用不到的格子。 -->
-        <div class="mtoggle" id="mToggle" hidden>
-          <div class="mtoggle-hd">
-            <b id="mToggleWho"></b>
-            <span class="note" id="mToggleHint">点击模型可单独关闭 —— 关闭后该账号不再用该模型，且不受自动恢复影响</span>
-            <span class="grow"></span>
-            <button class="xs" id="btnMToggleClose">收起</button>
-          </div>
-          <div class="mtoggle-body" id="mToggleBody"></div>
+        <div class="tbl-wrap">
+        <table class="acc">
+          <thead><tr>
+            <th class="mark" aria-hidden="true"></th>
+            <th>账号</th><th>状态</th><th>积分</th>
+            <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th class="c-acts"></th>
+          </tr></thead>
+          <tbody id="accBody"></tbody>
+        </table>
         </div>
 
-        <!-- 池子健康横幅：healthy<=1 时亮黄条。
+        <!-- 诊断信息移到表格【下方】（设计心理学：序列位置效应 + 层级）。
+             为何不在表格上方：账号表格是**主内容**（用户来这是为了看/操作账号），
+             而健康横幅/倾斜条是**辅助诊断**。原先三块常驻上方 ≈150~210px，
+             把主内容推到折叠线以下 —— 辅助信息挤占了主内容的注意力位置。
+             移到下方后：主内容（账号列表）优先进入首屏；
+             诊断信息仍在同页、需要时下滚即见（不隐藏、不折叠，保持可发现性）。 -->
+        <div class="diag">
+          <div class="diag-hd">诊断</div>        <!-- 池子健康横幅：healthy<=1 时亮黄条。
              为何需要：此前池子枯竭（如 3 个号全被 6004 限流）时，用户只能
              等请求返回 503 才知道——实测曾持续 77 分钟无人察觉。
              这里把「还能撑几个号被限」提前说出来。 -->
@@ -656,15 +675,6 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
              （实测：global 号仅 27 次，混入后倾斜度虚高）。 -->
         <div class="skew" id="skewBar" hidden></div>
 
-        <div class="tbl-wrap">
-        <table class="acc">
-          <thead><tr>
-            <th class="mark" aria-hidden="true"></th>
-            <th>账号</th><th>状态</th><th>积分</th>
-            <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th class="c-acts"></th>
-          </tr></thead>
-          <tbody id="accBody"></tbody>
-        </table>
         </div>
       </div>
     </section>
@@ -856,6 +866,42 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             </div>
             <div id="usChart" class="uschart-body"></div>
           </div>
+        </div>
+      </div>
+
+      <!-- 「账号 × 模型」时序：用户要求按颗粒度到不同账号的不同模型画折线。
+           设计要点（数据驱动，非偏好）：
+           实测 30 个组合中**仅 3 个**累计到 ≥7 个小时点，其余多为 1~2 点。
+           1~2 点连不成线（两点定一线，画出来像故障）→ 故分两段渲染：
+             · 够画折线的（≥7 点）→ 真折线，每账号一色；
+             · 不够的 → **只显示合计数字**，不画线（避免"看起来像故障"的空图）。
+           并在标题旁标注"可画 N / 共 M 条"，让读者知道为什么只画了几条。 -->
+      <div class="box">
+        <header>
+          <h3>账号 × 模型 时序 <span class="hint">点数 ≥7 才画折线（少于 7 点连不成趋势）</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="amsNote">—</span>
+          <button class="xs" id="btnAms">刷新</button>
+        </header>
+        <div class="pad">
+          <div class="uschart">
+            <div class="uschart-hd">
+              <span class="lb">Token 用量（按小时）</span>
+              <span class="grow"></span>
+              <span class="legend" id="amsLegend"></span>
+            </div>
+            <div id="amsChart" class="uschart-body"></div>
+          </div>
+        </div>
+        <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr>
+              <th class="mark" aria-hidden="true"></th><th>账号</th><th>模型</th>
+              <th class="num">合计 Token</th><th class="num">请求</th>
+              <th class="num">点数</th><th>可否画线</th>
+            </tr></thead>
+            <tbody id="amsBody"></tbody>
+          </table>
         </div>
       </div>
 
@@ -1115,6 +1161,30 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 </div>
 
 <!-- 积分任务 -->
+<div class="veil" id="mToggleVeil">
+  <div class="dlg" style="width:880px">
+    <header>
+      <h3>模型开关 <span class="hint" id="mToggleWho"></span></h3>
+      <div class="hint">
+        精确到「账号 × 模型」的**永久**开关：关闭后该账号不再用该模型，
+        且不受自动恢复（限流到期）影响，只有在这里才能重新打开。
+        不可用的模型（上游确认无此模型）已自动隐藏。
+      </div>
+    </header>
+    <div class="body">
+      <div class="state" id="mToggleState"><span class="dots">加载中</span></div>
+      <div class="mtoggle-body" id="mToggleBody" hidden></div>
+    </div>
+    <footer>
+      <span class="note" id="mToggleNote"></span>
+      <span class="grow"></span>
+      <button id="btnMToggleAllOn">全部打开</button>
+      <button id="btnMToggleAllOff" class="danger">全部关闭</button>
+      <button id="btnMToggleClose">关闭</button>
+    </footer>
+  </div>
+</div>
+
 <div class="veil" id="taskVeil">
   <div class="dlg" style="width:940px">
     <header>

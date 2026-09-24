@@ -192,6 +192,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/models/off", p.withAuth(p.modelsOff))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/models/toggle", p.withAuth(p.modelToggle))
 	p.mux.HandleFunc("GET /panel/api/quota", p.withAuth(p.quota))
+	p.mux.HandleFunc("GET /panel/api/usage_series", p.withAuth(p.usageSeries))
 	p.mux.HandleFunc("POST /panel/api/model_availability/probe", p.withAuth(p.probeAvailability))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
@@ -236,6 +237,29 @@ func (p *Panel) apiKey() string {
 //
 // ⚠️ 产出是**实测推断值**，非上游官方额度 —— 口径说明随响应一起返回
 // （quota.Caveat），前端必须原样展示（见 quota.go 的定位声明）。
+// usageSeries 「账号 × 模型」用量时序（供折线图）。
+//
+// 返回全部有点的组合，每条带 Enough 标志（点数是否够画折线）——
+// 实测 30 个组合中仅 3 个 ≥7 点，其余画不成线；前端据此**降级为数字**，
+// 避免产出"看起来像故障"的单点折线。
+func (p *Panel) usageSeries(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Usage == nil {
+		writeErr(w, http.StatusNotImplemented, "usage recorder not available")
+		return
+	}
+	series := p.cfg.Usage.AccountModelSeries()
+	enough := 0
+	for _, s := range series {
+		if s.Enough {
+			enough++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "series": series,
+		"total": len(series), "plottable": enough,
+	})
+}
+
 func (p *Panel) quota(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Usage == nil {
 		writeErr(w, http.StatusNotImplemented, "usage recorder not available")
