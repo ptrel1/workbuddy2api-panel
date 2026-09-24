@@ -1536,3 +1536,50 @@ func TestCustomModeFingerprintSanitizePreserved(t *testing.T) {
 		t.Errorf("want exactly 1 system message, got %d (all=%v)", systemCount, msgs)
 	}
 }
+
+// TestStatusExposesCostExplore /status 必须透出条件探索台账。
+//
+// 为什么需要：探索会**主动把真实请求改道**给未知号（打破 tier 0 垄断）。这是路由层
+// 的"非默认行为"，运维必须能解释"这次为什么没走最省钱的号"——否则该机制是黑盒，
+// 出现异常时无从归因。透出 interval 也让面板能区分"关停了"与"开着但还没探过"。
+// 本测试同时防"加了 pool 侧 getter 但忘了接线"这类死代码（getter 只有测试调用）。
+func TestStatusExposesCostExplore(t *testing.T) {
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999})
+	// 默认窗口未显式注入 → pool.New 的 30m 默认。
+	h := NewHandler(Config{Pool: p, Upstream: upstream.New()})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/status", nil))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("status not json: %v", err)
+	}
+	ce, ok := body["cost_explore"].(map[string]any)
+	if !ok {
+		t.Fatalf("status 缺 cost_explore 字段（探索台账未透出）: %v", body["cost_explore"])
+	}
+	if ce["interval_seconds"] != float64((30 * time.Minute).Seconds()) {
+		t.Errorf("interval_seconds=%v want 1800（默认 30m）", ce["interval_seconds"])
+	}
+	if ce["events"] != float64(0) {
+		t.Errorf("events=%v want 0（未探索过）", ce["events"])
+	}
+	if m, ok := ce["last"].(map[string]any); !ok || len(m) != 0 {
+		t.Errorf("last 应为空对象，得 %v", ce["last"])
+	}
+
+	// 关停后 interval_seconds 归 0（面板据此显示"已关停"而非"还没探过"）。
+	p.SetCostExploreInterval(0)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/status", nil))
+	body = nil
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("status not json: %v", err)
+	}
+	if ce, _ := body["cost_explore"].(map[string]any); ce["interval_seconds"] != float64(0) {
+		t.Errorf("关停后 interval_seconds=%v want 0", ce["interval_seconds"])
+	}
+}

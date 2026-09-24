@@ -194,7 +194,27 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		},
 		"sticky_sessions": sticky,
 		"redis_mode":      redisMode,
+		// cost_explore 条件探索台账：interval_seconds 为 0 表示已关停；events 是累计
+		// 改道次数；last 是各 (域, 模型) 的上次探索时刻。为什么透出：探索会**主动改道**
+		// 一个真实请求，运维必须能解释"这次为什么没走最省钱的号"，否则该机制是黑盒。
+		"cost_explore": costExploreStatusJSON(h.cfg.Pool),
 	})
+}
+
+// costExploreStatusJSON 把探索台账转成 /status 的展示形态。
+// 键里的 \x1f 是 pool 内部的分隔符（防模型名/域含分隔歧义），展示层替换为 "|"
+// 便于人读与日志检索；时刻用 RFC3339。
+func costExploreStatusJSON(p *pool.Pool) map[string]any {
+	interval, events, last := p.CostExploreStatus()
+	out := make(map[string]string, len(last))
+	for k, ts := range last {
+		out[strings.ReplaceAll(k, "\x1f", "|")] = ts.Format(time.RFC3339)
+	}
+	return map[string]any{
+		"interval_seconds": int64(interval.Seconds()),
+		"events":           events,
+		"last":             out,
+	}
 }
 
 // countsMapFrom 把 CountsDetailed 五元组打包成 /status 的域分组建模。

@@ -164,23 +164,19 @@ func (p *Pool) SetCostExploreInterval(d time.Duration) {
 	p.costExploreInterval = d
 }
 
-// CostExploreStats 返回累计探索事件数与各 (域, 模型) 的上次探索时刻副本。
-// 副本是为避免调用方（面板/状态接口）持有内部 map 后并发读写。
-func (p *Pool) CostExploreStats() (int64, map[string]time.Time) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	last := make(map[string]time.Time, len(p.exploreLast))
+// CostExploreStatus 返回探索台账快照，供 /status 透出（运维据此解释"为什么这次没走最省钱的号"）。
+//
+// 用读锁而非写锁：本方法是只读语义，且 /status 可能被周期性轮询——不该与 pick 的
+// 写锁热路径争抢。返回的 map 是副本，避免调用方持有内部 map 后并发读写。
+// interval 一并返回（0 = 关停），让面板能区分"关停了"与"开着但还没探过"。
+func (p *Pool) CostExploreStatus() (interval time.Duration, events int64, last map[string]time.Time) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	last = make(map[string]time.Time, len(p.exploreLast))
 	for k, ts := range p.exploreLast {
 		last[k] = ts
 	}
-	return p.costExploreEvents, last
-}
-
-// CostExploreInterval 返回当前探索窗口（0 = 关停）。供面板展示"探索是否启用"。
-func (p *Pool) CostExploreInterval() time.Duration {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.costExploreInterval
+	return p.costExploreInterval, p.costExploreEvents, last
 }
 
 // SetDegrade 注入连败降权参数（main 从 config 解析后调用，issue #114）。

@@ -1829,7 +1829,7 @@ func TestCostExploreNoTier1NoSwitch(t *testing.T) {
 			t.Fatalf("无 tier 1 时第 %d 次 pick=%v, want u1（不该探索）", i, got)
 		}
 	}
-	if _, last := p.CostExploreStats(); len(last) != 0 {
+	if _, _, last := p.CostExploreStatus(); len(last) != 0 {
 		t.Errorf("无 tier 1 却记录了探索时刻: %v", last)
 	}
 }
@@ -1847,7 +1847,7 @@ func TestCostExploreRequiresModel(t *testing.T) {
 	if got := p.Pick(); got == nil || got.UID != "u1" {
 		t.Fatalf("无 reqModel 时 pick=%v, want u1（不该探索）", got)
 	}
-	if n, _ := p.CostExploreStats(); n != 0 {
+	if _, n, _ := p.CostExploreStatus(); n != 0 {
 		t.Errorf("无 reqModel 却记了 %d 次探索事件", n)
 	}
 }
@@ -1862,11 +1862,11 @@ func TestCostExploreStatsExposed(t *testing.T) {
 	seedCost(p, "u1", "m1", 0)
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 
-	if n, last := p.CostExploreStats(); n != 0 || len(last) != 0 {
+	if _, n, last := p.CostExploreStatus(); n != 0 || len(last) != 0 {
 		t.Fatalf("初始应为 0 事件 0 键，得 %d/%v", n, last)
 	}
 	p.PickExcludingForModel(nil, "m1") // 触发一次探索
-	n, last := p.CostExploreStats()
+	_, n, last := p.CostExploreStatus()
 	if n != 1 {
 		t.Errorf("探索事件数 = %d, want 1", n)
 	}
@@ -1879,15 +1879,15 @@ func TestCostExploreStatsExposed(t *testing.T) {
 // 否则配置里的 "0" 会被静默当成"没配"而继续探索（用户以为关了，其实没关）。
 func TestSetCostExploreIntervalZeroDisables(t *testing.T) {
 	p := New("")
-	if p.CostExploreInterval() != 30*time.Minute {
-		t.Fatalf("默认窗口 = %v, want 30m", p.CostExploreInterval())
+	if iv, _, _ := p.CostExploreStatus(); iv != 30*time.Minute {
+		t.Fatalf("默认窗口 = %v, want 30m", iv)
 	}
 	p.SetCostExploreInterval(0)
-	if p.CostExploreInterval() != 0 {
-		t.Fatalf("显式 0 后窗口 = %v, want 0（关停）", p.CostExploreInterval())
+	if iv, _, _ := p.CostExploreStatus(); iv != 0 {
+		t.Fatalf("显式 0 后窗口 = %v, want 0（关停）", iv)
 	}
 	p.SetCostExploreInterval(-time.Second)
-	if p.CostExploreInterval() != 0 {
-		t.Fatalf("负值后窗口 = %v, want 0（归一为关停）", p.CostExploreInterval())
+	if iv, _, _ := p.CostExploreStatus(); iv != 0 {
+		t.Fatalf("负值后窗口 = %v, want 0（归一为关停）", iv)
 	}
 }
