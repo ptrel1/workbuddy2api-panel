@@ -137,7 +137,7 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 
 ### 同步上游
 
-**第一轮（fork 基线 `53ee3a1` → `9a87758`，34 个提交）**：四类任务独立排程、pool 文件拆分、12153 连续计数才禁用、429 `code=6004` 模型级限流收窄、11101 不罚号、请求体 413、DeepSeek 思维链、reasoning_content 回填、Codex 指纹脱敏、系统提示词体系、出站 UA 可配等。
+**第一轮（fork 基线 `53ee3a1` → `9a87758`，34 个提交）**：四类任务独立排程、pool 文件拆分、12153 连续计数才禁用、429 `code=6004` 模型级限流收窄、11101 不罚号、请求体 413（**后已移除，见下**）、DeepSeek 思维链、reasoning_content 回填、Codex 指纹脱敏、系统提示词体系、出站 UA 可配等。
 
 **第二轮（`9a87758` → `ea8b1e5`，2026-09-14，只吸收底层）**：
 
@@ -172,7 +172,7 @@ flowchart LR
     Client["客户端 / SDK\nOpenAI 兼容请求"] --> H
 
     subgraph GWI["WorkBuddy2API 网关 :7863"]
-        H["HTTP Handler\n鉴权 · 请求体上限 · 提示词改写 · 轮转"] --> P
+        H["HTTP Handler\n鉴权 · 提示词改写 · 轮转"] --> P
         H --> S
         P["账号池\n三因子加权 · 熔断 · 冷却 · 租约"] --> U
         S["会话粘性路由"] -.绑定镜像.-> REDIS
@@ -310,7 +310,6 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `api_key` | 空 | 网关鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置） |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
-| `server.max_body_mb` | `8` | 聊天请求体大小上限（MB，0 / 负数启动报错）。超限直接返回 **413 `request_body_too_large`**，不再把半截请求喂给上游。**面板在线修改即时生效** |
 | `cooldown.soft_rate` | `600s` | 软限流（429 / 限流文案）冷却基数；同一账号连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
 | `schedule.checkin_hours` | `[9, 21]` | 每日本地时区整点签到 + 余额查询解冻。空数组 / `null` = 未配置回落默认（不是禁用） |
@@ -359,7 +358,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 加载顺序：JSON 文件 → `WB2A_*` 环境变量（变量非空才覆盖）：
 
-`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_MAX_BODY_MB` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
+`WB2A_LISTEN` · `WB2A_API_KEY` · `WB2A_AUTH_DIR` · `WB2A_STATE_FILE` · `WB2A_SOFT_RATE`(duration) · `WB2A_SOFT_RATE_MAX`(duration) · `WB2A_TIMEOUT_SECONDS` · `WB2A_HEADER_TIMEOUT_SECONDS` · `WB2A_IDLE_TIMEOUT_SECONDS` · `WB2A_USER_AGENT` · `WB2A_SANITIZE_FINGERPRINTS`(bool) · `WB2A_PROMPT_MODE` · `WB2A_PROMPT_FILE`
 
 ## 核心行为语义
 
@@ -400,7 +399,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | 内容拦截 | HTTP 400 + 审核文案 | **不罚账号**，`passthrough` 模式走降级重试 | 即时 |
 | 客户端错误 | 其余 4xx / 业务 `code≠0` | 不处罚，换号重试 | 即时 |
 
-请求体解析失败（`11101`）与内容拦截一样**不罚账号**：问题在请求内容而非账号健康。请求体的网关侧截断已由 `server.max_body_mb` 的 413 消灭，剩余的 `11101` 只可能是客户端发来的畸形 JSON。
+请求体解析失败（`11101`）与内容拦截一样**不罚账号**：问题在请求内容而非账号健康。网关侧已不做请求体截断（`server.max_body_mb` 已移除，请求体无上限直读），故 `11101` 只可能是客户端发来的畸形 JSON。
 
 **熔断器**：所有冷却入口与 5xx 共用唯一连续失败计数器 `fails`；累计达 `breaker_threshold`（默认 3）触发熔断，退避 `breaker_cooldown × 2^retryCount`，封顶 `6h`；成功清零。
 
@@ -541,7 +540,7 @@ http://127.0.0.1:7863/panel/
 
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
-| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
+| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体无网关侧上限 |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
@@ -716,19 +715,15 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 - **切模型立即可用**：冷却由 6004 触发时会记录触发模型；同一账号改用**其他模型**请求时视为可用。同模型或未记录模型的冷却回到现状
 - **退回指数退避**：6004 无「将在 … 重置」文案，或非 6004 的普通软限流 → 仍是 `soft_rate`（600s 起，连续触发指数退避，封顶 `soft_rate_max`）
 
-### 多图会话请求体超限怎么办？
+### 多图会话会被网关的请求体上限拦住吗？
 
-请求体超过 `server.max_body_mb`（默认 8 MB）时网关直接返回 `413 request_body_too_large`：
+**不会——网关侧已无请求体大小上限**（`server.max_body_mb` 已移除，破坏性变更）。
 
-```json
-{"error":{"message":"请求体超过 8 MB 上限：多图/长上下文会话易触发（历史图片每轮以 base64 重发）；请压缩图片或调大 server.max_body_mb（面板修改即时生效）后重试","type":"api_error","code":"request_body_too_large"}}
-```
-
-- 该错误在**网关侧**判出，**不会**打上游、**不会**罚账号、**不会**轮转——**这不是 WorkBuddy 上游的限制**，是网关自身的默认上限
-- 为什么多图容易触发：客户端（Claude Code / Codex / ZCode 等 agent）每轮都会把**历史全部图片**以 base64 重新塞进请求体（编码再膨胀约 37%），几张 MB 级截图叠两三轮就会破 8 MB
-- 收到 `413` 即表示是请求体本身超限：面板「配置 → 请求体上限」在线调大**保存后即时生效，无需重启**（issue #17）；直接改 `config.json` 或设 `WB2A_MAX_BODY_MB` 环境变量则需要重启进程
-- 上游真实上限未实测（8 MB 以上的请求从未穿过网关），建议按需调大（如 16 / 32），若上游回 413 再回调
-- 要么放行要么明确 `413`，网关不再把半截请求体喂给上游
+- 请求体完整读入并原样转发，超限类问题**交由上游自然响应**：上游的错误信息量更大（能看到它到底是什么策略），网关提前 `413` 反而挡住上游真实行为
+- 为什么原来会拦：客户端（Claude Code / Codex / ZCode 等 agent）每轮都会把**历史全部图片**以 base64 重新塞进请求体（编码再膨胀约 37%），几张 MB 级截图叠两三轮就会破旧默认的 8 MB——现在不存在这道闸
+- **保留的防御**：读 body 阶段出错（客户端自己断流）→ 就地 `400`，不把半截 JSON 喂上游 unmarshal 报 `unexpected EOF` 冤枉罚号（issue #41 语义）
+- 升级提示：旧 `config.json` 里的 `server.max_body_mb` 键与 `WB2A_MAX_BODY_MB` 环境变量**被静默忽略**（未知键容忍，不影响启动）；面板「配置」页已不再提供该字段
+- 若真撞到上游的请求体限制，错误会经既有[错误分类](#错误分类与账号处置)链路原样透出（网关不预判、不拦截）
 
 ### Docker 部署登录后报「写入 auths/…json.tmp 失败： permission denied」？
 
@@ -766,7 +761,6 @@ sudo chown -R 10001:10001 ./auths ./data ./config.json
 | 断言 | 出处 |
 |---|---|
 | `prompt.mode` 默认 `custom` | `cmd/server/config.go:148` |
-| 请求体上限默认 8 MB | `cmd/server/config.go:132`；413 判定与返回 `internal/server/handler.go:246-254` |
 | 出站强制 `stream:true` | `internal/upstream/payload.go:28` |
 | DeepSeek 思维链注入（`thinking.type=enabled`） | `internal/upstream/thinking.go:110` |
 | 默认 `reasoning_effort` 档位 = `high` | `internal/upstream/thinking.go:32` |

@@ -568,60 +568,39 @@ func TestBalanceRefreshDefaults(t *testing.T) {
 	}
 }
 
-// TestMaxBodyDefault 默认 max_body_mb=8。
-func TestMaxBodyDefault(t *testing.T) {
-	c := Default()
-	if err := c.normalize(); err != nil {
-		t.Fatalf("normalize: %v", err)
-	}
-	if c.Server.MaxBodyMB != 8 {
-		t.Errorf("max_body_mb=%d want 8", c.Server.MaxBodyMB)
-	}
-}
-
-// TestMaxBodyExplicit 显式设置 max_body_mb。
-func TestMaxBodyExplicit(t *testing.T) {
+// TestMaxBodyKeyRemovedLegacyConfigIgnored server.max_body_mb 已移除（BREAKING），
+// 但**旧配置里的该键必须被静默忽略、不影响启动**——用户升级后不会因为残留键起不来。
+//
+// 为什么必须守：这是破坏性变更的唯一"软着陆"承诺。config 用 json.Unmarshal（未设
+// DisallowUnknownFields），未知键天然被忽略；本测试把该行为固化，防日后有人加上
+// 严格模式而无声打破向后兼容。
+// 注：该键被忽略后，配置回写（MarshalIndent）会将其抹除——这是既有行为，非本次引入。
+func TestMaxBodyKeyRemovedLegacyConfigIgnored(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")
-	os.WriteFile(fp, []byte(`{"server":{"max_body_mb":16}}`), 0o600)
+	// 含已移除的 server 段 + 一个仍有效的键，确认整体仍能加载。
+	os.WriteFile(fp, []byte(`{"listen":":9999","server":{"max_body_mb":8},"cooldown":{"soft_rate":"30s"}}`), 0o600)
 	c, err := Load(fp)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("残留的已移除键不应导致启动失败: %v", err)
 	}
-	if c.Server.MaxBodyMB != 16 {
-		t.Errorf("max_body_mb=%d want 16", c.Server.MaxBodyMB)
+	if c.Listen != ":9999" {
+		t.Errorf("listen=%q want :9999（有效键应照常生效）", c.Listen)
 	}
-}
-
-// TestMaxBodyInvalid 非法值（0/负数）normalize 报错：0 想表达"不限"会被静默当成 8MB，
-// 与其误导不如 fail fast 提示显式配大上限。
-func TestMaxBodyInvalid(t *testing.T) {
-	for _, v := range []string{"0", "-1"} {
-		dir := t.TempDir()
-		fp := filepath.Join(dir, "c.json")
-		os.WriteFile(fp, []byte(`{"server":{"max_body_mb":`+v+`}}`), 0o600)
-		_, err := Load(fp)
-		if err == nil {
-			t.Fatalf("want error for max_body_mb=%s", v)
-		}
-		if !strings.Contains(err.Error(), "server.max_body_mb") {
-			t.Errorf("error should name config key server.max_body_mb: %v", err)
-		}
+	if c.SoftRateDur != 30*time.Second {
+		t.Errorf("soft_rate=%v want 30s（有效键应照常生效）", c.SoftRateDur)
 	}
 }
 
-// TestMaxBodyEnvOverride env WB2A_MAX_BODY_MB 非空覆盖 JSON 值。
-func TestMaxBodyEnvOverride(t *testing.T) {
+// TestMaxBodyEnvRemoved env WB2A_MAX_BODY_MB 已随键移除：设了也不再有任何效果
+// （不报错、不改变行为）。守的是"旧部署脚本里残留的该 env 不会让进程起不来"。
+func TestMaxBodyEnvRemoved(t *testing.T) {
+	t.Setenv("WB2A_MAX_BODY_MB", "64")
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")
-	os.WriteFile(fp, []byte(`{"server":{"max_body_mb":4}}`), 0o600)
-	t.Setenv("WB2A_MAX_BODY_MB", "12")
-	c, err := Load(fp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.Server.MaxBodyMB != 12 {
-		t.Errorf("max_body_mb=%d want env 12", c.Server.MaxBodyMB)
+	os.WriteFile(fp, []byte(`{"listen":":9999"}`), 0o600)
+	if _, err := Load(fp); err != nil {
+		t.Fatalf("残留的 WB2A_MAX_BODY_MB 不应导致启动失败: %v", err)
 	}
 }
 
