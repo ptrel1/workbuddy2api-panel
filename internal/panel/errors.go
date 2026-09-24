@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // errSeverity 错误严重度（驱动 UI 语义色，对齐 dev-principles §2.4「语义化色彩」）。
@@ -223,11 +224,24 @@ func aggregateErrors(lines []LogLine) []ErrStat {
 }
 
 // truncateLine 截断日志行（保留头部，便于识别）。
+// truncateLine 截断日志行（保留头部，便于识别）。
+//
+// ⚠️ 必须按 **rune** 截断而非字节：日志里大量中文（"您的使用量已超出频率限制"），
+// 汉字 3 字节，按字节切会把某个字切成半截 → 产生**非法 UTF-8** →
+// JSON 编码成 \ufffd、前端显示成乱码方块。实测踩过（truncateLine(s,57) 切出 \xe6\x82）。
+//
+// 顺带把换行/Tab 压成空格：这些样本用于 HTML title 属性，换行会被浏览器吞掉。
 func truncateLine(s string, n int) string {
-	if len(s) <= n {
+	s = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == '\t' {
+			return ' '
+		}
+		return r
+	}, s)
+	if utf8.RuneCountInString(s) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	return string([]rune(s)[:n]) + "…"
 }
 
 // errorsUpdatedAt 给前端显示"统计截至何时"（§十一：口径要标注时间窗）。

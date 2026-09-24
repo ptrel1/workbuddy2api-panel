@@ -22,36 +22,38 @@ import "time"
 // ChatTiming 单次上游聊天调用的分段耗时。
 // 各字段零值表示该段未测量（如未发生 fallback 重试、请求未发出即失败）。
 type ChatTiming struct {
-// Prepare 本地请求体准备耗时（prepareBody：effort 降级 / 指纹脱敏 /
-// cache key 注入）。纯 CPU，不含 IO；异常大值提示 body 过大或锁竞争。
-Prepare time.Duration
-// Do 从调用 http.Client.Do 到响应头 + 首字节到达的耗时。三段合一：
-//   连接获取（池内复用 ≈0，新建则含 TCP+TLS 握手）+ 请求写出 + 上游首字节。
-// 说明：Go 的 http.Transport 不暴露「建连 vs 首字节」的分离计时点，
-// 强行拆需自定义 RoundTripper 包装并牺牲连接池复用语义，故此处合并观测；
-// 若需进一步归因，用独立实验（curl time_connect）而非生产路径改动。
-Do time.Duration
-// Attempts 实际发出的上游请求次数（>1 表示 global 路径 404/405 发生了
-// fallback 重试）。用于识别「重试导致的慢」而非「单次慢」。
-Attempts int
+	// Prepare 本地请求体准备耗时（prepareBody：effort 降级 / 指纹脱敏 /
+	// cache key 注入）。纯 CPU，不含 IO；异常大值提示 body 过大或锁竞争。
+	Prepare time.Duration
+	// Do 从调用 http.Client.Do 到响应头 + 首字节到达的耗时。三段合一：
+	//
+	//	连接获取（池内复用 ≈0，新建则含 TCP+TLS 握手）+ 请求写出 + 上游首字节。
+	//
+	// 说明：Go 的 http.Transport 不暴露「建连 vs 首字节」的分离计时点，
+	// 强行拆需自定义 RoundTripper 包装并牺牲连接池复用语义，故此处合并观测；
+	// 若需进一步归因，用独立实验（curl time_connect）而非生产路径改动。
+	Do time.Duration
+	// Attempts 实际发出的上游请求次数（>1 表示 global 路径 404/405 发生了
+	// fallback 重试）。用于识别「重试导致的慢」而非「单次慢」。
+	Attempts int
 }
 
 // Add 累加另一次尝试的耗时（fallback 重试路径用），并递增 Attempts。
 // 仅累加已测量的分段：零值段（未测量）不参与累加，避免把「未测量」摊成「0ms」
 // 而虚高 Attempts 对应的分母。
 func (t *ChatTiming) Add(o ChatTiming) {
-if o.Prepare > 0 || o.Do > 0 {
-t.Prepare += o.Prepare
-t.Do += o.Do
-}
-if o.Attempts > 0 {
-t.Attempts += o.Attempts
-}
+	if o.Prepare > 0 || o.Do > 0 {
+		t.Prepare += o.Prepare
+		t.Do += o.Do
+	}
+	if o.Attempts > 0 {
+		t.Attempts += o.Attempts
+	}
 }
 
 // Total 返回本结构已测量的分段合计。恒 ≥0；用于自证 sum ≤ 外层 total。
 // 不变量（可由测试断言）：Total() <= handler 侧 total，差值即 handler 自身开销
 // （选号 / 租约 / 日志 / SSE 解析），是分段观测的正确性判据。
 func (t ChatTiming) Total() time.Duration {
-return t.Prepare + t.Do
+	return t.Prepare + t.Do
 }

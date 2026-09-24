@@ -19,6 +19,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"sync/atomic"
 )
 
 // TestMain 默认关闭聊天表格日志（chatLogEnabled=false），消除 go test 期间的 stdout 噪音。
@@ -1036,9 +1037,9 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	dynamicModelsCache.lastFail = time.Time{}
 	dynamicModelsCache.Unlock()
 
-	var calls int
+	var calls atomic.Int64 // 上游探测是**并发**的（企业端点 ∥ v3 双 UA），故用原子计数
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
-		calls++
+		calls.Add(1)
 		return 500, `boom`, false
 	})
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
@@ -1053,9 +1054,14 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 			t.Fatalf("req %d: code=%d body=%s", i, rec.Code, rec.Body)
 		}
 	}
-	// 一轮探测 = 2 次上游调用（企业端点 + /v3/config 并发，两路全失败才进负缓存）。
-	if calls != 2 {
-		t.Errorf("want 2 probes (console + v3), got %d", calls)
+	// 一轮探测 = 3 次上游调用：企业端点(1) + /v3/config 双 UA(2)。
+	//
+	// 20260924 更新：v3/config 改为**双 UA 并集**（IDE + CLI，见 upstream/v3union.go）
+	// —— 同一端点按 UA 返回不同目录（CN 22 vs 51），互不包含故需各探一次。
+	// 本断言随实现更新，**不是放宽**：仍精确匹配"一轮应有的调用数"，
+	// 将来若多出新的探测路径，这里会再次失败（保持咬合力）。
+	if calls.Load() != 3 {
+		t.Errorf("want 3 probes (console 1 + v3 双 UA 2), got %d", calls.Load())
 	}
 
 	// 冷却期结束（把失败时间戳拨回 10 分钟前）→ 应重新 fetch。
@@ -1067,8 +1073,8 @@ func TestModelsNegativeCacheOnFetchFailure(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatalf("after cooldown: code=%d", rec.Code)
 	}
-	if calls != 4 {
-		t.Errorf("want 4 probes after cooldown (2 rounds x 2), got %d", calls)
+	if calls.Load() != 6 {
+		t.Errorf("want 6 probes after cooldown (2 rounds x 3), got %d", calls.Load())
 	}
 }
 

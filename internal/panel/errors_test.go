@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // 真实日志样本（取自生产日志，含各类错误形态）。
@@ -139,5 +140,33 @@ func TestAggregateErrorsTextFallback(t *testing.T) {
 	}
 	if stats[0].Last != "16:40:56" {
 		t.Errorf("Last = %q, want 16:40:56（纯文本入口应从行首解析）", stats[0].Last)
+	}
+}
+
+// TestTruncateLineKeepsValidUTF8 截断必须按 **rune** 而非字节 ——
+// 日志里大量中文（汉字 3 字节），按字节切会产生**非法 UTF-8**，
+// JSON 编码成 \ufffd、前端显示乱码方块。实测 truncateLine(s,57) 切出 \xe6\x82。
+func TestTruncateLineKeepsValidUTF8(t *testing.T) {
+	// 构造边界：让第 n 字节正好落在汉字中间
+	s := strings.Repeat("x", 55) + "您的使用量已超出频率限制"
+	got := truncateLine(s, 57) // 57 = 55 + 2，落在"您"的第 3 字节之前
+	if !utf8.ValidString(got) {
+		t.Errorf("截断产生非法 UTF-8：%q", got)
+	}
+	// 且不应把字符数切多（按 rune 计应恰好 57 + 省略号）
+	if n := utf8.RuneCountInString(got); n != 58 {
+		t.Errorf("rune 数 = %d, want 58（57 + 省略号）", n)
+	}
+}
+
+// TestTruncateLineStripsNewlines 换行/Tab 必须压成空格 ——
+// 样本用于 HTML title 属性，换行会被浏览器吞掉导致文本粘在一起。
+func TestTruncateLineStripsNewlines(t *testing.T) {
+	got := truncateLine("a\nb\tc\rd", 100)
+	if strings.ContainsAny(got, "\n\t\r") {
+		t.Errorf("未清理换行/Tab：%q", got)
+	}
+	if got != "a b c d" {
+		t.Errorf("got %q, want %q", got, "a b c d")
 	}
 }

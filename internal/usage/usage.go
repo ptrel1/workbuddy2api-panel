@@ -369,11 +369,11 @@ type Point struct {
 
 // Daily 单日单账号的用量（额度评估用）。
 type Daily struct {
-Day       string `json:"day"`        // 2006-01-02
-UID       string `json:"uid"`
-Reqs      int64  `json:"reqs"`       // 成功请求数
-ErrReqs   int64  `json:"err_reqs"`   // 失败请求数
-Tokens    int64  `json:"tokens"`     // prompt + completion
+	Day     string `json:"day"` // 2006-01-02
+	UID     string `json:"uid"`
+	Reqs    int64  `json:"reqs"`     // 成功请求数
+	ErrReqs int64  `json:"err_reqs"` // 失败请求数
+	Tokens  int64  `json:"tokens"`   // prompt + completion
 }
 
 // DailyUsage 按「日 × 账号」汇总用量，供额度评估（quota.go）反推能力上界。
@@ -382,37 +382,37 @@ Tokens    int64  `json:"tokens"`     // prompt + completion
 // 按 realm/model 分组），而额度评估只需要"每天每号用了多少"这一最朴素的口径。
 // 复用会让 quota 依赖大量无关结构，且 Snapshot 的时序处理会扭曲日聚合。
 func (r *Recorder) DailyUsage() []Daily {
-if r == nil {
-return nil
-}
-r.mu.Lock()
-defer r.mu.Unlock()
-type key struct{ day, uid string }
-agg := map[key]*Daily{}
-order := []key{}
-for _, b := range r.buckets {
-day := b.Scope
-// 只取小时桶（"h:2006-01-02T15"）汇总到日；日桶（"d:..."）跳过避免重复计算
-if len(day) < 12 || day[0] != 'h' {
-continue
-}
-day = day[2:12]
-k := key{day, b.UID}
-d, ok := agg[k]
-if !ok {
-d = &Daily{Day: day, UID: b.UID}
-agg[k] = d
-order = append(order, k)
-}
-d.Reqs += b.Req - b.Err
-d.ErrReqs += b.Err
-d.Tokens += b.PT + b.CT
-}
-out := make([]Daily, 0, len(order))
-for _, k := range order {
-out = append(out, *agg[k])
-}
-return out
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	type key struct{ day, uid string }
+	agg := map[key]*Daily{}
+	order := []key{}
+	for _, b := range r.buckets {
+		day := b.Scope
+		// 只取小时桶（"h:2006-01-02T15"）汇总到日；日桶（"d:..."）跳过避免重复计算
+		if len(day) < 12 || day[0] != 'h' {
+			continue
+		}
+		day = day[2:12]
+		k := key{day, b.UID}
+		d, ok := agg[k]
+		if !ok {
+			d = &Daily{Day: day, UID: b.UID}
+			agg[k] = d
+			order = append(order, k)
+		}
+		d.Reqs += b.Req - b.Err
+		d.ErrReqs += b.Err
+		d.Tokens += b.PT + b.CT
+	}
+	out := make([]Daily, 0, len(order))
+	for _, k := range order {
+		out = append(out, *agg[k])
+	}
+	return out
 }
 
 // Snapshot 面板一次拉取的全部用量视图数据。
