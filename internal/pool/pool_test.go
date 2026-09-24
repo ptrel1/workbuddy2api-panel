@@ -1733,3 +1733,161 @@ func TestTokenUsagePersistsAcrossReload(t *testing.T) {
 		t.Fatalf("state.json contains credential field: %s", raw)
 	}
 }
+
+// ── costTier 条件探索窗口 ─────────────────────────────────────────────
+
+// seedCost 直接写入某账号在某模型上的成本观测（测试内构造，绕开 NoteModelCost
+// 的 time.Now() 与 EMA 递推）。per1k <= 0 = 该模型实测免费（tier 0）。
+func seedCost(p *Pool, uid, model string, per1k float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e := p.byUID[uid]
+	if e.modelCost == nil {
+		e.modelCost = make(map[string]modelCostEntry)
+	}
+	e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastSeen: time.Now(), Samples: 1}
+}
+
+// 核心行为：tier 0 垄断时，窗口到期应把本次 pick 切到 tier 1-only（搭车改道给未知号）。
+//
+// 为什么必须测：costTier 是硬过滤，没有本机制时 tier 1 未知号永远进不了候选集——
+// "还有几个号在这模型上免费"永远不可知。这是硬过滤的必然副作用，也是本机制存在的
+// 唯一理由；若它失效，功能静默退化成"永远只用一个免费号"。
+func TestCostExploreSwitchesToTier1WhenWindowElapsed(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	// 关停窗口做对照：u1（免费）应恒被选中，u2（未知）永不入选。
+	p.SetCostExploreInterval(0)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	seedCost(p, "u1", "m1", 0) // tier 0：实测免费
+	// u2 无观测 → tier 1
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+	for i := 0; i < 5; i++ {
+		if got := p.PickExcludingForModel(nil, "m1"); got == nil || got.UID != "u1" {
+			t.Fatalf("关停探索时 pick=%v, want u1（tier 0 硬过滤应独占）", got)
+		}
+	}
+
+	// 开启窗口：首次满足条件即探（exploreLast 零值 → 距上次无限久）。
+	p.SetCostExploreInterval(30 * time.Minute)
+	got := p.PickExcludingForModel(nil, "m1")
+	if got == nil || got.UID != "u2" {
+		t.Fatalf("窗口开启后首次 pick=%v, want u2（应搭车改道给未知号 tier 1）", got)
+	}
+
+	// 窗口内不应再次探索：u1 免费层重新独占到窗口到期。
+	for i := 0; i < 5; i++ {
+		if g := p.PickExcludingForModel(nil, "m1"); g == nil || g.UID != "u1" {
+			t.Fatalf("窗口内第 %d 次 pick=%v, want u1（不应重复探索）", i, g)
+		}
+	}
+}
+
+// 窗口未到期不探索——防"探索变成常态改道"（会持续让位给未验证的号，损失已确认的最优路由）。
+func TestCostExploreRespectsWindow(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.SetCostExploreInterval(time.Hour)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	seedCost(p, "u1", "m1", 0)
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+
+	// 手工把上次探索时刻设为「刚刚」——窗口未到期。
+	p.mu.Lock()
+	p.exploreLast["\x1fm1"] = time.Now()
+	p.mu.Unlock()
+
+	for i := 0; i < 10; i++ {
+		if got := p.PickExcludingForModel(nil, "m1"); got == nil || got.UID != "u1" {
+			t.Fatalf("窗口未到期第 %d 次 pick=%v, want u1（不该探索）", i, got)
+		}
+	}
+	// 窗口到期后应探索。
+	p.mu.Lock()
+	p.exploreLast["\x1fm1"] = time.Now().Add(-2 * time.Hour)
+	p.mu.Unlock()
+	if got := p.PickExcludingForModel(nil, "m1"); got == nil || got.UID != "u2" {
+		t.Fatalf("窗口到期后 pick=%v, want u2（应探索）", got)
+	}
+}
+
+// 候选里没有 tier 1（全员已观测）时不探索——探索无对象，不该白白切层。
+func TestCostExploreNoTier1NoSwitch(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.SetCostExploreInterval(30 * time.Minute)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	seedCost(p, "u1", "m1", 0)   // tier 0
+	seedCost(p, "u2", "m1", 0.5) // tier 2（收费）——没有 tier 1
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+
+	for i := 0; i < 5; i++ {
+		if got := p.PickExcludingForModel(nil, "m1"); got == nil || got.UID != "u1" {
+			t.Fatalf("无 tier 1 时第 %d 次 pick=%v, want u1（不该探索）", i, got)
+		}
+	}
+	if _, last := p.CostExploreStats(); len(last) != 0 {
+		t.Errorf("无 tier 1 却记录了探索时刻: %v", last)
+	}
+}
+
+// realm 空（Pick 老语义，如 /v1/models 选号）不探索——reqModel 为空则无成本维度可言。
+func TestCostExploreRequiresModel(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.SetCostExploreInterval(30 * time.Minute)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	seedCost(p, "u1", "m1", 0)
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+
+	if got := p.Pick(); got == nil || got.UID != "u1" {
+		t.Fatalf("无 reqModel 时 pick=%v, want u1（不该探索）", got)
+	}
+	if n, _ := p.CostExploreStats(); n != 0 {
+		t.Errorf("无 reqModel 却记了 %d 次探索事件", n)
+	}
+}
+
+// 探索事件计数与 (域,模型) 时刻表透出：供运维解释"某次请求为什么没走最省钱的号"。
+func TestCostExploreStatsExposed(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.SetCostExploreInterval(30 * time.Minute)
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	seedCost(p, "u1", "m1", 0)
+	p.SetRandomSource(func(n int64) int64 { return 0 })
+
+	if n, last := p.CostExploreStats(); n != 0 || len(last) != 0 {
+		t.Fatalf("初始应为 0 事件 0 键，得 %d/%v", n, last)
+	}
+	p.PickExcludingForModel(nil, "m1") // 触发一次探索
+	n, last := p.CostExploreStats()
+	if n != 1 {
+		t.Errorf("探索事件数 = %d, want 1", n)
+	}
+	if _, ok := last["\x1fm1"]; !ok {
+		t.Errorf("缺少 (空域, m1) 的探索时刻: %v", last)
+	}
+}
+
+// SetCostExploreInterval(0) 必须真的关停——不能沿用其它 Set* 的"非正值保留原值"，
+// 否则配置里的 "0" 会被静默当成"没配"而继续探索（用户以为关了，其实没关）。
+func TestSetCostExploreIntervalZeroDisables(t *testing.T) {
+	p := New("")
+	if p.CostExploreInterval() != 30*time.Minute {
+		t.Fatalf("默认窗口 = %v, want 30m", p.CostExploreInterval())
+	}
+	p.SetCostExploreInterval(0)
+	if p.CostExploreInterval() != 0 {
+		t.Fatalf("显式 0 后窗口 = %v, want 0（关停）", p.CostExploreInterval())
+	}
+	p.SetCostExploreInterval(-time.Second)
+	if p.CostExploreInterval() != 0 {
+		t.Fatalf("负值后窗口 = %v, want 0（归一为关停）", p.CostExploreInterval())
+	}
+}

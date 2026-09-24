@@ -24,6 +24,27 @@ type Pool struct {
 	breakerCooldownMax time.Duration
 	// softRateMax 软冷却指数退避的封顶（SetSoftRateMax 注入；默认 defaultSoftRateMax）。
 	softRateMax time.Duration
+	// costExploreInterval costTier 条件探索窗口（SetCostExploreInterval 注入；
+	// 默认 defaultCostExploreInterval 30m）。
+	//
+	// 为什么需要：costTier 是**硬过滤**（只保留最优层），这带来一个必然副作用——
+	// 某模型一旦被某号实测为免费（tier 0），其他未知号（tier 1）就永远进不了候选集，
+	// 永远拿不到该模型的样本，于是"到底还有几个号在这模型上免费"永远学不到。
+	// 本窗口即该副作用的解药：tier 0 垄断 + 存在 tier 1 且距上次探索 ≥ 窗口时，
+	// 本次 pick 的生效层切到 tier 1-only —— **搭车改道**把一个既有真实请求改道给
+	// 未知号（零新增上游请求，IP 维度零增量，WAF 友好）。
+	// 成功 → NoteModelCost 首观测 → 毕业（下一轮 pick 立即按新 tier 生效）；
+	// 失败 → 既有错误策略照常，不产生探测风暴。
+	//
+	// 0 = 关停（完全回到"硬过滤无探索"的原行为）。
+	costExploreInterval time.Duration
+	// exploreLast 各 (realm, 模型) 的上次探索时刻，键 = realm + "\x1f" + model。
+	// 运行态（不持久化，同 lastUsed/usedSeq 口径）：重启归零 → 每个仍冻结的
+	// (域, 模型) 至多 1 次即时重探；已毕业号经 ModelCosts 恢复 tier，学费不重付。
+	// 仅在探索事件发生时写入（tier 1 枯竭期间停走，陈旧条目无害），不做对称清理。
+	exploreLast map[string]time.Time
+	// costExploreEvents 累计探索事件数（透出到面板/状态；pick 写锁内 ++，无需 atomic）。
+	costExploreEvents int64
 	// degradeThreshold / degradeCooldown / degradeCooldownMax 连败降权参数
 	// （SetDegrade 注入；默认值见 defaultDegrade*，issue #114）。
 	degradeThreshold   int
@@ -67,6 +88,10 @@ func New(stateFp string) *Pool {
 		degradeThreshold:   defaultDegradeThreshold,
 		degradeCooldown:    defaultDegradeCooldown,
 		degradeCooldownMax: defaultDegradeCooldownMax,
+		// 探索缺省 30m：tier 0 垄断下的 tier 1 探索窗口。用户经 config 显式 "0" 关停
+		// （SetCostExploreInterval(0)）。
+		costExploreInterval: defaultCostExploreInterval,
+		exploreLast:         map[string]time.Time{},
 	}
 	if stateFp != "" {
 		p.load()
@@ -123,6 +148,39 @@ func (p *Pool) SetWeights(idlePerHour, idleMax float64) {
 	if idleMax > 0 {
 		p.idleWeightMax = idleMax
 	}
+}
+
+// SetCostExploreInterval 注入 costTier 条件探索窗口（main 从 config 解析后调用）。
+//
+// ⚠️ 语义与其它 Set* 不同：**0 是有效值**（显式关停探索），故不能沿用"非正值保留原值"
+// 的写法——那会让 config 里的 "0" 被当成"没配"而静默启用默认 30m。负值按 0 处理
+// （解析侧已钳，这里再兜一次防御）。
+func (p *Pool) SetCostExploreInterval(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.costExploreInterval = d
+}
+
+// CostExploreStats 返回累计探索事件数与各 (域, 模型) 的上次探索时刻副本。
+// 副本是为避免调用方（面板/状态接口）持有内部 map 后并发读写。
+func (p *Pool) CostExploreStats() (int64, map[string]time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	last := make(map[string]time.Time, len(p.exploreLast))
+	for k, ts := range p.exploreLast {
+		last[k] = ts
+	}
+	return p.costExploreEvents, last
+}
+
+// CostExploreInterval 返回当前探索窗口（0 = 关停）。供面板展示"探索是否启用"。
+func (p *Pool) CostExploreInterval() time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.costExploreInterval
 }
 
 // SetDegrade 注入连败降权参数（main 从 config 解析后调用，issue #114）。

@@ -150,7 +150,10 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾
 | 粘性按模型判活 | 会话绑定的账号被 6004 模型级限额后，换模型请求自动解绑重分配（治"限额后换不动号"）；`/healthz` 探活计入模型豁免形态（治"全号被单模型限流探活误报 503"） |
 | report 增强 | `ReportChatActivity` 支持独立 `requestID`（同会话多轮上报各条可区分） |
 
-未吸收（明确不做）：脚本体系（task_runner/school 脚本—我们已有更完整的纯 API 实现）、governance/CI workflow、成本账本选号（依赖 usage.credit 观测，收益待验证）。
+未吸收（明确不做）：脚本体系（task_runner/school 脚本—我们已有更完整的纯 API 实现）、governance/CI workflow。
+
+> 成本账本选号（`internal/pool/entry.go` 的 `modelCost` + `pick.go` 的 `costTier` 硬分层 +
+> 条件探索窗口）**已在本地实现并启用**，详见上文[选号策略](#选号策略)。
 
 ### 未做 / 待办
 
@@ -337,6 +340,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `pool.breaker_cooldown_max` | `6h` | 熔断指数退避封顶 |
 | `pool.idle_weight_per_hour` | `0.5` | 闲置补偿：每小时未使用 +0.5 权重 |
 | `pool.idle_weight_max` | `5.0` | 闲置补偿权重封顶 |
+| `pool.cost_explore_interval` | `30m` | costTier 条件探索窗口：tier 0 垄断时，每 (域, 模型) 每窗口把一个既有请求搭车改道给未知号（打破"免费号垄断、新号永学不到成本"）。**`"0"` = 关停**（只有空字符串才回落默认，与 `expiring_soon` 相反） |
 | `session_sticky.enabled` | `true` | 会话粘性路由开关 |
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
 | `session_sticky.gc_interval` | `5m` | 过期绑定 GC 周期 |
@@ -404,16 +408,32 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 ### 选号策略
 
-1. 过滤：禁用 / 冷却 / 熔断 / 在途占满账号不参与
-2. 取 **Top-5** 候选（按三因子权重降序，积分只是因子之一）
-3. 三因子加权随机：
+1. 过滤：禁用 / 冷却 / 熔断 / 连败降权 / 在途占满账号不参与
+2. **成本分层硬过滤**（请求带模型时生效）：按该模型**实测扣费**把候选分层，只保留最优层
+   - `tier 0` = 已实测免费（最强偏好）
+   - `tier 1` = 无观测 / 观测过期（TTL 6h）
+   - `tier 2` = 已实测收费（层内按单价升序）
+   - 是**硬过滤而非排序**：只要有免费号可用，收费号直接进不了候选集。用排序的话加权随机仍会抽中收费号，达不到"优先免费"的语义
+   - "无观测"故意排在"已实测收费"之前：新号的限免状态只能靠实测发现，否则免费的号永远轮不到、永远学不到
+3. **条件探索**（`pool.cost_explore_interval`，默认 `30m`）：打破 tier 0 垄断
+   - 硬过滤的必然副作用：某模型一旦有号实测免费，未知号就永远进不了候选集、永远学不到成本
+   - 故每 (域, 模型) 每隔该窗口，把一个**既有真实请求搭车改道**给未知号（零新增上游请求，WAF 友好）；成功即产出首观测、该号毕业，失败走既有错误策略
+   - `"0"` = 显式关停（**注意**：与 `expiring_soon` 的"空/0 = 禁用"不同，本键只有**空字符串**才回落默认）
+   - 探索事件有日志：`pool: cost_explore model=... realm=... acct=...`（解释"这次为什么没走最省钱的号"）
+4. 取 **Top-5** 候选（按权重降序截断）
+5. 加权随机：
 
-   `weight = credits 比例 ×10 + idleWeight + successRate ×3`
+   `weight = 1.0 + credits 比例 ×10 + 快过期占比 ×8 + idleWeight`
 
    - `credits 比例` = 该号积分 / 候选集最大积分
+   - `快过期占比` = `creditsExpiring / credits`（官方活动赠送积分按批过期，不用就作废）
    - `idleWeight` = `min(闲置小时 × idle_weight_per_hour, idle_weight_max)`，从未使用给满分
-   - `successRate` = `successCount/(successCount+errTotal)`，无记录给中性 1.5
-4. 防惊群：跳过 100ms 内刚被选中的账号；全冷却时从非禁用、非余额耗尽的软冷却 / 熔断账号中选最早到期者顶班
+   - ⚠️ 原「成功率 ×3」因子**已删除**：`errTotal` 是终身累计、只增不减，会让早期出过错的号被永久压权且永不恢复；瞬时健康信号已由冷却/熔断/连败降权承接
+6. 防惊群：跳过 100ms 内刚被选中的账号；全冷却时从非禁用、非余额耗尽的软冷却 / 熔断账号中选最早到期者顶班
+
+> 面板的「套餐标记」（免费版/体验版）与上述成本分层是**两套独立概念**：前者是账号套餐名，
+> 后者是该账号**在该模型上**的实测单价——免费版账号在某个模型上未必 tier 0，标准版账号
+> 也可能因限免活动在该模型上就是 tier 0。
 
 ### 会话粘性
 

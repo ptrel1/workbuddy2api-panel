@@ -470,6 +470,12 @@ const (
 	defaultDegradeCooldownMax = 2 * time.Hour
 )
 
+// defaultCostExploreInterval costTier 条件探索的默认窗口：30 分钟。
+// 取值的权衡：太短会让"探索"变成常态改道（免费号被频繁让位，损失已确认的最优路由）；
+// 太长则新号长期学不到成本知识（tier 0 垄断永不打破）。30m 下每个 (域, 模型) 每小时
+// 至多 2 次探索——相对聊天量可忽略，又能让新号在数小时内毕业。
+const defaultCostExploreInterval = 30 * time.Minute
+
 // sessionDeadThreshold 连续 ErrSessionDead（12153）达到该次数才永久禁用。
 // 12153 会被临时性触发（网络抖动/上游闪断/refresh 竞态），一次失败即禁用的旧行为
 // 会误杀健康账号（P0-1：13 个 disabled 号全是误判）。3 次连续才判死：容忍偶发抖动，

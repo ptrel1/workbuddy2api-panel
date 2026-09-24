@@ -102,6 +102,37 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 			bestTier = ti
 		}
 	}
+	// 条件探索：打破 tier 0 垄断，让未知号（tier 1）也有机会被实测。
+	//
+	// 必要性：costTier 是硬过滤（下方 `if ti == bestTier` 只保留最优层）。一旦某模型上
+	// 有号被实测为免费，其余未知号就永远进不了候选集 → 永远拿不到该模型的成本样本 →
+	// tier 0 垄断永久固化，"还有几个号在这模型上免费"永远不可知。
+	//
+	// 做法（搭车改道，零新增上游请求）：tier 0 存在且候选含 tier 1 且距上次探索 ≥ 窗口时，
+	// 把本次生效层切到 tier 1-only——用**一个既有真实请求**去试未知号。成功即 NoteModelCost
+	// 产出首观测 → 该号毕业（下轮 pick 立即按新 tier 参与）；失败走既有错误策略，无探测风暴。
+	//
+	// 并发安全：timer 同锁写入（pick 全程持写锁），并发进入者只有一个能通过窗口判定，
+	// 天然防重复探索。key 含 realm：同模型名可跨域，探索节奏按 (域, 模型) 独立；
+	// realm==""（Pick 老语义）单独成键。
+	explored := false // 本次 pick 是否切了探索层（事件日志在选中号确定后打）
+	if p.costExploreInterval > 0 && bestTier == 0 && reqModel != "" {
+		hasTier1 := false
+		for _, e := range cands {
+			if ti, _ := costTier(e); ti == 1 {
+				hasTier1 = true
+				break
+			}
+		}
+		key := realm + "\x1f" + reqModel
+		// exploreLast 缺省零值 → now.Sub(零值) 极大 → 首次满足条件即探，无需额外初始化。
+		if hasTier1 && now.Sub(p.exploreLast[key]) >= p.costExploreInterval {
+			p.exploreLast[key] = now
+			p.costExploreEvents++
+			bestTier = 1
+			explored = true
+		}
+	}
 	// 权重只算一次：顶 5 截断要排序，若在 sort 比较器里现算 weightOf 会翻成 O(n log n) 次
 	// 冗余浮点计算（46 账号约 500 次）。先做 O(n) 预计算，再按 (权重, uid) 排序。
 	// costTier/modelCostOf 同样每候选只算一次（存入 tier/cost1k），比较器只读缓存字段。
@@ -186,6 +217,12 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	e.lastUsed = now // 锁内即时标记：下一个进入 pick 的 goroutine 立即看到本号已用
 	p.pickSeq++
 	e.usedSeq = p.pickSeq // 单调序号：保证 usedSeq 严格全序（防惊群/LRU 的权威依据）
+	// 探索事件日志：可观测性所必需——"路由被改道"是运维需要能解释的现象，
+	// 否则"某次请求为什么没走最省钱的号"无从查起。仅在真的切层时打，频率受窗口约束。
+	if explored {
+		log.Printf("pool: cost_explore model=%s realm=%q acct=%s window=%s",
+			reqModel, realm, e.a.UID, p.costExploreInterval)
+	}
 	return e.a
 }
 

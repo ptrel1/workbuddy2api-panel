@@ -146,6 +146,13 @@ type Config struct {
 		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到/余额刷新时，到期时间在
 		// 此窗口内的积分被标记为"快过期"，选号优先消耗。空/0 = 禁用分桶。
 		ExpiringSoon string `json:"expiring_soon"`
+		// CostExploreInterval costTier 条件探索窗口（默认 "30m"）。
+		// 背景：costTier 是硬过滤——某模型一旦有号实测免费，未知号就永远进不了候选集、
+		// 永远学不到成本。本窗口让每 (域, 模型) 每隔该时长把一个既有真实请求搭车改道给
+		// 未知号（零新增上游请求），成功即毕业。
+		// ⚠️ 与 ExpiringSoon 不同：**"0" 是有效值**（显式关停探索），仅**空字符串**才回落
+		// 默认 30m。若沿用"0=禁用/缺省"的写法，"0" 会被当成没配而静默启用。
+		CostExploreInterval string `json:"cost_explore_interval"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -165,6 +172,7 @@ type Config struct {
 	SessionGCInterval      time.Duration `json:"-"`
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
 	ExpiringSoonDur        time.Duration `json:"-"`
+	CostExploreIntervalDur time.Duration `json:"-"` // 0 = 关停探索（合法值，非"未配置"）
 }
 
 // Default 默认配置。
@@ -215,6 +223,9 @@ func Default() *Config {
 	c.Pool.IdleWeightPerHour = 0.5
 	c.Pool.IdleWeightMax = 5.0
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
+	// CostExploreInterval 缺省 30m：打破 costTier 硬过滤造成的 tier 0 垄断
+	//（详见 Pool.CostExploreInterval 字段注释）。用户填 "0" 可显式关停。
+	c.Pool.CostExploreInterval = "30m"
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
@@ -374,6 +385,10 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_EXPIRING_SOON"); v != "" {
 		c.Pool.ExpiringSoon = v
 	}
+	// 注意：env 只在**非空**时覆盖，故用 env 关停探索要写 "0"（写空串等于没设）。
+	if v := os.Getenv("WB2A_COST_EXPLORE_INTERVAL"); v != "" {
+		c.Pool.CostExploreInterval = v
+	}
 }
 
 func (c *Config) normalize() error {
@@ -416,6 +431,19 @@ func (c *Config) normalize() error {
 		if c.ExpiringSoonDur, err = time.ParseDuration(c.Pool.ExpiringSoon); err != nil {
 			return fmt.Errorf("pool.expiring_soon: %w", err)
 		}
+	}
+	// costTier 探索窗口：**空 = 未配置** → 回落默认 30m；**"0" = 显式关停**（合法值）。
+	// 语义与 expiring_soon 相反，故不能共用同一段归一逻辑——那里"0/空"都禁用，
+	// 这里"0"必须被当作有效配置保留，否则用户的显式关停会被静默覆盖成默认开启。
+	// 拼写错误 fail fast（同 expiring_soon 风格）。
+	if c.Pool.CostExploreInterval == "" {
+		c.Pool.CostExploreInterval = "30m"
+	}
+	if c.CostExploreIntervalDur, err = time.ParseDuration(c.Pool.CostExploreInterval); err != nil {
+		return fmt.Errorf("pool.cost_explore_interval: %w", err)
+	}
+	if c.CostExploreIntervalDur < 0 {
+		c.CostExploreIntervalDur = 0 // 负数与 0 同为关停（防御性归一）
 	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3

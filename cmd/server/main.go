@@ -31,7 +31,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.25.0-panel"
+const appVersion = "1.26.0-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -100,6 +100,9 @@ func main() {
 	p.SetDegrade(cfg.Pool.DegradeThreshold, cfg.DegradeCooldownDur, cfg.DegradeCooldownMaxD)
 	p.SetSoftRateMax(cfg.SoftRateMaxDur) // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
+	// costTier 条件探索窗口（默认 30m；config "0" = 关停）。注意这个 setter 接受 0，
+	// 不能因"非正值跳过"而忽略用户的显式关停。
+	p.SetCostExploreInterval(cfg.CostExploreIntervalDur)
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
@@ -391,6 +394,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetDegrade(newCfg.Pool.DegradeThreshold, newCfg.DegradeCooldownDur, newCfg.DegradeCooldownMaxD)
 	p.SetSoftRateMax(newCfg.SoftRateMaxDur)
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
+	p.SetCostExploreInterval(newCfg.CostExploreIntervalDur)
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
 		newCfg.Schedule.ActivityHours, newCfg.Schedule.KeepaliveHours, newCfg.Schedule.BlackcatHours,

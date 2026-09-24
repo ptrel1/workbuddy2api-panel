@@ -776,3 +776,90 @@ func TestLoadConfigPathIsDirectory(t *testing.T) {
 		t.Errorf("error should suggest the fix (cp config.example.json): %v", err)
 	}
 }
+
+// TestCostExploreDefault 未配置时回落默认 30m。
+func TestCostExploreDefault(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.CostExploreIntervalDur != 30*time.Minute {
+		t.Errorf("cost_explore_interval=%v want 30m", c.CostExploreIntervalDur)
+	}
+}
+
+// TestCostExploreExplicit 显式时长生效。
+func TestCostExploreExplicit(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"pool":{"cost_explore_interval":"5m"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.CostExploreIntervalDur != 5*time.Minute {
+		t.Errorf("cost_explore_interval=%v want 5m", c.CostExploreIntervalDur)
+	}
+}
+
+// TestCostExploreZeroDisables "0" 必须被当成**显式关停**而非"未配置回落默认"。
+//
+// 这是本键最容易写错的地方：本地其它 pool 键的归一逻辑都是"空/0 → 回落默认"
+//（如 expiring_soon 的"空/0 = 禁用分桶"），若照抄，用户填的 "0" 会被静默改成 30m，
+// 表现为"我明明关了，路由却还在改道"。
+func TestCostExploreZeroDisables(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"pool":{"cost_explore_interval":"0"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.CostExploreIntervalDur != 0 {
+		t.Errorf(`cost_explore_interval="0" 应关停（0），得 %v`, c.CostExploreIntervalDur)
+	}
+}
+
+// TestCostExploreNegativeClamped 负值归一为关停（不报错，防御性）。
+func TestCostExploreNegativeClamped(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"pool":{"cost_explore_interval":"-1m"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.CostExploreIntervalDur != 0 {
+		t.Errorf("负值应归一为 0，得 %v", c.CostExploreIntervalDur)
+	}
+}
+
+// TestCostExploreInvalidFailFast 拼写错误必须 fail fast——静默回落默认会让
+// "我配了但没生效"无从排查（同 expiring_soon 风格）。
+func TestCostExploreInvalidFailFast(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"pool":{"cost_explore_interval":"30min"}}`), 0o600)
+	_, err := Load(fp)
+	if err == nil {
+		t.Fatal("want error for 非法时长 30min")
+	}
+	if !strings.Contains(err.Error(), "pool.cost_explore_interval") {
+		t.Errorf("error 应点明配置键: %v", err)
+	}
+}
+
+// TestCostExploreEnvOverride env WB2A_COST_EXPLORE_INTERVAL 非空覆盖 JSON 值。
+func TestCostExploreEnvOverride(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"pool":{"cost_explore_interval":"5m"}}`), 0o600)
+	t.Setenv("WB2A_COST_EXPLORE_INTERVAL", "45m")
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.CostExploreIntervalDur != 45*time.Minute {
+		t.Errorf("cost_explore_interval=%v want env 45m", c.CostExploreIntervalDur)
+	}
+}
