@@ -418,6 +418,24 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   table.acc.err td.kind { font-weight: 550; }
   table.acc.err .why { color: var(--ink-3); font-size: 11px; margin-top: 2px; }
 
+  /* 模型开关抽屉：格子布局，每格 = 一个 (账号,模型) 开关。
+     关闭态用「删除线 + 灰化」而非只变色 —— 语义明确且色盲可辨。 */
+  .mtoggle { margin: 10px 12px 0; padding: 10px 12px; border-radius: 8px;
+    background: var(--surface-2); border: 1px solid var(--line); }
+  .mtoggle-hd { display: flex; align-items: center; gap: 10px; margin-bottom: 9px;
+    font-size: 12.5px; }
+  .mtoggle-hd .note { color: var(--ink-3); font-size: 11.5px; }
+  .mtoggle-body { display: flex; flex-wrap: wrap; gap: 6px; }
+  .mtoggle-body .mchip { font-size: 11.5px; padding: 3px 9px; border-radius: 6px;
+    border: 1px solid var(--line); background: var(--surface); cursor: pointer;
+    font-family: var(--mono); user-select: none; }
+  .mtoggle-body .mchip:hover { border-color: var(--accent); }
+  .mtoggle-body .mchip.off { text-decoration: line-through; opacity: .55;
+    background: var(--bad-soft); border-color: rgba(240,101,95,.35); }
+  .mtoggle-body .mchip .tag2 { font-family: var(--sans); margin-left: 5px; font-size: 10.5px; }
+  .mtoggle-empty { color: var(--ink-3); font-size: 12px; }
+  .mtoggle-note { color: var(--ink-3); font-size: 11px; margin-left: 6px; }
+
   /* 额度评估的口径声明：琥珀色底 + 显眼位置（首因效应）。
      为何不用脚注：读者会先看数字再看说明，那时已把峰值当官方额度了。 */
   .quota-caveat { margin: 10px 12px 0; padding: 9px 12px; border-radius: 8px;
@@ -614,6 +632,19 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           </select>
           <span class="note" id="planNote"></span>
         </header>
+        <!-- 模型开关抽屉：点账号行的「模型」按钮展开。
+             设计（用户选定 A）：精确到 (账号 × 模型)、永久、手动优先。
+             只列**该域实际可用的模型**，避免展示一堆用不到的格子。 -->
+        <div class="mtoggle" id="mToggle" hidden>
+          <div class="mtoggle-hd">
+            <b id="mToggleWho"></b>
+            <span class="note" id="mToggleHint">点击模型可单独关闭 —— 关闭后该账号不再用该模型，且不受自动恢复影响</span>
+            <span class="grow"></span>
+            <button class="xs" id="btnMToggleClose">收起</button>
+          </div>
+          <div class="mtoggle-body" id="mToggleBody"></div>
+        </div>
+
         <!-- 池子健康横幅：healthy<=1 时亮黄条。
              为何需要：此前池子枯竭（如 3 个号全被 6004 限流）时，用户只能
              等请求返回 503 才知道——实测曾持续 77 分钟无人察觉。

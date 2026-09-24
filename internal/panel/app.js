@@ -149,6 +149,7 @@ go((location.hash || '#accounts').slice(1) in TITLES ? (location.hash || '#accou
    仅进入账号池页时拉一次 + 可手动刷新。 */
 let plansMap = {};
 let planFilter = '';
+let mToggleUID = '';  // 模型开关抽屉当前操作的账号
 
 /* PLAN_LABEL 套餐类型展示名（kind → 中文 + CSS 类）。 */
 const PLAN_LABEL = {
@@ -296,6 +297,7 @@ function renderAccounts(list) {
         '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '">签到</button>' +
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>' +
         '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' +
+        '<button class="xs ghost" data-a="models" data-u="' + esc(s.uid) + '">模型</button>' +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
@@ -418,6 +420,9 @@ $('accBody').addEventListener('click', async ev => {
       toast('已禁用', 'ok');
     } else if (a === 'tasks') {
       openTasks(u);
+    } else if (a === 'models') {
+      openModelToggle(u);
+      return; // 抽屉内自行处理，不走末尾 loadOverview（避免重画闪烁）
     } else if (a === 'remove') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/remove', { method: 'POST' });
       toast(r.file_error ? '已移除（凭证文件删除失败：' + r.file_error + '）' : '已移除', 'ok');
@@ -585,6 +590,13 @@ async function loadModels() {
 $('btnModels').onclick = loadModels;
 
 if ($('btnQuota')) $('btnQuota').onclick = loadQuota;
+
+if ($('btnMToggleClose')) $('btnMToggleClose').onclick = function () { $('mToggle').hidden = true; };
+// 事件委托：模型格子是动态渲染的，绑定在容器上（避免每格绑一次）
+if ($('mToggleBody')) $('mToggleBody').addEventListener('click', function (ev) {
+  const chip = ev.target.closest('.mchip');
+  if (chip) toggleModel(chip);
+});
 
 /* 手动触发可用性探测。结果由后端持久化，完成后重画表格。
    为何不自动跑：虽单模型成本极低（1~10 token），但“自动烧额度”
@@ -2108,6 +2120,75 @@ async function loadQuota() {
     renderQuota(d.report || {});
   } catch (e) {
     if (body) body.innerHTML = '<tr><td colspan="8"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+  }
+}
+
+/* openModelToggle 展开某账号的模型开关抽屉。
+   数据来源：models（该域全量模型）+ model_availability 里的 off 清单。
+   为何只列**该域**模型：跨域模型本就不会路由到该账号，列出来是无意义的格子。 */
+async function openModelToggle(uid) {
+  const box = $('mToggle');
+  const body = $('mToggleBody');
+  if (!box || !body) return;
+  const st = (overviewData && (overviewData.accounts || []).find(x => x.uid === uid)) || {};
+  const short = uid.length > 8 ? uid.slice(0, 8) : uid;
+  $('mToggleWho').textContent = (st.nickname || short) + ' · 模型开关';
+  box.hidden = false;
+  body.innerHTML = '<span class="mtoggle-empty">正在加载模型列表…</span>';
+  mToggleUID = uid;
+
+  try {
+    const realm = st.realm === 'global' ? 'global' : 'cn';
+    const [md, off] = await Promise.all([
+      api('models?realm=' + encodeURIComponent(realm)).catch(() => ({ models: [] })),
+      api('accounts/' + encodeURIComponent(uid) + '/models/off').catch(() => ({ models: [] })),
+    ]);
+    renderModelToggle((md.models || []).map(m => m.id), off.models || []);
+  } catch (e) {
+    body.innerHTML = '<span class="mtoggle-empty">加载失败：' + esc(e.message) + '</span>';
+  }
+}
+
+/* renderModelToggle 画模型格子。offSet 是**关闭**的组合集合。 */
+function renderModelToggle(ids, offList) {
+  const body = $('mToggleBody');
+  if (!body) return;
+  if (!ids.length) {
+    body.innerHTML = '<span class="mtoggle-empty">没有可用模型（该域无账号或目录为空）</span>';
+    return;
+  }
+  const offMap = {};
+  (offList || []).forEach(o => { offMap[o.model] = o; });
+  const ids2 = ids.slice().sort();
+  body.innerHTML = ids2.map((id, i) => {
+    const o = offMap[id];
+    const isOff = !!o;
+    return '<span class="mchip' + (isOff ? ' off' : '') + '" data-m="' + esc(id) + '"' +
+      ' title="' + esc(isOff ? ('已手动关闭' + (o.since ? ' · ' + o.since : '') + (o.note ? ' · ' + o.note : '') + '\n点击恢复')
+                              : '点击关闭该账号对 ' + id + ' 的使用') + '">' +
+      esc(id) + '<span class="tag2">' + (isOff ? '已关' : '开') + '</span></span>';
+  }).join('') + '<span class="mtoggle-note">共 ' + ids2.length + ' 个模型 · 关闭 ' +
+    (offList || []).length + ' 个</span>';
+}
+
+/* toggleModel 切换某 (账号,模型) 开关。乐观更新：先改 UI 再发请求，
+   失败则回滚（开关类交互必须即时反馈，否则用户会以为没点上）。 */
+async function toggleModel(chip) {
+  const model = chip.getAttribute('data-m');
+  const wasOff = chip.classList.contains('off');
+  chip.classList.toggle('off', !wasOff);
+  const t = chip.querySelector('.tag2');
+  if (t) t.textContent = wasOff ? '开' : '已关';
+  try {
+    await api('accounts/' + encodeURIComponent(mToggleUID) + '/models/toggle', {
+      method: 'POST',
+      body: JSON.stringify({ model, off: !wasOff }),
+    });
+  } catch (e) {
+    // 回滚（失败必须让用户看见真实状态，不能停在乐观值上）
+    chip.classList.toggle('off', wasOff);
+    if (t) t.textContent = wasOff ? '已关' : '开';
+    toast('设置失败：' + e.message, 'err');
   }
 }
 

@@ -27,6 +27,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
+	"strings"
 )
 
 // Config 面板依赖（main 装配注入）。
@@ -188,6 +189,8 @@ func (p *Panel) routes() {
 	// 模型可用性探测（手动触发 + 结果持久化，见 availability.go）
 	p.mux.HandleFunc("GET /panel/api/model_availability", p.withAuth(p.modelAvailability))
 	p.mux.HandleFunc("GET /panel/api/plans", p.withAuth(p.plans))
+	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/models/off", p.withAuth(p.modelsOff))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/models/toggle", p.withAuth(p.modelToggle))
 	p.mux.HandleFunc("GET /panel/api/quota", p.withAuth(p.quota))
 	p.mux.HandleFunc("POST /panel/api/model_availability/probe", p.withAuth(p.probeAvailability))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
@@ -299,6 +302,71 @@ func (p *Panel) quota(w http.ResponseWriter, r *http.Request) {
 	}
 	rep := BuildQuotaReport(p.cfg.Usage.DailyUsage(), plans, labels, limited)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "report": rep})
+}
+
+// modelToggle 手动开关某 (账号, 模型) 组合。
+//
+// 请求：POST /panel/api/accounts/{uid}/models/toggle
+//
+// {"model": "glm-5.3", "off": true, "note": "质量差"}
+//
+// 语义（用户选定）：**永久 + 精确到组合 + 手动优先**。
+//   - 关闭后该账号不再被选中执行该模型（healthyForModel 拒绝）；
+//   - 自动机制（6004/11102 到期）**不能**把它打开；
+//   - 仅手动 `off:false` 才恢复。
+//
+// model 用**裸名**：前缀（cn:/global:）是网关侧路由协议，同账号域固定，
+// 带前缀存会在模型改名/换域时对不上。
+// modelsOff 返回某账号**手动关闭**的模型清单（供开关抽屉渲染初始状态）。
+func (p *Panel) modelsOff(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	if _, ok := p.cfg.Pool.Status(uid); !ok {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	list := p.cfg.Pool.ModelOffOf(uid)
+	if list == nil {
+		list = []pool.ModelOffEntry{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "models": list})
+}
+
+func (p *Panel) modelToggle(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	if _, ok := p.cfg.Pool.Status(uid); !ok {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	var req struct {
+		Model string `json:"model"`
+		Off   bool   `json:"off"`
+		Note  string `json:"note"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "bad json: "+err.Error())
+		return
+	}
+	model := strings.TrimSpace(req.Model)
+	if model == "" {
+		writeErr(w, http.StatusBadRequest, "model is required")
+		return
+	}
+	// 剥 realm 前缀（与出站口径一致：上游只认裸名）
+	if i := strings.Index(model, ":"); i >= 0 {
+		model = model[i+1:]
+	}
+	if req.Off {
+		if !p.cfg.Pool.SetModelOff(uid, model, req.Note) {
+			writeErr(w, http.StatusBadRequest, "set model off failed")
+			return
+		}
+	} else {
+		p.cfg.Pool.SetModelOn(uid, model)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "uid": uid, "model": model, "off": req.Off,
+		"list": p.cfg.Pool.ModelOffOf(uid),
+	})
 }
 
 func (p *Panel) plans(w http.ResponseWriter, r *http.Request) {

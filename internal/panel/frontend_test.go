@@ -923,3 +923,47 @@ func TestQuotaCaveatRenderedFromServer(t *testing.T) {
 		t.Error("caveat 未渲染出来（读了不用）")
 	}
 }
+
+// TestModelToggleUIFullyWired 模型开关的每个要素必须**双侧存在且被调用**。
+// （这条断言此前已救过两次 —— 脚本中途失败只落一半改动。）
+func TestModelToggleUIFullyWired(t *testing.T) {
+	html := readIndexHTML(t)
+	js := readAppJS(t)
+	for _, id := range []string{"mToggle", "mToggleBody", "mToggleWho", "btnMToggleClose"} {
+		if !strings.Contains(html, `id="`+id+`"`) {
+			t.Errorf("index.html 缺少 #%s", id)
+		}
+	}
+	for _, fn := range []string{"function openModelToggle(", "function renderModelToggle(", "function toggleModel("} {
+		if !strings.Contains(js, fn) {
+			t.Errorf("app.js 缺少 %s", fn)
+		}
+	}
+	// 账号行的「模型」按钮 + 动作分发（只加按钮不接线 = 点了没反应）
+	if !strings.Contains(js, `data-a="models"`) {
+		t.Error("账号行缺少「模型」按钮")
+	}
+	if !strings.Contains(js, `a === 'models'`) {
+		t.Error("动作分发未接 models（按钮点了没反应）")
+	}
+	if !strings.Contains(js, "openModelToggle(u)") {
+		t.Error("未调用 openModelToggle")
+	}
+	// 格子点击必须绑定（动态渲染 → 用事件委托）
+	if !strings.Contains(js, "$('mToggleBody').addEventListener") {
+		t.Error("模型格子未绑定点击（用委托）—— 点了没反应")
+	}
+}
+
+// TestToggleRollbackOnFailure 开关失败必须**回滚乐观更新**。
+// 停在乐观值上会让用户以为设置成功了，而实际没生效 —— 比不反馈更糟。
+func TestToggleRollbackOnFailure(t *testing.T) {
+	body := funcBody(t, "async function toggleModel(")
+	if !strings.Contains(body, "catch") {
+		t.Fatal("toggleModel 未处理失败")
+	}
+	// 必须把状态改回去（而不是只弹个 toast）
+	if !strings.Contains(body, "chip.classList.toggle('off', wasOff)") {
+		t.Error("失败后未回滚 UI 状态 —— 用户会以为开关已生效")
+	}
+}
