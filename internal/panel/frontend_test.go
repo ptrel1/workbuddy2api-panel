@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1268,5 +1269,275 @@ func TestAmsAccountColumnUsesNickname(t *testing.T) {
 	// 3) 三处展示都应经 amsWho。
 	if n := strings.Count(body, "amsWho(s)"); n < 3 {
 		t.Errorf("renderAms 里 amsWho(s) 用了 %d 次，want >=3（明细表 + 图例 + tooltip）", n)
+	}
+}
+
+/* ── 折线图配色 / 平滑 / 风格统一（20260928 用户反馈"线风格太丑""平滑没做"） ────
+   下面四条各自钉一条**规则**，不钉字面量实现（本项目有过"测试钉死写法、
+   实现变好反被判失败"的教训）。每条都已做变异验证：把缺陷放回去必须 FAIL。 */
+
+// bhPaletteSlots 解析 app.js 的 BH_COLORS 数组，返回槽位字面量。
+//
+// 为什么自己解析而不用正则匹配全文：BH_COLORS 在文件里被引用 9 次
+// （偏差条/图例/柱状/明细表…），全文 Contains 会把**引用处**也算进来，
+// 断言就恒真了（§2.5 假绿形态 #9：匹配面必须精确到承载语义的那一行）。
+func bhPaletteSlots(t *testing.T) []string {
+	t.Helper()
+	src := readAppJS(t)
+	i := strings.Index(src, "const BH_COLORS = [")
+	if i < 0 {
+		t.Fatal("BH_COLORS 不存在")
+	}
+	rest := src[i+len("const BH_COLORS = ["):]
+	j := strings.Index(rest, "];")
+	if j < 0 {
+		t.Fatal("BH_COLORS 数组未正常结束")
+	}
+	raw := rest[:j]
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		s := strings.TrimSpace(part)
+		// 剥掉 JS 的引号 —— 否则调用方拿到的字面量带 '，与"禁止值"比对时
+		// **永远不匹配**（静态断言恒真的经典成因，§2.5 假绿形态 #9/#11）。
+		s = strings.Trim(s, `'"`)
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// TestBhPaletteEightDistinctSlots 账号身份色板必须是 8 槽、槽位互不相同。
+//
+// 为什么是 8：单域常见账号数已超过 6（旧色板 6 槽循环，第 7 个账号会与第 1 个
+// **同色**——两条不同的线长得一样，读者无法区分，等于丢信息）。
+// 为什么必须互不相同：色板的每个槽位是"某账号的身份"，两槽同色 = 两个账号
+// 共享身份，身份编码失效。
+func TestBhPaletteEightDistinctSlots(t *testing.T) {
+	slots := bhPaletteSlots(t)
+	if len(slots) != 8 {
+		t.Fatalf("BH_COLORS 有 %d 槽，want 8（槽位不足会让第 N 个账号与第 1 个同色）: %v",
+			len(slots), slots)
+	}
+	seen := map[string]bool{}
+	for _, s := range slots {
+		if seen[s] {
+			t.Errorf("BH_COLORS 槽位 %q 重复（两个账号会共享同一身份色）", s)
+		}
+		seen[s] = true
+	}
+}
+
+// TestBhPaletteAvoidsSemanticStateHues 账号身份色板不得复用**状态语义色**：
+// --ok(可用/净增) / --bad(失败/净减) / --warn(限流告警)。
+//
+// 为什么：一个视觉通道只能承载一种含义（§十一）。账号身份色若等于"可用/失败"
+// 的绿红，同一颜色就有两个互斥含义（"某账号" vs "状态"），读者必然误读。
+// 本测试钉的是**规则**（不得等于语义色），而不是"必须用哪几个 hex" ——
+// 故同时接受 var(--ok) 形式的引用与语义色的两套主题字面量。
+func TestBhPaletteAvoidsSemanticStateHues(t *testing.T) {
+	slots := bhPaletteSlots(t)
+	// 语义色的**两套主题字面量**（index.html 的 :root 与 [data-theme="light"]）
+	// + 变量引用形式。任一形式出现在色板里都算撞车。
+	banned := map[string]string{
+		"var(--ok)": "可选状态绿", "var(--bad)": "失败状态红", "var(--warn)": "限流告警黄",
+		"#3ddc97": "深色 --ok", "#0f9d63": "浅色 --ok",
+		"#f0655f": "深色 --bad", "#cf3b34": "浅色 --bad",
+		"#f5b544": "深色 --warn", "#b47611": "浅色 --warn",
+	}
+	// 语义色变量引用：槽位不得**是**语义色本身。注意 --accent 不在此列 ——
+	// 槽 0 复用 --accent 是既有设计（主题主色 = 第一身份色），不是状态语义。
+	for _, s := range slots {
+		if why, hit := banned[s]; hit {
+			t.Errorf("色板槽位 %q 复用了状态语义色（%s）——同一颜色两个互斥含义，会误导读者", s, why)
+		}
+	}
+}
+
+// TestBhPaletteDefinedForBothThemes 色板必须**两套主题各有一份**定义。
+//
+// 为什么：色板的可用性是"颜色 vs 背景"的函数。深底(#14171f)靠高明度取得
+// 对比，浅底(#ffffff)靠低明度取得对比 —— 同一 hex 不可能在两套主题下都最优。
+// 若只写一份硬编码，切到浅色主题时线条会因对比度不足而看不清。
+// 本测试只断言"两套主题都定义了同一组 --bh-N 变量"，不钉具体颜色值。
+func TestBhPaletteDefinedForBothThemes(t *testing.T) {
+	html := readIndexHTML(t)
+	// 深色（:root 默认）与浅色（[data-theme="light"]）各自的分段
+	lightIdx := strings.Index(html, `[data-theme="light"]`)
+	if lightIdx < 0 {
+		t.Fatal("index.html 缺少 [data-theme=\"light\"] 分支（浅色主题不存在，双主题适配无从谈起）")
+	}
+	darkPart := html[:lightIdx]
+	lightPart := html[lightIdx:]
+
+	// 槽位数必须与 BH_COLORS 一致：色板变量少了，JS 引用到的 --bh-N 会解析成
+	// 无效值 → 线条透明/变黑，且**不会报错**（CSS 变量缺失是静默的）。
+	nSlots := len(bhPaletteSlots(t))
+	for i := 1; i < nSlots; i++ {
+		v := "--bh-" + strconv.Itoa(i)
+		if !strings.Contains(darkPart, v+":") {
+			t.Errorf("深色主题（:root）缺少色板变量 %s（JS 会引用到空值，线条静默变透明）", v)
+		}
+		if !strings.Contains(lightPart, v+":") {
+			t.Errorf("浅色主题 [data-theme=light] 缺少色板变量 %s（切主题后该线条对比度不足/不可见）", v)
+		}
+	}
+}
+
+// TestSmoothPathExistsAndIsUsedByBothCharts 曲线平滑必须**存在**且被**两处**
+// 折线图调用。
+//
+// 为什么断言"两处"：本次需求是"两处折线都要平滑"。只改一处时，用户会在同一个
+// 面板里看到一条平滑线 + 一条折线，比"都没平滑"更糟（不一致本身是缺陷）。
+// 因此这里**分函数体**分别检查（不能用全文 Contains —— 那样只改一处也会绿）。
+func TestSmoothPathExistsAndIsUsedByBothCharts(t *testing.T) {
+	js := readAppJS(t)
+	if !strings.Contains(js, "function smoothPath(") {
+		t.Fatal("缺少 smoothPath（无共享的平滑实现，两处折线会各写一套）")
+	}
+	// 余额趋势图
+	bh := funcBody(t, "function renderBalanceChart(")
+	if !strings.Contains(bh, "smoothPath(") {
+		t.Error("余额趋势图未调用 smoothPath（仍是直连折线）")
+	}
+	// 账号×模型图
+	ams := funcBody(t, "function renderAms(")
+	if !strings.Contains(ams, "smoothPath(") {
+		t.Error("账号×模型图未调用 smoothPath（两处只改了一处，风格不一致）")
+	}
+	// 平滑输出必须是 <path>：<polyline> 无法承载三次贝塞尔。
+	if strings.Contains(js, "<polyline") {
+		t.Error("仍存在 <polyline>（polyline 只能画直线段，平滑必须改用 <path>）")
+	}
+}
+
+// TestSmoothPathIsMonotoneNotCatmullRom 平滑**必须是单调保持插值**。
+//
+// 为什么这是关键判断（不是风格偏好）：Catmull-Rom / 普通三次样条只保证
+// "经过控制点"，**不保证不过冲**。在余额/用量这类统计图上，过冲会在两个
+// 真实点之间画出**数据里不存在的波峰**，用户据此判断"当时到过 4150"，
+// 而实际最高只有 4100 —— 这是**虚构数据**，比"线不好看"严重得多。
+// Fritsch–Carlson 的单调性约束（把切线夹到相邻割线 3 倍以内）才是解法。
+//
+// 本测试断言实现里**存在单调性约束**，而不是钉具体写法：
+// 判据 = 出现"切线修正/限制"的特征（对相邻割线的比值做钳制）。
+func TestSmoothPathIsMonotoneNotCatmullRom(t *testing.T) {
+	body := funcBody(t, "function smoothPath(")
+	if body == "" {
+		t.Fatal("未找到 smoothPath")
+	}
+	// 1) 必须就"单调/不过冲"给出设计理由（防止后人换成 Catmull-Rom 时
+	//    看不到这条约束的存在理由）。
+	src := readAppJS(t)
+	i := strings.Index(src, "function smoothPath(")
+	head := src[:i]
+	// 取 smoothPath 之前的文档注释块
+	docStart := strings.LastIndex(head, "/* smoothPath")
+	if docStart < 0 {
+		t.Fatal("smoothPath 缺少文档注释（须写明为何必须 monotone）")
+	}
+	doc := src[docStart:i]
+	for _, need := range []string{"monotone", "过冲"} {
+		if !strings.Contains(doc, need) {
+			t.Errorf("smoothPath 注释未说明 %q（后人换成 Catmull-Rom 时会重蹈过冲之坑）", need)
+		}
+	}
+	if !strings.Contains(doc, "Catmull") {
+		t.Error("smoothPath 注释未点名 Catmull-Rom 为何不可用（少了这条，改进会被回退）")
+	}
+	// 2) 必须**同时**具备单调保持的两条必要条件（缺任一条都会过冲）：
+	//    a) 极值点/拐点切线归零 —— 否则在平台/尖峰处必然拱出去；
+	//    b) 切线按相邻割线比值做 sqrt 钳制（Fritsch–Carlson 的 3 倍界）。
+	//
+	//    ⚠️ 断言必须**精确到承载语义的那一行**：早先版本只查
+	//    `Contains(body, "= 0;")`，而实现里另有一处"水平段两端切线归零"
+	//    也含该串 —— 把极值点归零整段删掉后断言**依然通过**（变异体存活，
+	//    见 §2.5 假绿形态 #9/#11）。现改为查极值点分支的**判定条件本身**。
+	if !strings.Contains(body, "d[i - 1] * d[i] <= 0") {
+		t.Error("smoothPath 缺少极值点判定（d[i-1]*d[i]<=0 处切线必须归零，否则拐点必然过冲）")
+	}
+	hasClamp := strings.Contains(body, "sqrt")
+	if !hasClamp {
+		t.Error("smoothPath 未见切线钳制（须按相邻割线比值做 3 倍界，否则平滑段会过冲虚构波峰）")
+	}
+	if !strings.Contains(body, "3 / Math.sqrt") && !strings.Contains(body, "3 /Math.sqrt") {
+		t.Error("smoothPath 的钳制未见 3 倍界（Fritsch–Carlson 判据的核心常数）")
+	}
+}
+
+// TestPointMarkAdaptiveToPointCount 点标记必须**按点数自适应**：
+// 点数多时不画实心圆点，但**保留可悬停的透明热区**。
+//
+// 为什么：60 个点每点一个 r=2.2 实心圆，在 ~7px 点距下糊成花带；
+// 圆点是前注意加工最易捕捉的特征，注意力被它抓走反而看不到"线"。
+// 但"不画圆点"绝不能等于"少给信息" —— hover 必须仍能定位任意点。
+// 故本测试同时断言两件事：阈值判断存在 + 无圆点时有透明热区。
+func TestPointMarkAdaptiveToPointCount(t *testing.T) {
+	js := readAppJS(t)
+	// 1) 必须有一个"按点数决定是否画点"的判断（阈值集中一处，避免两图漂移）。
+	if !strings.Contains(js, "function shouldMarkPoints(") {
+		t.Fatal("缺少点标记自适应的共享判断（两处折线会各写各的阈值）")
+	}
+	body := funcBody(t, "function shouldMarkPoints(")
+	if !strings.Contains(body, "POINT_MARK_MAX") {
+		t.Error("shouldMarkPoints 未使用统一的点数阈值 POINT_MARK_MAX")
+	}
+	// 2) 阈值常量必须存在且有界（防被改成恒真/恒假让自适应失效）
+	if !strings.Contains(js, "const POINT_MARK_MAX") {
+		t.Error("缺少 POINT_MARK_MAX 阈值常量")
+	}
+	// 3) 热区：不画圆点时必须仍给出透明命中圈（否则 tooltip 只能靠 1.5~2px
+	//    的线宽命中，悬停基本触发不了 = 静默丢信息）。
+	//
+	//    ⚠️ 断言必须限定在 drawPointMarker **函数体内**：早先版本用全文
+	//    Contains("fill=\"transparent\"")，而余额图末点的"加圈便于悬停"也是
+	//    透明圆 —— 把 drawPointMarker 的透明热区整段删掉后断言**依然通过**
+	//    （变异体存活，§2.5 假绿形态 #9：匹配面命中了别处的同形字符串）。
+	if !strings.Contains(js, "POINT_HIT_R") {
+		t.Fatal("缺少 POINT_HIT_R（无圆点时失去悬停热区，tooltip 查不到值）")
+	}
+	pm := funcBody(t, "function drawPointMarker(")
+	if pm == "" {
+		t.Fatal("缺少 drawPointMarker（两处折线的点/hover 渲染未共用）")
+	}
+	if !strings.Contains(pm, `fill="transparent"`) {
+		t.Error("drawPointMarker 未画透明热区（点密集时不画圆点 → 悬停无处可落，查不到值）")
+	}
+	if !strings.Contains(pm, "POINT_HIT_R") {
+		t.Error("drawPointMarker 的透明热区未用统一半径 POINT_HIT_R")
+	}
+	// 4) 两处折线都必须走这个共享判断（只改一处 = 风格不一致）。
+	for _, fn := range []string{"function renderBalanceChart(", "function renderAms("} {
+		if !strings.Contains(funcBody(t, fn), "shouldMarkPoints(") {
+			t.Errorf("%s 未使用 shouldMarkPoints（点标记策略两图不一致）", fn)
+		}
+	}
+}
+
+// TestChartLineWidthSharedAcrossCharts 线宽必须由**共享函数**按系列数给出，
+// 且补上 stroke-linecap="round"（线帽统一）。
+//
+// 为什么：旧实现两处各硬编码 stroke-width="1.8"，且其中一处缺 linecap ——
+// 这是"同一个面板里两种线风格"的直接来源。抽成函数后线宽只有一个真源。
+func TestChartLineWidthSharedAcrossCharts(t *testing.T) {
+	js := readAppJS(t)
+	if !strings.Contains(js, "function lineWidthFor(") {
+		t.Fatal("缺少 lineWidthFor（线宽仍散落硬编码，两处会漂移）")
+	}
+	// 系列数多时更细：断言函数体里对入参做了**分档**比较（规则，非字面量）。
+	body := funcBody(t, "function lineWidthFor(")
+	if !strings.Contains(body, "if (") || !strings.Contains(body, "return 2") &&
+		!strings.Contains(body, "return 1") {
+		t.Errorf("lineWidthFor 未按系列数分档返回线宽: %s", body)
+	}
+	// 两处折线都必须调用它，且都带圆头线帽。
+	for _, fn := range []string{"function renderBalanceChart(", "function renderAms("} {
+		b := funcBody(t, fn)
+		if !strings.Contains(b, "lineWidthFor(") {
+			t.Errorf("%s 未使用 lineWidthFor（线宽仍是硬编码）", fn)
+		}
+		if !strings.Contains(b, `stroke-linecap="round"`) {
+			t.Errorf("%s 缺少 stroke-linecap=\"round\"（线帽不统一，端点看着断茬）", fn)
+		}
 	}
 }

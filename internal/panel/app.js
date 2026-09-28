@@ -1737,11 +1737,46 @@ function fmtTokTip(v) { return fmtTok(v); }
 /* ── 余额趋势 ────────────────────────────────────────────────────────
    与「用量」视图的区别：用量是事件驱动的流量（柱状），余额是定时采样的存量
    水位（折线）。每账号一条线；涨跌用圆点标记，到账/消耗一眼可辨。 */
-/* 账号身份色板。刻意**不含** var(--ok)/var(--bad) —— 绿/红已被「净增/净减」
-   语义占用（每日变化柱），若账号色复用它们会产生双重编码冲突：同一颜色
-   有两个互斥含义（"涨" vs "某账号"），读者必然误读。详见 §十一 同源纪律：
-   一个视觉通道只承载一种含义。6 色循环，够覆盖单域常见账号数。 */
-const BH_COLORS = ['var(--accent)', '#9b6dff', '#26b3c9', 'var(--warn)', '#e879a6', '#7d8cff'];
+/* 账号身份色板（8 槽）。槽位 0 = var(--accent)（**主题主色**，浅色主题下
+   自动跟随；刻意保留，因为它承载的是"第一条线=当前主题强调色"的既有语义，
+   不是与状态语义撞车），槽位 1~7 走 CSS 变量 --bh-1..--bh-7，两套主题各一份。
+
+   ── 各槽色相与选它的理由（色相为实测值） ──────────────────────────
+   槽0 227°  var(--accent)   主题主色，非新增取舍
+   槽1  58°  黄                语义色的 38°(warn) 与 154°(ok) 之间唯一能放的点
+   槽2  96°  黄绿              离三语义色都远（≥46°），最"安全"的槽位
+   槽3 135°  绿                在 warn/ok 之间的另一侧，与 58° 相距 77°
+   槽4 191°  青                冷色区，与 accent(227°) 相距 36°
+   槽5 247°  蓝紫              与 accent 相距 19°，靠明度/饱和度区分（见下）
+   槽6 295°  品红              远离所有语义色（≥66°）
+   槽7 343°  玫红              与 bad(2.6°) 相距 20°，靠低饱和暖粉区分
+   相邻间距：77/40/42/42/42/42/40 度（槽1→槽7 内部链），最小 40°。
+
+   ── 为何避开语义色 ────────────────────────────────────────────────
+   绿/红/黄已被状态语义占用（--ok 可用 / --bad 失败 / --warn 限流告警）。
+   账号身份色若与它们同色相，同一颜色就有两个互斥含义（"某账号" vs "状态"），
+   读者必然误读 —— 这是 §十一"一个视觉通道只承载一种含义"的直接推论。
+   故 1~7 槽都把色相放在距 warn/ok/bad 至少 20° 的位置（浅色主题下
+   warn 37°、ok 155°、bad 3°，均已核验）。
+
+   ⚠️ 这里有一个**已实测的取舍**，勿轻改：要求「8 色 + 相邻相差距 ≥40° +
+   同时避开 全部 4 个语义色(含 accent) ±20°」三者**数学上不可同时成立** ——
+   4 个禁区共占 160°，而 8 槽相邻 ≥40° 需要 320° 的弧，160+320 > 360。
+   穷举求解证实：若同时避开 accent，最大可实现的相邻最小间距只有 38.5°。
+   因此本色板选择：**槽位 0 复用 accent（不视为撞车）**，1~7 槽避开 warn/ok/bad
+   且相邻间距 ≥40°。槽 5(247°) 与 accent 相距仅 19° 是这一取舍的唯一代价 ——
+   它靠**明显不同的明度/饱和度**（accent 是高饱和靛蓝、槽5 是亮紫）来区分，
+   这是 20° 色相判据之外的第二条判据，符合任务"或明度/饱和度明显不同"的允许。
+
+   ── 两套主题（硬编码 hex 必须两套，见 index.html） ────────────────
+   对比度实测（深底 #14171f / 浅底 #ffffff，WCAG 对比度）：
+     槽1 13.3/4.6  槽2 14.1/4.5  槽3 13.5/4.5  槽4 11.8/4.5
+     槽5  6.4/11.8 槽6  7.1/5.9  槽7  6.7/6.4   槽0(var(--accent)) 4.9/5.4
+   全部达到非文本对比度 3:1 的要求，且多数 ≥4.5:1。 */
+const BH_COLORS = [
+  'var(--accent)', 'var(--bh-1)', 'var(--bh-2)', 'var(--bh-3)',
+  'var(--bh-4)', 'var(--bh-5)', 'var(--bh-6)', 'var(--bh-7)',
+];
 
 /* 域元数据：cn = 国内（CodeBuddy），global = 国际（WorkBuddy）。
    两域的积分不同源、不可互换（连上游 base 与模型目录都不同），
@@ -1780,6 +1815,127 @@ function measureWidth(el) {
   const pr = parseFloat(cs.paddingRight) || 0;
   const w = el.clientWidth - pl - pr;
   return w > 40 ? Math.round(w) : CHART_FALLBACK_W;
+}
+
+/* ── 折线共用的三个渲染规则（两处折线图必须一致，故抽成共享函数） ──────
+   为什么抽出来：余额趋势图与账号×模型图是**同类图形**（都是"真实时间 x
+   轴 + 值 y 轴的多序列折线"）。同一类图形若各写一套线宽/平滑/点标记，
+   两处必然逐渐漂移，用户看到的是"同一个面板里两种线风格" —— 这正是
+   本次要修的问题本身。故把三者收敛为共享实现，两处只负责传数据。 */
+
+/* lineWidthFor 按**系列数**给线宽：系列多时略细、少时略粗。
+   为什么与系列数挂钩：线宽是"信息密度"的补偿手段。1~3 条线时线细会显得
+   单薄、且单条线的视觉权重不足以承载注意力；>6 条时线越细越不糊 ——
+   60px 高的绘图区里 8 条 2.0px 线会互相吃掉、趋势读不出来。
+   这与既有的"点标记按点数自适应"是同一思路：**图形密度决定笔触粗细**。
+   分档取整（2.0/1.8/1.5）而非连续函数，是为了让同一系列数在任何容器宽度
+   下都得到同一线宽，避免"窗口一拉线宽就变"的抖动感。 */
+function lineWidthFor(n) {
+  if (n > 6) return 1.5;
+  if (n >= 4) return 1.8;
+  return 2.0;
+}
+
+/* smoothPath 用 **Monotone 三次插值（Fritsch–Carlson）** 生成平滑 <path> 的
+   d 属性。入参 pts = [{x, y}, ...]（已投影到屏幕坐标，x 单调递增）。
+
+   ⚠️ 为什么**必须**是 monotone，不能用 Catmull-Rom / 普通三次样条：
+   后两者只保证**经过**控制点与一阶连续，**不保证不过冲**。在"余额/用量"
+   这类统计图上，过冲会在两个真实点之间画出**数据里不存在的波峰或负值** ——
+   例如余额从 4000→4100 的两点之间被样条拱到 4150，用户据此判断"当时冲到
+   过 4150"，而成因只是曲线形状。这是**虚构数据**，比"线条不好看"严重得多。
+   Fritsch–Carlson 的做法是：先按三点斜率算切线，再把切线限制在相邻割线
+   斜率的 3 倍以内（即保证插值函数在每个子区间内单调），于是平滑段
+   **始终夹在两端真实值之间**，不会产生局部极值。
+
+   边界：点数 <2 退回直线（无插值意义）；点数 ==2 直接给一条线段
+   （两点之间任何"平滑"都是凭空造的弧度）。 */
+function smoothPath(pts) {
+  if (!pts || pts.length < 2) return '';
+  if (pts.length === 2) {
+    return 'M' + pts[0].x.toFixed(1) + ' ' + pts[0].y.toFixed(1) +
+      'L' + pts[1].x.toFixed(1) + ' ' + pts[1].y.toFixed(1);
+  }
+  const n = pts.length;
+  // 1) 相邻割线斜率 d[i] = (y[i+1]-y[i]) / (x[i+1]-x[i])
+  const dx = [], dy = [], d = [];
+  for (let i = 0; i < n - 1; i++) {
+    dx[i] = pts[i + 1].x - pts[i].x;
+    dy[i] = pts[i + 1].y - pts[i].y;
+    d[i] = dx[i] === 0 ? 0 : dy[i] / dx[i];
+  }
+  // 2) 各点切线 m[i]：端点用单侧割线，内部点用相邻割线的加权平均
+  //    （Fritsch–Carlson 的标准初始化；下一步再对 m 作单调性约束）。
+  const m = new Array(n);
+  m[0] = d[0];
+  m[n - 1] = d[n - 2];
+  for (let i = 1; i < n - 1; i++) {
+    if (d[i - 1] * d[i] <= 0) {
+      m[i] = 0;                     // 极值点/拐点：切线必须为 0，否则必然过冲
+    } else {
+      m[i] = (d[i - 1] + d[i]) / 2;
+    }
+  }
+  // 3) 单调性约束（本算法的关键）：把每点切线夹到相邻割线的 3 倍以内。
+  //    这一步才是"单调保持"的来源；只做第 2 步仍会过冲。
+  for (let i = 0; i < n - 1; i++) {
+    if (d[i] === 0) {               // 水平段：两端切线都归零，段内恒为常数
+      m[i] = 0;
+      m[i + 1] = 0;
+      continue;
+    }
+    const a = m[i] / d[i], b = m[i + 1] / d[i];
+    const s = a * a + b * b;
+    if (s > 9) {                    // 限制在半径 3 的圆内（Fritsch–Carlson 判据）
+      const t = 3 / Math.sqrt(s);
+      m[i] = t * a * d[i];
+      m[i + 1] = t * b * d[i];
+    }
+  }
+  // 4) 转成三次贝塞尔：控制点 = 端点沿切线外推 1/3 段长（与 Hermite 等价）
+  let out = 'M' + pts[0].x.toFixed(1) + ' ' + pts[0].y.toFixed(1);
+  for (let i = 0; i < n - 1; i++) {
+    const c1x = pts[i].x + dx[i] / 3, c1y = pts[i].y + m[i] * dx[i] / 3;
+    const c2x = pts[i + 1].x - dx[i] / 3, c2y = pts[i + 1].y - m[i + 1] * dx[i] / 3;
+    out += 'C' + c1x.toFixed(1) + ' ' + c1y.toFixed(1) + ' ' +
+      c2x.toFixed(1) + ' ' + c2y.toFixed(1) + ' ' +
+      pts[i + 1].x.toFixed(1) + ' ' + pts[i + 1].y.toFixed(1);
+  }
+  return out;
+}
+
+/* POINT_MARK_MAX 点标记（实心小圆）的**点数上限**：超过即不画圆点。
+   为什么：60 个点 × 每点一个 r=2.2 实心圆，在 ~7px 点距下糊成花带——
+   圆点是前注意加工最易捕捉的特征，注意力被它抓走反而看不到"线"（趋势）。
+   阈值 30 的经验来源：绘图区宽约 900px 时，30 点在 30px 间距下圆点互不
+   粘连，仍能起"采样点"的作用；再多就退化为噪音。
+   ⚠️ 不画圆点 ≠ 少给信息：hover 仍靠透明大热区（见 POINT_HIT_R）逐点可查，
+   且"显著变化"的点在两个图上都仍然保留标记（降噪 ≠ 减信息）。 */
+const POINT_MARK_MAX = 30;
+/* POINT_HIT_R 无圆点时使用的**透明热区半径**：圆点不画了，但命中判定不能
+   跟着消失，否则 tooltip 只能靠线宽命中、悬停极难触发（线宽仅 1.5~2px）。
+   取 6px ≈ 手指/光标可稳定停留的范围，且相邻热区不重叠（点距通常 >12px）。 */
+const POINT_HIT_R = 6;
+
+/* shouldMarkPoints 是否画实心圆点（点数自适应）。
+   为什么做成函数而不是各处内联比较：这条规则是**两个折线图共有的产品决策**，
+   分散写会漂移；且集中一处后"阈值"只有一个真源，调整时不会漏改一处。 */
+function shouldMarkPoints(n) {
+  return n <= POINT_MARK_MAX;
+}
+
+/* drawPointMarker 画一个数据点的标记 + hover 文案。
+   marked=true → 实心小圆（能被看见）；false → 透明大热区（不可见但可悬停）。
+   两个折线图共用，保证"看不见的点同样查得到值"这一行为在两处一致。 */
+function drawPointMarker(x, y, marked, color, title) {
+  const r = marked ? 2.6 : 0;
+  const t = esc(title);
+  if (marked) {
+    return '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="' + r +
+      '" fill="' + color + '"><title>' + t + '</title></circle>';
+  }
+  return '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="' + POINT_HIT_R +
+    '" fill="transparent"><title>' + t + '</title></circle>';
 }
 
 
@@ -1890,8 +2046,10 @@ function renderBalanceChart(series) {
   rows.forEach((s, si) => {
     const color = BH_COLORS[si % BH_COLORS.length];
     const pts = s.points.map(p => ({ x: X(Number(p.t) * 1000), y: Y(Number(p.c)), c: Number(p.c), t: Number(p.t) * 1000, g: p.d }));
-    out += '<polyline fill="none" stroke="' + color + '" stroke-width="1.8" stroke-linejoin="round" ' +
-      'stroke-linecap="round" points="' + pts.map(p => p.x.toFixed(1) + ',' + p.y.toFixed(1)).join(' ') + '"/>';
+    // 平滑 <path>（monotone，不过冲 —— 见 smoothPath 注释）+ 统一线宽/线帽。
+    // 线宽按**本图系列数**取档，两处折线共用同一函数，风格不会各走各的。
+    out += '<path fill="none" stroke="' + color + '" stroke-width="' + lineWidthFor(rows.length) +
+      '" stroke-linecap="round" stroke-linejoin="round" d="' + smoothPath(pts) + '"/>';
     // 点标记：**只标"显著变化"**，不是每个点都画圈。
     //
     // 为何改（20260918 用户反馈"丑"）：原先 delta !== 0 就画圈，151 个采样点
@@ -1904,21 +2062,30 @@ function renderBalanceChart(series) {
     // "显著"的绝对量不同，用相对值才等价可比。跨度极小时保底 1，避免永不标记。
     const span = Math.max(1, hi - lo);
     const markMin = Math.max(1, span * 0.03);
+    // 点数自适应：点数 > POINT_MARK_MAX 时不再逐点画实心小圆（见其注释），
+    // 显著变化点仍然标记 —— 两者是不同用途：前者是"采样点"，后者是"事件"。
+    const markAll = shouldMarkPoints(pts.length);
     pts.forEach((p, i) => {
       const prev = i > 0 ? pts[i - 1] : null;
       const delta = prev ? p.c - prev.c : 0;
       const sig = prev && Math.abs(delta) >= markMin;
-      if (sig) {                              // 显著变化才标记：涨=绿、跌=红
-        const up = delta > 0;
-        out += '<circle cx="' + p.x.toFixed(1) + '" cy="' + p.y.toFixed(1) + '" r="2.6" ' +
-          'fill="' + (up ? 'var(--ok)' : 'var(--bad)') + '"/>';
-      }
-      // title 仍然**每点都给**（悬停可查任意点）—— 减少的是视觉噪音，
-      // 不是信息量。这是"降噪"与"减信息"的关键区别。
+      const up = delta > 0;
       const when = new Date(p.t).toLocaleString('zh-CN', { hour12: false });
-      const head = esc(s.name || s.uid.slice(0, 8)) + '  ' + esc(when) + (p.g ? '（日粒度）' : '');
-      out += '<title>' + head + '\n余额 ' + fmtNum(p.c) +
-        (prev ? '\n较上一点 ' + (delta > 0 ? '+' : '') + fmtNum(delta) : '') + '</title>';
+      const head = (s.name || s.uid.slice(0, 8)) + '  ' + when + (p.g ? '（日粒度）' : '');
+      const tip = head + '\n余额 ' + fmtNum(p.c) +
+        (prev ? '\n较上一点 ' + (delta > 0 ? '+' : '') + fmtNum(delta) : '');
+      if (sig) {
+        // 显著变化：涨=绿、跌=红（唯一允许"借用"语义色的地方 —— 因为它
+        // 表达的**就是**涨跌语义，不是账号身份）。
+        out += '<circle cx="' + p.x.toFixed(1) + '" cy="' + p.y.toFixed(1) + '" r="2.6" ' +
+          'fill="' + (up ? 'var(--ok)' : 'var(--bad)') + '"><title>' + esc(tip) + '</title></circle>';
+      } else if (markAll) {
+        out += drawPointMarker(p.x, p.y, true, color, tip);
+      } else {
+        // 点太密：不画圆点，但**保留透明热区**，悬停仍可查任意点。
+        // 减少的是视觉噪音，不是信息量 —— 这是"降噪"与"减信息"的关键区别。
+        out += drawPointMarker(p.x, p.y, false, color, tip);
+      }
     });
     const last = pts[pts.length - 1];          // 末点加大命中圈，便于悬停
     out += '<circle cx="' + last.x.toFixed(1) + '" cy="' + last.y.toFixed(1) + '" r="9" fill="transparent">' +
@@ -2388,13 +2555,18 @@ function renderAms(series) {
         const pts = s.points.map(p => ({
           x: X(Date.parse(p.slot + ':00:00')), y: Y(p.tokens), p,
         }));
-        out += '<polyline fill="none" stroke="' + color + '" stroke-width="1.8" ' +
-          'stroke-linejoin="round" points="' +
-          pts.map(q => q.x.toFixed(1) + ',' + q.y.toFixed(1)).join(' ') + '"/>';
+        // 与余额趋势图**同一套渲染规则**（平滑/线宽/线帽/点自适应），
+        // 保证同类图形风格一致 —— 这是本次"统一下线风格"的落点。
+        out += '<path fill="none" stroke="' + color + '" stroke-width="' + lineWidthFor(plot.length) +
+          '" stroke-linecap="round" stroke-linejoin="round" d="' + smoothPath(pts) + '"/>';
+        // 点标记：点数自适应（点数 > POINT_MARK_MAX 时只留透明热区）。
+        // 口径与余额图一致（见 shouldMarkPoints 注释）；本图每个点都是
+        // "该小时该组合的用量"，没有"显著变化"概念，故不需要显著性子集。
+        const markAll = shouldMarkPoints(pts.length);
         pts.forEach(q => {
-          out += '<circle cx="' + q.x.toFixed(1) + '" cy="' + q.y.toFixed(1) + '" r="2.2" fill="' + color + '">' +
-            '<title>' + esc(amsWho(s) + ' · ' + s.model + '\n' + q.p.slot +
-              '\n' + fmtTokens(q.p.tokens) + ' tokens / ' + q.p.reqs + ' 次') + '</title></circle>';
+          out += drawPointMarker(q.x, q.y, markAll, color,
+            amsWho(s) + ' · ' + s.model + '\n' + q.p.slot +
+            '\n' + fmtTokens(q.p.tokens) + ' tokens / ' + q.p.reqs + ' 次');
         });
       });
       out += '</svg>';

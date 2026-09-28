@@ -21,6 +21,13 @@
   --ok: #3ddc97; --ok-soft: rgba(61,220,151,.12);
   --warn: #f5b544; --warn-soft: rgba(245,181,68,.12);
   --bad: #f0655f; --bad-soft: rgba(240,101,95,.12);
+  /* 账号身份色板（8 槽，槽位 0 复用 --accent；详见 app.js 的 BH_HUES 注释）。
+     必须**两套主题各写一份**：色板的可用性是"颜色 vs 背景"的函数，
+     深底(#14171f)靠高明度取得对比，浅底(#ffffff)靠低明度取得对比——
+     同一 hex 不可能同时最优，故做成变量由主题切换（§十一：一个视觉通道
+     只承载一种含义；这里则是"一套色板要适配两种背景"）。 */
+  --bh-1: #f0e070; --bh-2: #a7fa70; --bh-3: #70fa93; --bh-4: #70e1fa;
+  --bh-5: #9a8cf5; --bh-6: #ee70fa; --bh-7: #fa7097;
   --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.5);
   --mono: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -33,6 +40,11 @@
   --ok: #0f9d63; --ok-soft: rgba(15,157,99,.1);
   --warn: #b47611; --warn-soft: rgba(180,118,17,.11);
   --bad: #cf3b34; --bad-soft: rgba(207,59,52,.09);
+  /* 账号身份色板·浅色主题版。色相与深色版**一一对应**（相邻间距不变，
+     故"哪条线是哪条"在切换主题后仍可辨认），只把明度压到能满足
+     非文本对比度（WCAG 1.4.11 目标 3:1，本组实测 ≥4.5:1）的水平。 */
+  --bh-1: #7d7900; --bh-2: #368700; --bh-3: #008a23; --bh-4: #00819e;
+  --bh-5: #1600bf; --bh-6: #af00bf; --bh-7: #bf0036;
   --shadow: 0 1px 2px rgba(16,20,32,.06), 0 8px 24px -14px rgba(16,20,32,.14);
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
