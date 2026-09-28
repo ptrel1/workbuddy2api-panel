@@ -248,15 +248,32 @@ func (p *Panel) usageSeries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	series := p.cfg.Usage.AccountModelSeries()
+	// 昵称仅用于展示，取自池快照（不含任何凭证）——与 usage 端点同口径。
+	// 为什么在 panel 层拼而非改 usage.Series：昵称属**池状态**（会变、来源是 auth），
+	// 而 usage 包只管用量聚合；把池状态混进聚合结构会让该包反向依赖账号池。
+	nicks := map[string]string{}
+	for _, s := range p.cfg.Pool.List() {
+		if s.Nickname != "" {
+			nicks[s.UID] = s.Nickname
+		}
+	}
+	// 匿名嵌入 usage.Series：JSON 输出是原有字段 + name，前端零破坏性改动。
+	// name 为空时前端自行回退到 uid 短哈希（见 app.js renderAms）。
+	type seriesRow struct {
+		usage.Series
+		Name string `json:"name,omitempty"`
+	}
+	rows := make([]seriesRow, 0, len(series))
 	enough := 0
 	for _, s := range series {
 		if s.Enough {
 			enough++
 		}
+		rows = append(rows, seriesRow{Series: s, Name: nicks[s.UID]})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "series": series,
-		"total": len(series), "plottable": enough,
+		"ok": true, "series": rows,
+		"total": len(rows), "plottable": enough,
 	})
 }
 

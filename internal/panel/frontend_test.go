@@ -7,6 +7,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/balance"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +18,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestAppJSSyntax app.js 必须能通过 JS 解析器语法校验。
@@ -854,8 +856,11 @@ func TestErrorAccountShowsNickname(t *testing.T) {
 	if !strings.Contains(body, "uidName") {
 		t.Error("renderErrors 未使用昵称变量")
 	}
-	// 必须真的把昵称渲染出来（只查不改 = 白查）
-	if !strings.Contains(body, "esc(uidName)") {
+	// 必须真的把昵称渲染出来（只查不改 = 白查）。
+	// 断言用前缀 "esc(uidName" 而非整串 "esc(uidName)"：后者钉死了具体写法，
+	// 而「昵称缺失时回退 uid」（esc(uidName || uid)）是更完整的实现、应被允许 ——
+	// 否则测试会因"实现变好"而误报失败（本次即如此）。
+	if !strings.Contains(body, "esc(uidName") {
 		t.Error("renderErrors 查了昵称但未渲染（只查不用）")
 	}
 	// 昵称映射必须从 overview 重建（昵称可能在面板里被改）
@@ -1187,5 +1192,81 @@ func TestPerfSampleGate(t *testing.T) {
 	// 样本数不足时要有明确占位与说明，不能静默输出空串。
 	if !strings.Contains(js, "不足") {
 		t.Error("fmtPerf 未对少样本给出说明文案（会静默显示 —，用户不知为何）")
+	}
+}
+
+// TestUsageSeriesExposesNickname 「账号 × 模型」接口必须透出账号昵称。
+//
+// 为什么必须：uid 是 8 位十六进制（685754d3），**人在 web 上认不出是哪个账号**
+// （用户实测反馈）。只给哈希 = 把"哈希 → 人"的映射推给用户。
+// 昵称来自池快照，由 panel 层拼到 series 上（不改 usage.Series——昵称属池状态，
+// 混进用量聚合包会让该包反向依赖账号池）。
+func TestUsageSeriesExposesNickname(t *testing.T) {
+	pl := pool.New("")
+	pl.Add(&auth.Auth{UID: "abcdef1234567890", Nickname: "周五口", AccessToken: "at", ExpiresAt: 9999999999})
+	rec := usage.New("")
+	now := time.Now()
+	for i := 0; i < 8; i++ {
+		rec.Add(now.Add(-time.Duration(i)*time.Hour), "cn", "abcdef1234567890", "glm-5.2",
+			usage.Delta{PromptTokens: 10, HasPromptTokens: true, CompletionTokens: 5, HasCompletion: true}, true)
+	}
+	p := New(Config{Version: "test", APIKey: "", Pool: pl, Usage: rec})
+
+	rec2 := httptest.NewRecorder()
+	p.ServeHTTP(rec2, httptest.NewRequest("GET", "/panel/api/usage_series", nil))
+	if rec2.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec2.Code, rec2.Body)
+	}
+	var body struct {
+		Series []struct {
+			UID    string `json:"uid"`
+			Name   string `json:"name"`
+			Model  string `json:"model"`
+			Tokens int64  `json:"tokens"`
+		} `json:"series"`
+	}
+	if err := json.Unmarshal(rec2.Body.Bytes(), &body); err != nil {
+		t.Fatalf("not json: %v", err)
+	}
+	if len(body.Series) == 0 {
+		t.Fatal("series 为空，无法验证昵称透出")
+	}
+	for _, s := range body.Series {
+		if s.Name != "周五口" {
+			t.Errorf("series[uid=%s].name=%q want %q（前端靠它显示账号名）", s.UID, s.Name, "周五口")
+		}
+	}
+}
+
+// TestAmsAccountColumnUsesNickname 「账号 × 模型」明细表/图例/tooltip 的账号必须走昵称口径。
+//
+// 本测试钉的是**规则**而非实现：账号展示一律昵称优先（uid 仅作兜底）。
+// 反例（曾被用户指出）：表格直接输出 s.uid.slice(0, 8)，用户看到 685754d3 不知是谁。
+func TestAmsAccountColumnUsesNickname(t *testing.T) {
+	js := readAppJS(t)
+
+	// 1) 必须有统一的展示名辅助函数，且昵称优先。
+	if !strings.Contains(js, "function amsWho(") {
+		t.Fatal("缺少 amsWho（账号展示名辅助）")
+	}
+	who := funcBody(t, "function amsWho(")
+	if !strings.Contains(who, "s.name") {
+		t.Errorf("amsWho 未优先用昵称: %s", who)
+	}
+
+	// 2) renderAms 内不得把裸 uid 哈希当账号展示（3 处：明细表/图例/tooltip）。
+	body := funcBody(t, "function renderAms(")
+	if body == "" {
+		t.Fatal("未找到 renderAms")
+	}
+	if strings.Contains(body, "esc(s.uid.slice(0, 8))") {
+		t.Error("renderAms 仍直接展示 uid 哈希（用户认不出是哪个账号）")
+	}
+	if strings.Contains(body, "s.uid.slice(0, 8) + ' · '") {
+		t.Error("renderAms 的 tooltip 仍以 uid 哈希开头")
+	}
+	// 3) 三处展示都应经 amsWho。
+	if n := strings.Count(body, "amsWho(s)"); n < 3 {
+		t.Errorf("renderAms 里 amsWho(s) 用了 %d 次，want >=3（明细表 + 图例 + tooltip）", n)
 	}
 }

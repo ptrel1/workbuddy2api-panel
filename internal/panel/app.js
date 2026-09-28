@@ -270,7 +270,10 @@ function renderAccounts(list) {
         '<b>⛔ 模型限流</b><br>' + rlmLines + '</div>';
     }
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
-    const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
+    // 账号展示统一用昵称（uid 哈希对人无信息量，web 上认不出是哪个账号）。
+    // 昵称缺失时退回短 uid：否则多个"未命名"账号互相无法区分。
+    // 完整 uid 仍保留在行 title（悬停可核对），不占主展示位。
+    const whoName = s.nickname || (s.uid.length > 8 ? s.uid.slice(0, 8) : s.uid);
     const cred = s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits));
     const pct = s.credits_total > 0
       ? Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100))
@@ -293,7 +296,7 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + planTag(s.uid) + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm">' + esc(whoName) + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + planTag(s.uid) + '</div></td>' +
       '<td>' + tag + note + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -690,20 +693,18 @@ function renderErrors(stats, updatedAt) {
   }
   tb.innerHTML = stats.map(st => {
     const uid = st.uid || '';
-    // 账号列：**优先显示昵称**（与账号池页同口径），短 uid 作副行。
+    // 账号列：**统一显示昵称**（全项目口径）。
     //
-    // 为何不能只显示 uid（用户实测反馈"怎么没写哪个账号"）：
+    // 为何不能显示 uid（用户实测反馈"怎么没写哪个账号"）：
     // uid 是 8 位十六进制（1aeaf3ba），**人记不住也认不出**；
     // 而昵称（周五口 / pt / 汪羽杰）才是用户认知里的"账号"。
     // 只给 uid = 让用户自己去做一次"哈希 → 人"的映射，这是把认知负担
     // 推给用户（对齐 dev-principles：信息可解释）。
-    // 昵称缺失时才退回 uid（不编造）。
+    // 昵称缺失时才退回 uid（不编造）；完整 uid 放 title，悬停可核对、不占展示位。
     const uidName = uid ? (uidNames[uid] || '') : '';
     const who = uid
-      ? (uidName
-          ? '<div class="nm" style="font-size:12.5px">' + esc(uidName) + '</div>' +
-            '<div class="mono" style="font-size:11px;color:var(--ink-3)">' + esc(uid) + '</div>'
-          : '<span class="mono" style="font-size:11.5px">' + esc(uid) + '</span>')
+      ? '<div class="nm" style="font-size:12.5px" title="' + esc(uid) + '">' +
+        esc(uidName || uid) + '</div>'
       : '<span style="color:var(--ink-3)">（全局）</span>';
     const model = st.model ? '<div class="why">模型 ' + esc(st.model) + '</div>' : '';
     const code = st.code ? '<div class="why">code ' + esc(st.code) + '</div>' : '';
@@ -1186,7 +1187,7 @@ async function loadSchoolStatus(quiet) {
       const done = SCHOOL_META.filter(([code]) => code !== 'task_student_verify' && by[code] && by[code].status === 'claimed').length;
       allDone += done === 4 ? 1 : 0;
       return '<div class="srow">' +
-        '<div class="who"><div class="nm" title="' + esc(v.nickname || '') + '">' + esc(v.nickname || '未命名') + '</div><div class="id">' + esc(v.uid) + '</div></div>' +
+        '<div class="who" title="' + esc(v.uid) + '"><div class="nm">' + esc(v.nickname || (v.uid.length > 8 ? v.uid.slice(0, 8) : v.uid)) + '</div></div>' +
         '<div class="stasks">' + cells + '</div>' +
         '<div class="luck" title="剩余抽奖次数">' + LUCK_SVG + (v.chances == null ? '—' : v.chances) + '</div>' +
         (v.error ? '<div class="err">' + esc(v.error) + '</div>' : '') +
@@ -2182,8 +2183,9 @@ async function openModelToggle(uid) {
   const state = $('mToggleState');
   if (!veil || !body) return;
   const st = (overviewData && (overviewData.accounts || []).find(x => x.uid === uid)) || {};
-  const short = uid.length > 8 ? uid.slice(0, 8) : uid;
-  $('mToggleWho').textContent = (st.nickname || short) + '（' + short + '）';
+  // 只显示昵称（不附 uid 哈希）：哈希对人无信息量，用户在 web 上认不出是哪个账号。
+  // 昵称缺失才退回短哈希，避免标题为空。
+  $('mToggleWho').textContent = st.nickname || (uid.length > 8 ? uid.slice(0, 8) : uid);
   veil.classList.add('on');
   mToggleUID = uid;
   body.hidden = true;
@@ -2323,6 +2325,14 @@ async function loadAms() {
   }
 }
 
+/* amsWho 「账号 × 模型」里账号列的展示名。
+   一律用昵称：uid 是 8 位十六进制（685754d3），人在 web 上认不出是哪个账号——
+   只给哈希等于让用户自己做一次"哈希 → 人"的映射（用户实测反馈）。
+   昵称缺失才退回哈希（不编造、不留空）。后端 usage_series 的 name 字段来自池快照。 */
+function amsWho(s) {
+  return s.name || s.uid.slice(0, 8);
+}
+
 /* renderAms 画「账号 × 模型」折线 + 明细表。 */
 function renderAms(series) {
   const body = $('amsBody');
@@ -2383,7 +2393,7 @@ function renderAms(series) {
           pts.map(q => q.x.toFixed(1) + ',' + q.y.toFixed(1)).join(' ') + '"/>';
         pts.forEach(q => {
           out += '<circle cx="' + q.x.toFixed(1) + '" cy="' + q.y.toFixed(1) + '" r="2.2" fill="' + color + '">' +
-            '<title>' + esc(s.uid.slice(0, 8) + ' · ' + s.model + '\n' + q.p.slot +
+            '<title>' + esc(amsWho(s) + ' · ' + s.model + '\n' + q.p.slot +
               '\n' + fmtTokens(q.p.tokens) + ' tokens / ' + q.p.reqs + ' 次') + '</title></circle>';
         });
       });
@@ -2392,7 +2402,7 @@ function renderAms(series) {
       const lg = $('amsLegend');
       if (lg) lg.innerHTML = plot.map((s, i) =>
         '<i class="sw" style="background:' + BH_COLORS[i % BH_COLORS.length] + '"></i>' +
-        esc(s.uid.slice(0, 8) + ' ' + s.model.replace(/^[a-z]+:/, ''))).join(' ');
+        esc(amsWho(s) + ' ' + s.model.replace(/^[a-z]+:/, ''))).join(' ');
     }
   }
 
@@ -2404,7 +2414,7 @@ function renderAms(series) {
         : '<span class="tag" style="opacity:.6">点数不足</span>';
       return '<tr>' +
         '<td class="mark" aria-hidden="true"></td>' +
-        '<td><span class="mono" style="font-size:11.5px">' + esc(s.uid.slice(0, 8)) + '</span></td>' +
+        '<td>' + esc(amsWho(s)) + '</td>' +
         '<td><span class="mono" style="font-size:11.5px">' + esc(s.model) + '</span></td>' +
         '<td class="num" style="font-weight:600">' + fmtTokens(s.tokens) + '</td>' +
         '<td class="num">' + s.reqs + '</td>' +
