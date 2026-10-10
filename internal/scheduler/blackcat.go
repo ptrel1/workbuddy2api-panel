@@ -9,17 +9,21 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
-// RunBlackcatNow 对所有可用账号执行夜猫子对话补足（窗口外跳过）。
+// blackcatNow 供 InNightWindow 判定用的当前时刻，测试可替换以固定窗口。
+// 生产路径恒为 time.Now（零行为变化）；与 travelAccountDelay 同款测试接缝，
+// 避免夜猫子这条放行路径只能在 23:00–08:00 才测得到。
+var blackcatNow = time.Now
+
+// RunBlackcatNow 对**所有**账号执行夜猫子对话补足（窗口外跳过）。
+// 禁用账号同样参与（禁用只停选号，见 disabled.go）；无 AccessToken 的跳过。
 // 由 blackcat_hours 排程（默认 [23]）触发；执行前二次校验 InNightWindow。
 func (s *Scheduler) RunBlackcatNow() {
-	if !upstream.InNightWindow(time.Now()) {
+	if !upstream.InNightWindow(blackcatNow()) {
 		log.Printf("blackcat: 当前不在 23:00–08:00 计数窗口，跳过")
 		return
 	}
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
-			continue
-		}
+		// 不按 st.Disabled 跳过：夜猫子属增长任务，走 growth/chat 任务通道而非选号。见 disabled.go。
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.AccessToken == "" {
 			continue

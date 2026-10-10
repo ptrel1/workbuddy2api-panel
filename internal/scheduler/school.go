@@ -21,13 +21,14 @@ const (
 	schoolPollGap   = 2500 * time.Millisecond
 )
 
-// RunSchoolNow 对所有可用账号执行开学季活动闭环（幂等：不在期/已领静默跳过）。
+// RunSchoolNow 对**所有**账号执行开学季活动闭环（幂等：不在期/已领静默跳过）。
+// 禁用账号同样参与（禁用只停选号，见 disabled.go）；无 AccessToken 的跳过。
 // 由 RunCheckinNow 末尾调用（活动是每日刷新，搭每日签到的车最自然）。
 func (s *Scheduler) RunSchoolNow() {
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
-			continue
-		}
+		// 不按 st.Disabled 跳过：开学季属增长任务，走 task 通道；面板单号动作
+		// （taskcenter.runSchoolQueued → RunSchoolAccountNow）也从不按 disabled 过滤，
+		// 自动排程同样不跳过才自洽。见 disabled.go。
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.AccessToken == "" {
 			continue

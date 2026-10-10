@@ -40,15 +40,13 @@ func travelDay(t time.Time) string {
 	return t.In(cstZone).Format("2006-01-02")
 }
 
-// RunTravelNow 立即对池内所有可用账号执行一趟旅行巡检。
-// 禁用账号跳过；401/查询失败只跳过该账号本轮（不强刷 token，交 22:00 keepalive）；
-// 账号间限速 travelAccountDelay。
+// RunTravelNow 立即对池内**所有**账号执行一趟旅行巡检。
+// 禁用账号同样参与（禁用只停选号，见 disabled.go）；401/查询失败只跳过该账号本轮
+// （不强刷 token，交 22:00 keepalive）；账号间限速 travelAccountDelay。
 func (s *Scheduler) RunTravelNow() {
 	first := true
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
-			continue
-		}
+		// 不按 st.Disabled 跳过：旅行属增长任务，走 growth 通道而非选号。见 disabled.go。
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshToken == "" {
 			continue

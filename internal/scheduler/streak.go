@@ -14,13 +14,12 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
 
-// RunStreakBonusNow 对所有可用账号执行连登兑换 + 抽奖（幂等：locked/无次数自动跳过）。
+// RunStreakBonusNow 对**所有**账号执行连登兑换 + 抽奖（幂等：locked/无次数自动跳过）。
+// 禁用账号同样参与（禁用只停选号，见 disabled.go）；无 AccessToken 的跳过。
 // 由签到排程（RunCheckinNow）末尾调用；也可面板手动触发。
 func (s *Scheduler) RunStreakBonusNow() {
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
-			continue
-		}
+		// 不按 st.Disabled 跳过：连登兑现属增长任务，走 growth/task 通道。见 disabled.go。
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.AccessToken == "" {
 			continue

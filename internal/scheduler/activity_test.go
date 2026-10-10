@@ -68,8 +68,9 @@ func TestRunActivityNowReportsEachAccount(t *testing.T) {
 	}
 }
 
-// TestRunActivityNowSkipsDisabledAndNoToken 禁用账号与无 token 账号跳过。
-func TestRunActivityNowSkipsDisabledAndNoToken(t *testing.T) {
+// TestRunActivityNowCoversDisabledButSkipsNoToken 禁用账号**照常上报**（禁用只停选号，
+// 见 disabled.go）；无 token 的账号才跳过 —— 断言的是行为：禁用号的请求确实发出去了。
+func TestRunActivityNowCoversDisabledButSkipsNoToken(t *testing.T) {
 	fastActivity(t)
 	stub := &reportStub{}
 	srv := httptest.NewServer(stub.handler())
@@ -85,8 +86,11 @@ func TestRunActivityNowSkipsDisabledAndNoToken(t *testing.T) {
 
 	s.RunActivityNow()
 
-	if n := stub.calls.Load(); n != 1 {
-		t.Errorf("report calls=%d want 1（仅 ok 账号）", n)
+	if n := stub.calls.Load(); n != 2 {
+		t.Errorf("report calls=%d want 2（ok + 禁用号各一次；notoken 跳过）", n)
+	}
+	if n := stub.uids.Load(); n != 2 {
+		t.Errorf("report with X-User-Id=%d want 2", n)
 	}
 }
 

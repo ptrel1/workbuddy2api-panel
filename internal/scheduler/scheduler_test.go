@@ -401,8 +401,13 @@ func TestRunBalanceRefreshNowUpdatesCreditsAndRevives(t *testing.T) {
 	if f.checkinCalls.Load() != 0 {
 		t.Errorf("balance refresh must not checkin, got %d calls", f.checkinCalls.Load())
 	}
-	// 禁用账号不参与：其 credits 保持 0（未被 UserResource 覆盖解冻）。
-	if st2, _ := p.Status("u2"); !st2.Disabled {
-		t.Errorf("u2 must stay disabled")
+	// 禁用账号照常刷新（禁用只停选号，见 disabled.go）：credits 取到上游新鲜值，
+	// 且**不**因 ReenableIfCredits 被解冻——池层对 disabled 的既有判定不变。
+	st2, _ := p.Status("u2")
+	if !st2.Disabled {
+		t.Errorf("u2 必须保持禁用（余额刷新不得解冻禁用账号）")
+	}
+	if st2.Credits != 777 {
+		t.Errorf("u2 credits=%d want 777（禁用账号也要真刷上游，不再降级用池内旧值）", st2.Credits)
 	}
 }

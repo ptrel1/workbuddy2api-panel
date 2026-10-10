@@ -292,15 +292,16 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 }
 
 // RunCheckinNow 立即对所有账号执行签到 + 余额刷新 + 解冻。
-// 冷却中的账号也参与（签到就是为了解冻它们）；禁用的跳过。
+// 冷却中的账号也参与（签到就是为了解冻它们）；**禁用账号同样参与**——
+// 禁用只停「选号」，签到是账号的恢复路径（见 disabled.go）。凭证缺失的
+// 账号由下方 RefreshToken 检查兜住，发不出请求。
 // 旅行已从签到剥离为独立排程（travel_hours），不再搭签到便车。
 // 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
 func (s *Scheduler) RunCheckinNow() {
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
-			continue
-		}
+		// 不按 st.Disabled 跳过：禁用只停选号（pool.healthy/healthyForModel 的
+		// 唯一影响面），签到属账号维护且是解冻恢复路径。理由与死锁分析见 disabled.go。
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshToken == "" {
 			continue
@@ -337,7 +338,8 @@ func (s *Scheduler) RunCheckinNow() {
 }
 
 // RunActivityNow 立即对池内所有可用账号执行一次对话活跃上报。
-// 禁用账号跳过；无 AccessToken 的跳过；账号间限速 activityAccountDelay。
+// **禁用账号同样参与**（禁用只停选号，见 disabled.go）；无 AccessToken 的跳过；
+// 账号间限速 activityAccountDelay。
 // 一条上报同时点亮 growth 连登 + 解锁 first_buddy 任务。
 // 上报成功后续跑 streak 自检（checkActivityStreak）：回读连登天数，发现
 // 「上报 200 但 streak 没涨」的静默丢弃（只读 oracle，不做重试）。
@@ -351,9 +353,8 @@ func (s *Scheduler) RunActivityNow() {
 func (s *Scheduler) runActivity(ctx context.Context) {
 	first := true
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
-			continue
-		}
+		// 不按 st.Disabled 跳过：活跃上报走 report 通道（与 chat 选号无关），
+		// 且它是连登/first_buddy 判据的来源。见 disabled.go。
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.AccessToken == "" {
 			continue
@@ -398,14 +399,15 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 }
 
 // RunKeepaliveNow 立即对所有账号刷新 token；session 死亡的自动禁用。
+// **禁用账号同样参与**（禁用只停选号，见 disabled.go）：保活是刷新凭证本身，
+// 停掉它会让禁用号的 token 走向彻底失效、再无恢复可能。
 // 12153 禁用走 Pool.NoteSessionDead 的**连续计数**语义：一次刷新失败不再立即杀号，
 // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
 // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
 func (s *Scheduler) RunKeepaliveNow() {
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
-			continue
-		}
+		// 不按 st.Disabled 跳过：保活=刷新凭证，禁用号更需要它（且它是误判号的
+		// 复活路径之一，ClearSessionDead/Revive 靠刷新成功驱动）。见 disabled.go。
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.RefreshToken == "" {
 			continue
@@ -460,27 +462,28 @@ func (s *Scheduler) RetryTransientDisabled() {
 	}
 }
 
-// RunBalanceRefreshNow 并发对所有非禁用账号查询余额并更新池内 credits。
+// RunBalanceRefreshNow 并发对**所有**账号（含禁用）查询余额并更新池内 credits。
 // 解冻语义与签到一致（ReenableIfCredits：余额 > 0 的冷却账号自动解冻），
 // 但不做签到、不刷新 token——只让"积分"这个观测量保持新鲜。
 // 供两类入口复用：后台周期任务（StartBalanceRefresh）与面板手动全量刷新。
+//
+// 禁用账号此前被降级为"只用池内已知 Credits 采样、不打上游"；现已与普通账号
+// 同一条路径（见 disabled.go）。为何必须真刷：余额是"为什么被禁/是否可恢复"的
+// 唯一权威观测量（如积分耗尽），用陈旧池内值画曲线看不出变化；且禁用是终态时，
+// 面板「解冻」后用户第一眼要的就是**当下**余额，而不是禁用前的旧水位。
+// 代价：DisableRelogin（封号/凭证失效）账号会各产生 1 次注定失败的上游调用
+// ——这是用户已知悉并明确选择接受的风险；凭证检查在下方兜住无凭证的号。
 func (s *Scheduler) RunBalanceRefreshNow() {
 	// 顺带处理「临时禁用到期」的账号（复用本循环的 5 分钟节拍，不新增定时器）。
 	s.RetryTransientDisabled()
 	var wg sync.WaitGroup
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
-			// 禁用账号不刷新（已不参与轮转），但**仍采样一个历史水位**：
-			// 禁用≠注销，保留曲线才能看出"为什么被禁"（如积分耗尽）。
-			// 采样失败静默跳过——禁用账号查询失败属预期，不打日志噪音。
-			if s.cfg.Balance != nil && st.Credits > 0 {
-				s.cfg.Balance.SetName(st.UID, st.Nickname)
-				if s.cfg.Balance.Add(st.UID, st.Credits) {
-					log.Printf("balance-sample %s: credits=%d (disabled)", st.UID, st.Credits)
-				}
-			}
-			continue
-		}
+		// 不按 st.Disabled 跳过：禁用只停选号，余额属账号维护。见 disabled.go。
+		//
+		// 此处**刻意不检查 RefreshToken/AccessToken**（与 7 处排程点不同）：
+		// 原实现只判 a == nil，本次不放行新增检查，否则会误伤"refresh_token 为空
+		// 但 access_token 仍有几小时寿命"的号，改变既有行为。凭证失效的号最多
+		// 让这次查询失败（唯一代价是一次请求），故不为它改变原有口径。
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil {
 			continue
