@@ -877,9 +877,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.toks, _ = stats.Tokens()
 			// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价，
 			// 供下次选号把免费/便宜的号排在前面。
+			// ⚠️ 用 curModel 而非 bareModel：记的是**本次实际发生的扣费**，而降级后
+			// 实际打的是等价模型（curModel）—— 记成原模型会把 v4 的费用挂到 v4.1 名下，
+			// 污染 modelCostOf 台账，进而污染 costTier 分层与 credit_floor 判据。
 			if credit, ok := stats.Credit(); ok {
 				if total, tok := stats.TotalTokens(); tok && total > 0 {
-					h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
+					h.cfg.Pool.NoteModelCost(acct.UID, curModel, credit, total)
 				}
 			}
 			rc.Close()
@@ -899,8 +902,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
 		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
+		// ⚠️ 同流式路径：用 curModel（实际扣费发生在等价模型上）。
 		if credit, total, ok := usageCreditTotal(resp); ok {
-			h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
+			h.cfg.Pool.NoteModelCost(acct.UID, curModel, credit, total)
 		}
 		return
 	}

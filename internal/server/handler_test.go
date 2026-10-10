@@ -33,6 +33,12 @@ const sseOK = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\"
 	"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n" +
 	"data: [DONE]\n\n"
 
+// sseOKWithUsage 同 sseOK，但末帧 usage 带 credit —— 供成本台账（NoteModelCost）相关测试用。
+// credit=17 / total_tokens=100 → 单价 170 credits/1K。
+const sseOKWithUsage = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"你好\"}}]}\n\n" +
+	"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":50,\"completion_tokens\":50,\"total_tokens\":100,\"credit\":17}}\n\n" +
+	"data: [DONE]\n\n"
+
 // newFakeUpstream 返回一个 ChatStream 走 fake 的 upstream.Client。
 // fake 依据 Authorization 头决定行为。
 func newFakeUpstream(t *testing.T, behavior func(auth string) (status int, body string, isStream bool)) *upstream.Client {
@@ -1851,5 +1857,52 @@ func TestModelFallbackWhenNoAccountForModel(t *testing.T) {
 	}
 	if len(seen) == 0 || seen[0] != "deepseek-v4-flash" {
 		t.Fatalf("上游应直接收到 v4（v4.1 全池不可选），实际 seen=%v", seen)
+	}
+}
+
+// TestModelFallbackCostLedgerUsesActualModel 降级后**成本账本必须记在实际模型**名下。
+//
+// 为什么必须钉住：`NoteModelCost` 记的是「本次实际发生的扣费」，而降级后实际打的是
+// 等价模型（curModel）。若误用 bareModel（原模型），会把 v4 的费用挂到 v4.1 名下 →
+// 污染 modelCostOf 台账 → 进而污染 costTier 分层（"该模型免不免费"）与 credit_floor 判据。
+//
+// 这是我自己实现降级时漏掉的一处（commit message 写了要分开，代码却仍用 bareModel），
+// 由后续代码分析发现 —— 故补测试防回归。
+func TestModelFallbackCostLedgerUsesActualModel(t *testing.T) {
+	reset := time.Now().Add(5 * time.Minute)
+	ts := reset.In(upstream.SoftRateResetLoc()).Format("2006-01-02 15:04:05")
+	var seen []string
+	// v4.1 返回 6004；v4 成功并带 usage（credit=17, total=100 → 单价 170/1k）
+	up := modelAwareUpstream(t, &seen, func(model string) (int, string) {
+		if model == "deepseek-v4.1-flash" {
+			return 429, `{"code":6004,"msg":"将在 ` + ts + ` UTC+8 重置"}`
+		}
+		return 200, sseOKWithUsage
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p.SetCredits("u1", 10000, 0)
+	h := NewHandler(Config{
+		Pool: p, Upstream: up,
+		ModelFallback: func() map[string]string {
+			return map[string]string{"deepseek-v4.1-flash": "deepseek-v4-flash"}
+		},
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"deepseek-v4.1-flash","messages":[]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	st, _ := p.Status("u1")
+	byModel := map[string]float64{}
+	for _, mc := range st.ModelCosts {
+		byModel[mc.Model] = mc.CostPer1k
+	}
+	// 关键断言：成本应记在 **v4**（实际用的）名下，而不是 v4.1（请求的）。
+	if _, ok := byModel["deepseek-v4.1-flash"]; ok {
+		t.Errorf("成本被误记到原模型 v4.1 名下（应用 curModel=v4）：%+v", st.ModelCosts)
+	}
+	if _, ok := byModel["deepseek-v4-flash"]; !ok {
+		t.Errorf("成本未记在实际模型 v4 名下：%+v", st.ModelCosts)
 	}
 }
