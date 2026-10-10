@@ -228,9 +228,13 @@ function renderAccounts(list) {
       // 禁用必须说明「该怎么办」—— 三种情况动作完全不同（revive.go 的 DisableInfo）：
       // 人工禁用 → 点解冻；临时禁用 → 等自动重试；凭证失效 → 需重新登录。
       // 只给"已禁用"用户不知道该干什么。
+      // ⭐ 完整提示放 title（悬停）而非行内：状态列窄，长 hint（如"人工禁用·在面板
+      // 点「解冻」恢复 manual disable (panel)"）会把行撑到 5 行（实测截图）。
+      // 行内只留「禁用原因的短形态」—— reason 去掉括号尾巴（那是最长的部分）。
       const dh = s.disable_hint || {};
-      tag = '<span class="tag bad">已禁用</span>' +
-        (dh.hint ? '<div class="dhint">' + esc(dh.hint) + '</div>' : '');
+      const reasonShort = String(s.reason || '').replace(/\s*\([^)]*\)\s*$/, '');
+      tag = '<span class="tag bad" title="' + esc((dh.hint || '') + (s.reason ? ' · ' + s.reason : '')) + '">已禁用</span>' +
+        (dh.hint ? '<div class="dhint" title="' + esc(dh.hint + (s.reason ? ' · ' + s.reason : '')) + '">' + esc(reasonShort || dh.hint) + '</div>' : '');
     }
     // 暂停选号（paused）：与 disabled 并列判否（都退出选号），但**文案与提示不同** ——
     // 这正是引入该状态的目的：让位的人看到"已暂停选号 / 照常保号"，
@@ -267,23 +271,28 @@ function renderAccounts(list) {
     const rlm = s.rate_limited_models || [];
     if (rlm.length && !s.disabled) {
       // 降级路由表（overview 的 model_fallback）：限流的模型若配了等价模型，
-      // 标注「已路由至 X」—— 否则用户看到"v4.1 限流"会以为服务断了，
+      // 标注「⤳ 已路由至 X」—— 否则用户看到"v4.1 限流"会以为服务断了，
       // 实际请求已被自动改道到等价模型（用户实测反馈要求可见）。
       const fb = (overviewData && overviewData.model_fallback) || {};
       const rlmLines = rlm.map(r => {
         // reset_at 是上游权威重置墙钟；until 是本地截断后的截止。
-        // 展示 reset_at 优先（那才是"真正什么时候能再用"）。
+        // ⭐ 时间只显示 **HH:MM**（今天的话）—— 状态列窄，"10/11 " 前缀把
+        // 模型名挤成竖条（实测截图：deepseek-v4.1-flash 在连字符处断成 5 行）。
+        // 完整日期放行 title（悬停可见），不占行内宽度。
         const at = r.reset_at || r.until;
         const t = at ? new Date(at) : null;
-        const when = t && !isNaN(t)
+        const when = t && !isNaN(t) ? t.toTimeString().slice(0, 5) : '?';
+        const whenFull = t && !isNaN(t)
           ? t.toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
           : '?';
         // 等价模型查找：rlm 的 model 通常是**裸名**，但配置可能带域前缀，
         // 故两种写法都查一遍（先原样、再剥前缀后的裸名）。
         const bare = String(r.model || '').replace(/^[a-z]+:/, '');
         const alt = fb[r.model] || fb[bare] || '';
-        const route = alt ? ' <span class="fb">已路由至 ' + esc(alt) + '</span>' : '';
-        return esc(r.model || '?') + ' → ' + esc(when) + route;
+        const route = alt ? '<span class="fb">⤳ 已路由至 ' + esc(alt) + '</span>' : '';
+        const name = esc(r.model || '?');
+        return '<span class="ln" title="' + esc(r.model || '?') + ' 恢复于 ' + esc(whenFull) +
+          (alt ? '；已自动改道到 ' + esc(alt) : '') + '">' + name + ' <span class="tm">' + when + '</span> ' + route + '</span>';
       }).join('<br>');
       tag += '<div class="rlm" title="该模型被上游限流；同账号其他模型不受影响。若已配降级路由（model_fallback），请求会自动改道到等价模型，无需人工干预。">' +
         '<b>⛔ 模型限流</b><br>' + rlmLines + '</div>';
