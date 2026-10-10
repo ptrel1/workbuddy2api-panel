@@ -31,7 +31,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "2.5.0-panel"
+const appVersion = "2.6.0-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -231,6 +231,7 @@ func main() {
 		APIKey:               cfg.APIKey,
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
+		ModelFallback:        cfg.Pool.ModelFallback,
 	})
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
@@ -255,6 +256,8 @@ func main() {
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
 		ConfigPath: *cfgPath,
+		// 降级路由表：面板据此在限流提示里标注「已路由至 <等价模型>」。
+		ModelFallback: func() map[string]string { return live.Load().ModelFallback },
 		LoadConfig: func() (any, error) {
 			return Load(*cfgPath)
 		},
@@ -280,6 +283,8 @@ func main() {
 		PromptText:   cfg.PromptText,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
+		// 模型降级路由表：读 live 快照（支持面板热更，改完即生效、无需重启）。
+		ModelFallback: func() map[string]string { return live.Load().ModelFallback },
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -378,6 +383,8 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		APIKey:               newCfg.APIKey,
 		SoftCooldown:         newCfg.SoftRateDur,
 		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
+		// 传新 map（非就地改）：map 是引用类型，就地改会与并发读的 handler 竞态。
+		ModelFallback: newCfg.Pool.ModelFallback,
 	})
 	up.SanitizeFingerprints = newCfg.Features.SanitizeBlacklistFingerprints
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)

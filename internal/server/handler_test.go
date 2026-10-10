@@ -1584,3 +1584,272 @@ func TestStatusExposesCostExplore(t *testing.T) {
 		t.Errorf("关停后 interval_seconds=%v want 0", ce["interval_seconds"])
 	}
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 模型降级路由（pool.model_fallback）
+// ─────────────────────────────────────────────────────────────────────────────
+
+// modelAwareUpstream 构造一个能**看到请求 body 里的 model** 的 fake 上游。
+// 现有 newFakeUpstream 的 behavior 只收 auth 字符串，无法断言"上游实际收到的
+// 模型名变了"——而那是降级功能的核心验收点。
+// perModel 的 key 是上游收到的 model 名，返回 (status, body)。
+func modelAwareUpstream(t *testing.T, seen *[]string, perModel func(model string) (int, string)) *upstream.Client {
+	t.Helper()
+	return &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			b, _ := io.ReadAll(r.Body)
+			var req struct {
+				Model string `json:"model"`
+			}
+			_ = json.Unmarshal(b, &req)
+			if seen != nil {
+				*seen = append(*seen, req.Model)
+			}
+			status, body := perModel(req.Model)
+			ct := "application/json"
+			if strings.Contains(body, "data:") {
+				ct = "text/event-stream"
+			}
+			return &http.Response{
+				StatusCode: status,
+				Header:     http.Header{"Content-Type": []string{ct}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+}
+
+// TestModelFallbackOn6004 核心行为：账号在 v4.1 上被 6004 限流 → **同账号**改用等价
+// 模型 v4 重试（不换号），且成功返回。
+func TestModelFallbackOn6004(t *testing.T) {
+	reset := time.Now().Add(5 * time.Minute)
+	ts := reset.In(upstream.SoftRateResetLoc()).Format("2006-01-02 15:04:05")
+	var seen []string
+	up := modelAwareUpstream(t, &seen, func(model string) (int, string) {
+		if model == "deepseek-v4.1-flash" {
+			return 429, `{"code":6004,"msg":"将在 ` + ts + ` UTC+8 重置"}`
+		}
+		return 200, sseOK
+	})
+	// 单账号池：排除"靠换号成功"的可能，证明成功**只可能**来自同账号换模型。
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p.SetCredits("u1", 1000, 0)
+	h := NewHandler(Config{
+		Pool: p, Upstream: up,
+		ModelFallback: func() map[string]string {
+			return map[string]string{"deepseek-v4.1-flash": "deepseek-v4-flash"}
+		},
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"deepseek-v4.1-flash","messages":[]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s（应降级到 v4 后成功）", rec.Code, rec.Body)
+	}
+	// 断言上游**依次**收到 v4.1 然后 v4 —— 这是降级发生的直接证据。
+	if len(seen) != 2 || seen[0] != "deepseek-v4.1-flash" || seen[1] != "deepseek-v4-flash" {
+		t.Fatalf("上游收到的模型序列=%v，want [deepseek-v4.1-flash deepseek-v4-flash]", seen)
+	}
+	// 冷却应记在**原模型**（v4.1）上，而不是 v4。
+	st, _ := p.Status("u1")
+	if len(st.RateLimitedModels) != 1 || st.RateLimitedModels[0].Model != "deepseek-v4.1-flash" {
+		t.Errorf("冷却台账应只含 v4.1（原模型），得 %+v", st.RateLimitedModels)
+	}
+}
+
+// TestModelFallbackOnlyOn6004 非 6004 错误**不得**降级。
+// 尤其 11102（该后端无此模型）：换模型也救不了，降级纯属浪费一次上游调用。
+func TestModelFallbackOnlyOn6004(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"11102 无此模型", 400, `{"code":11102,"msg":"service info not found"}`},
+		{"11101 bad params", 400, `{"code":11101,"msg":"Unmarshal chat params failed"}`},
+		{"普通 429（非 6004）", 429, `{"code":0,"msg":"too many requests"}`},
+		{"500 上游故障", 500, `{"code":0,"msg":"internal error"}`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var seen []string
+			up := modelAwareUpstream(t, &seen, func(model string) (int, string) {
+				return c.status, c.body
+			})
+			p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+			p.SetCredits("u1", 1000, 0)
+			h := NewHandler(Config{
+				Pool: p, Upstream: up,
+				ModelFallback: func() map[string]string {
+					return map[string]string{"deepseek-v4.1-flash": "deepseek-v4-flash"}
+				},
+			})
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+				strings.NewReader(`{"model":"deepseek-v4.1-flash","messages":[]}`)))
+			for _, m := range seen {
+				if m == "deepseek-v4-flash" {
+					t.Fatalf("非 6004 错误却降级了！上游收到的模型=%v", seen)
+				}
+			}
+		})
+	}
+}
+
+// TestModelFallbackNoConfigKeepsOldBehavior 未配置 model_fallback 时行为与改动前一致
+// （零回归）：6004 只换号、不降级。
+func TestModelFallbackNoConfigKeepsOldBehavior(t *testing.T) {
+	reset := time.Now().Add(5 * time.Minute)
+	ts := reset.In(upstream.SoftRateResetLoc()).Format("2006-01-02 15:04:05")
+	var seen []string
+	up := modelAwareUpstream(t, &seen, func(model string) (int, string) {
+		if model == "deepseek-v4.1-flash" {
+			return 429, `{"code":6004,"msg":"将在 ` + ts + ` UTC+8 重置"}`
+		}
+		return 200, sseOK
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "u2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("u1", 2000, 0)
+	p.SetCredits("u2", 1000, 0)
+	h := NewHandler(Config{Pool: p, Upstream: up}) // 不注入 ModelFallback
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"deepseek-v4.1-flash","messages":[]}`)))
+	// 未配置降级 → 所有请求都必须是原模型（靠换号成功）。
+	for _, m := range seen {
+		if m != "deepseek-v4.1-flash" {
+			t.Errorf("未配置降级却改了模型：上游收到 %v", seen)
+		}
+	}
+}
+
+// TestModelFallbackNoLoop 降级只发生一次：等价模型也 6004 时不得 A→B→A 循环。
+func TestModelFallbackNoLoop(t *testing.T) {
+	reset := time.Now().Add(5 * time.Minute)
+	ts := reset.In(upstream.SoftRateResetLoc()).Format("2006-01-02 15:04:05")
+	var seen []string
+	up := modelAwareUpstream(t, &seen, func(model string) (int, string) {
+		// 两个模型都 6004 → 降级也无解
+		return 429, `{"code":6004,"msg":"将在 ` + ts + ` UTC+8 重置"}`
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p.SetCredits("u1", 1000, 0)
+	h := NewHandler(Config{
+		Pool: p, Upstream: up,
+		ModelFallback: func() map[string]string {
+			return map[string]string{"deepseek-v4.1-flash": "deepseek-v4-flash"}
+		},
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"deepseek-v4.1-flash","messages":[]}`)))
+	// 关键：v4 只应被尝试一次（不得 v4.1→v4→v4.1→v4 反复）。
+	n := 0
+	for _, m := range seen {
+		if m == "deepseek-v4-flash" {
+			n++
+		}
+	}
+	if n > 1 {
+		t.Errorf("降级目标被尝试 %d 次（应 ≤1，防 A→B→A 循环）：%v", n, seen)
+	}
+}
+
+// TestModelFallbackReturnsToOriginalAfterCooldown ⭐ 用户明确要求：
+// 「限流解除后就自动回 v4.1」—— 降级必须是**本次请求的临时改道**，不写持久状态。
+//
+// 做法：先让 v4.1 被 6004（触发降级），随后**清掉冷却**（模拟限流解除），
+// 再发一次请求 → 必须直接用 v4.1，不再降级。
+func TestModelFallbackReturnsToOriginalAfterCooldown(t *testing.T) {
+	reset := time.Now().Add(5 * time.Minute)
+	ts := reset.In(upstream.SoftRateResetLoc()).Format("2006-01-02 15:04:05")
+	var seen []string
+	limited := true // 可切换：模拟限流生效/解除
+	up := modelAwareUpstream(t, &seen, func(model string) (int, string) {
+		if limited && model == "deepseek-v4.1-flash" {
+			return 429, `{"code":6004,"msg":"将在 ` + ts + ` UTC+8 重置"}`
+		}
+		return 200, sseOK
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p.SetCredits("u1", 1000, 0)
+	h := NewHandler(Config{
+		Pool: p, Upstream: up,
+		ModelFallback: func() map[string]string {
+			return map[string]string{"deepseek-v4.1-flash": "deepseek-v4-flash"}
+		},
+	})
+
+	// 第一次：限流中 → 降级到 v4
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"deepseek-v4.1-flash","messages":[]}`)))
+	if len(seen) != 2 || seen[1] != "deepseek-v4-flash" {
+		t.Fatalf("第一次请求应降级到 v4，实际 seen=%v", seen)
+	}
+
+	// 模拟「限流解除」（6004 冷却到期）。
+	// ⚠️ 两个 API 都不能用：
+	//   - BlockModelClear **只清 11102 前缀**条目（cooldown.go:173），对 6004 无效
+	//     （刻意设计：11102 负缓存 vs 6004 限流语义不同）；
+	//   - CooldownSoftForModel 内部做 min(resetAt, now+softRateMax)，传过去时间会被
+	//     算成未来，清不掉。
+	// 正确做法：Revive —— 它无条件清 modelCooldowns（state.go:89），等价于"冷却彻底解除"。
+	p.Revive("u1")
+	limited = false
+	seen = nil
+
+	// 第二次：冷却已解除 → 必须**直接用 v4.1**（证明降级没留持久状态）
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"deepseek-v4.1-flash","messages":[]}`)))
+	if len(seen) == 0 || seen[0] != "deepseek-v4.1-flash" {
+		t.Fatalf("限流解除后应直接用回 v4.1，实际 seen=%v", seen)
+	}
+	for _, m := range seen {
+		if m == "deepseek-v4-flash" {
+			t.Errorf("限流已解除却仍在降级（降级留了持久状态？）：%v", seen)
+		}
+	}
+}
+
+// TestModelFallbackWhenNoAccountForModel 选号为空时也要降级。
+//
+// 场景（真实且常见）：**全池所有账号**的 v4.1 都在 6004 冷却中。
+// 此时按 v4.1 选号必然为空 —— 若不给降级机会就直接 503，
+// 恰恰在最需要降级（全池都被限流）的时候失效。
+//
+// 这个缺口是写测试时诊断出来的：首版只在「已选中账号、该账号返回 6004」时降级，
+// 覆盖不到"选号阶段就选不出来"的路径。
+func TestModelFallbackWhenNoAccountForModel(t *testing.T) {
+	// 预先把唯一账号的 v4.1 打成冷却（模拟"之前已被限流"）。
+	reset := time.Now().Add(5 * time.Minute)
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	p.SetCredits("u1", 1000, 0)
+	p.CooldownSoftForModel("u1", 600*time.Second, reset, "deepseek-v4.1-flash", "6004 model rate limit")
+
+	var seen []string
+	up := modelAwareUpstream(t, &seen, func(model string) (int, string) {
+		return 200, sseOK // 等价模型可用
+	})
+	h := NewHandler(Config{
+		Pool: p, Upstream: up,
+		ModelFallback: func() map[string]string {
+			return map[string]string{"deepseek-v4.1-flash": "deepseek-v4-flash"}
+		},
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"deepseek-v4.1-flash","messages":[]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s（全池 v4.1 冷却时应降级到 v4，而非 503）", rec.Code, rec.Body)
+	}
+	if len(seen) == 0 || seen[0] != "deepseek-v4-flash" {
+		t.Fatalf("上游应直接收到 v4（v4.1 全池不可选），实际 seen=%v", seen)
+	}
+}

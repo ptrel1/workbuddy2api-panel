@@ -145,6 +145,24 @@ type Config struct {
 		// ⚠️ 与 ExpiringSoon 不同：**"0" 是有效值**（显式关停探索），仅**空字符串**才回落
 		// 默认 30m。若沿用"0=禁用/缺省"的写法，"0" 会被当成没配而静默启用。
 		CostExploreInterval string `json:"cost_explore_interval"`
+
+		// ModelFallback 模型降级路由表：key = 客户端请求的模型，value = 限流时改用的
+		// 等价模型（如 {"deepseek-v4.1-flash": "deepseek-v4-flash"}）。
+		//
+		// 背景：同一账号的某模型被上游 6004 模型级限流后，**同账号**换用等价模型重试，
+		// 而不是只能换号——因为等价模型（如 v4.1-flash 与 v4-flash）实际是同一底层能力，
+		// 用户不必感知。
+		//
+		// ⚠️ 计费提示：等价模型未必同价（实测 v4.1-flash 倍率 x0.11、v4-flash x0.17，
+		// **降级后成本上升约 55%**）。这是"可用性优先"的取舍，用户已知悉。
+		//
+		// ⚠️ 只对 **6004 模型级限流**生效：11102（该后端无此模型）换模型也救不了，
+		// 封号/鉴权/5xx 同理。降级是**本次请求的临时改道，不写任何持久状态**——
+		// 6004 冷却到期后自动回原模型（见 pool.modelCooled 的时限判定）。
+		//
+		// 缺省空 map = 不降级（对老配置零影响）。key 用**裸模型名**（不带 cn:/global:
+		// 前缀），因为前缀是网关侧路由协议、不参与模型身份。
+		ModelFallback map[string]string `json:"model_fallback"`
 	} `json:"pool"`
 
 	SessionSticky struct {

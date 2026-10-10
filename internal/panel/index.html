@@ -494,6 +494,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     background: var(--warn-soft); border-left: 2px solid var(--warn);
     font-size: 11px; line-height: 1.55; color: var(--ink-2); }
   .rlm b { color: var(--warn); font-weight: 600; }
+  /* .fb 降级标注（「已路由至 X」）：用 ok 色 —— 与「限流」的 warn 形成对照，
+     表达"虽然限流了，但已被自动接住"。这是好消息，不该用告警色。 */
+  .rlm .fb { color: var(--ok); font-weight: 550; }
 
   /* 诊断区（表格下方）：接近性原则 —— 组内小间距、与主内容大间距。
      原先三块用同样的 margin-top:10px 且下边距 0，导致

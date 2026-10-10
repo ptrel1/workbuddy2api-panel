@@ -18,6 +18,13 @@ type Snapshot struct {
 	APIKey               string        // 网关/面板共同鉴权密钥；空 = 不鉴权
 	SoftCooldown         time.Duration // 429 软冷却基数（<=0 时调用方回退内置默认）
 	SanitizeFingerprints bool          // 出站请求体指纹脱敏
+	// ModelFallback 模型降级路由表（pool.model_fallback）：6004 模型级限流时改用的
+	// 等价模型。热更：面板保存配置后立即生效，无需重启。
+	//
+	// ⚠️ map 是**引用类型**：Store 的是浅拷贝，故写入方（main 的 ApplyConfig）
+	// 必须**传入新 map 而非就地修改**旧 map —— 否则与并发读的 handler 竞态。
+	// 读方（handler）只读不写，故共享安全。
+	ModelFallback map[string]string
 }
 
 // Holder 原子持有当前快照。

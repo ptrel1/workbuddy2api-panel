@@ -266,6 +266,10 @@ function renderAccounts(list) {
     // 首版把它嵌在 `else if (cool > 0)` 里 → **模型级限流永远不会显示**。
     const rlm = s.rate_limited_models || [];
     if (rlm.length && !s.disabled) {
+      // 降级路由表（overview 的 model_fallback）：限流的模型若配了等价模型，
+      // 标注「已路由至 X」—— 否则用户看到"v4.1 限流"会以为服务断了，
+      // 实际请求已被自动改道到等价模型（用户实测反馈要求可见）。
+      const fb = (overviewData && overviewData.model_fallback) || {};
       const rlmLines = rlm.map(r => {
         // reset_at 是上游权威重置墙钟；until 是本地截断后的截止。
         // 展示 reset_at 优先（那才是"真正什么时候能再用"）。
@@ -274,9 +278,14 @@ function renderAccounts(list) {
         const when = t && !isNaN(t)
           ? t.toLocaleString('zh-CN', { hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
           : '?';
-        return esc(r.model || '?') + ' → ' + esc(when);
+        // 等价模型查找：rlm 的 model 通常是**裸名**，但配置可能带域前缀，
+        // 故两种写法都查一遍（先原样、再剥前缀后的裸名）。
+        const bare = String(r.model || '').replace(/^[a-z]+:/, '');
+        const alt = fb[r.model] || fb[bare] || '';
+        const route = alt ? ' <span class="fb">已路由至 ' + esc(alt) + '</span>' : '';
+        return esc(r.model || '?') + ' → ' + esc(when) + route;
       }).join('<br>');
-      tag += '<div class="rlm" title="该模型被上游限流；同账号其他模型不受影响，可切模型绕开">' +
+      tag += '<div class="rlm" title="该模型被上游限流；同账号其他模型不受影响。若已配降级路由（model_fallback），请求会自动改道到等价模型，无需人工干预。">' +
         '<b>⛔ 模型限流</b><br>' + rlmLines + '</div>';
     }
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';

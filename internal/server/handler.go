@@ -38,6 +38,11 @@ type Config struct {
 	SoftCooldown time.Duration // 429/限流文案软冷却基数，默认 600s（连续触发指数退避，封顶 soft_rate_max）
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
 
+	// ModelFallback 模型降级路由表（pool.model_fallback）：key = 请求模型（裸名或带域
+	// 前缀均可），value = 6004 限流时改用的等价模型。空/nil = 不降级（老行为）。
+	// 只对 6004 模型级限流生效；降级不写持久状态，冷却到期自动回原模型。
+	ModelFallback func() map[string]string
+
 	// Panel 管理面板 handler（可选；nil = 不挂载）。挂载在 /panel/ 前缀下，
 	// 面板自带 Bearer 鉴权（同一 api_key）与内嵌静态资源，主路由只做转发。
 	Panel http.Handler
@@ -601,6 +606,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// outbound model 名重写为 bareModel（D6）：realm 前缀是网关侧路由协议，
 	// 上游不认前缀（global 账号也请求裸模型名）。裸名时 bareModel==peek.Model 恒等。
+	//
+	// 注：这里只做「剥前缀」；循环内还会按 curModel 再重写一次（模型降级时目标不同）。
+	// 两次都幂等（rewriteModel 是纯替换），故不必合并。
 	if bareModel != peek.Model {
 		body = rewriteModel(body, bareModel)
 	}
@@ -627,11 +635,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
+	// 模型降级（pool.model_fallback）：curModel 是**本轮实际使用**的模型，初值 = 客户端
+	// 请求的 bareModel；当某账号在本轮模型上被 6004 模型级限流、且配置了等价模型时，
+	// 本账号换用等价模型重试（curModel 改指向等价模型），随后重置回 bareModel。
+	//
+	// ⚠️ 为什么必须与 bareModel 分开：降级后二者指向**不同模型**，而它们要喂给不同用途 ——
+	//   - **实际用途**（选号 / 出站 body 重写 / 成本记账 / 提示语）→ curModel
+	//   - **冷却记账**（applyErrorPolicy 的 6004 分支）→ bareModel（**限流的是原模型**！
+	//     若误记成等价模型，会把本来好好的等价模型也冷却掉，降级就白做了）
+	curModel := bareModel
+	// fallbackTried 记录本请求**已试过的降级目标**，防 A→B→A 循环。
+	// 与 tried（按账号去重）正交：降级是「同账号换模型」，故需独立追踪。
+	fallbackTried := map[string]bool{}
+
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
-			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
+			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, curModel)
 			if acct == nil || (realm != "" && acct.Realm() != realm) {
 				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑，
 				// 本次回落普通轮换。
@@ -642,14 +663,32 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if acct == nil {
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。
-			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
+			acct = h.cfg.Pool.PickExcludingForRealm(tried, curModel, realm)
 		}
 		if acct == nil {
+			// ── 选号为空时的降级兜底 ────────────────────────────────────────
+			// 场景：**所有**账号的 curModel 都在 6004 冷却中（如全池 v4.1 都被限流）。
+			// 此时上面按 curModel 选号必然为空，但等价模型可能还有号可用 ——
+			// 若不给降级机会就直接 503，恰恰在最需要降级时失效。
+			//
+			// 只在「尚未试过该等价模型」时改道；改道后本轮重新选号（continue 复用
+			// 同一套选号/租约逻辑，不另写一份）。
+			if alt := h.fallbackModel(curModel); alt != "" && !fallbackTried[alt] {
+				fallbackTried[alt] = true
+				log.Printf("model fallback (no account for %s): %s -> %s", curModel, curModel, alt)
+				curModel = alt
+				continue
+			}
 			st.status = http.StatusServiceUnavailable
 			break
 		}
 		st.uid = acct.UID
 		tried[acct.UID] = true
+		// 出站 body 的 model 名随**本轮实际模型**走（降级后即等价模型）。
+		// 循环内每轮都判：curModel 变了必须重写（故不能只在循环外判一次）。
+		if curModel != peek.Model {
+			body = rewriteModel(body, curModel)
+		}
 
 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
 		if !h.cfg.Pool.Acquire(acct.UID) {
@@ -772,6 +811,34 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
 			// 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
+
+			// ── 模型降级路由（pool.model_fallback）────────────────────────────
+			// 触发条件**严格限定为 6004 模型级限流**：等价模型能救的只有"这个模型被限了"，
+			// 而 11102（该后端无此模型）换模型同样没有、封号/鉴权/5xx 与模型无关。
+			//
+			// 动作：**同一账号**改用等价模型重试（不换号）。为什么优先于换号：
+			// 等价模型是同一底层能力（如 v4.1-flash 与 v4-flash），换模型比换号代价小
+			// ——换号要重新建立会话/可能撞别的号限流，换模型直接复用当前账号。
+			//
+			// ⚠️ 不写任何持久状态：降级只是**本次请求的临时改道**。6004 冷却到期后
+			// modelCooled 自然失效，下一个请求自动回到原模型（用户明确要求"限流解除后
+			// 自动回 v4.1"）。若在此写"该账号以后用 v4"之类的标记，就再也回不去了。
+			if kind == upstream.ErrSoftRate && upstream.IsModelRateLimit(string(respBody)) {
+				if alt := h.fallbackModel(curModel); alt != "" && !fallbackTried[alt] {
+					// 记一次「已试过该降级目标」防 A→B→A；并冷却**原模型**（不是 alt）。
+					// 冷却原模型是必须的：否则下一轮选号仍会选到它、再撞一次 6004。
+					fallbackTried[alt] = true
+					h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
+					releaseHeld()
+					delete(tried, acct.UID) // 同账号换模型：该账号应可再被选（用新模型）
+					// 让当前账号的**原模型**冷却后，curModel 指向等价模型并重试。
+					curModel = alt
+					log.Printf("model fallback: %s -> %s (6004 model rate limit, uid=%s)",
+						bareModel, alt, acct.UID)
+					continue
+				}
+			}
+
 			h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 			fail(acct.UID)
 			// WAF IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义）：
@@ -1110,6 +1177,38 @@ func hasImagePart(body []byte) bool {
 // 加一次 FetchModels 网络调用既拖慢错误响应、又污染上游调用语义（错误风暴时放大
 // 请求量——与 WAF IP fail-fast 的「不放大请求量」哲学相悖）。缓存冷（最近 1h 未
 // 拉过）→ ModelInCatalog=false，11133 退中性 hint（宁缺勿滥，不编造能力事实）。
+// fallbackModel 查「模型降级路由表」，返回 6004 限流时应改用的等价模型；
+// 无配置/无该模型条目时返回空串（调用方据此不降级）。
+//
+// 查找顺序：先按**原样**查（兼容配置里写带域前缀的键），再按**剥前缀后的裸名**查
+// （rlm 台账与出站 body 用的都是裸名，是最常见写法）。两种都支持是为了避免
+// "配置写了 cn:xxx、代码按裸名查"这类静默不生效（本库有过同类坑）。
+//
+// 返回空串也覆盖"降级目标 == 当前模型"的自环配置（防 A→A 死循环）。
+func (h *Handler) fallbackModel(curModel string) string {
+	if h.cfg.ModelFallback == nil || curModel == "" {
+		return ""
+	}
+	m := h.cfg.ModelFallback()
+	if len(m) == 0 {
+		return ""
+	}
+	alt := m[curModel]
+	if alt == "" {
+		// 剥域前缀后再查（cn:/global: 是网关侧路由协议，不参与模型身份）。
+		bare := curModel
+		if i := strings.IndexByte(bare, ':'); i >= 0 {
+			bare = bare[i+1:]
+		}
+		alt = m[bare]
+	}
+	if alt == "" || alt == curModel {
+		return ""
+	}
+	return alt
+}
+
+// hintContext 构造提示语上下文（模型能力/是否支持图片，供 hint 文案判断）。
 func (h *Handler) hintContext(bareModel string, hasImage bool) upstream.HintContext {
 	ctx := upstream.HintContext{Model: bareModel, HasImage: hasImage}
 	if bareModel == "" {

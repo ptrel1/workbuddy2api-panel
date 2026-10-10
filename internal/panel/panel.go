@@ -63,6 +63,14 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+
+	// ModelFallback 返回「模型降级路由表」（pool.model_fallback 的当前值），
+	// 供面板在限流提示里标注「已路由至 <等价模型>」——让运维一眼看出
+	// "这个模型虽然限流了，但请求已被自动改道，服务没断"。
+	//
+	// 为什么用回调而非直接传 map：配置**可热更**（面板改完即生效），回调每次读
+	// 最新值，避免面板持有启动时的旧快照。nil = 未启用降级（面板不显示该标注）。
+	ModelFallback func() map[string]string
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -480,7 +488,21 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"disabled":        disabled,
 		"in_flight_full":  inFlightFull,
 		"accounts":        p.cfg.Pool.List(),
+		// 模型降级路由表：前端据此在限流提示里标注「已路由至 <等价模型>」。
+		// 空/未配置 = 不显示该标注（老行为）。
+		"model_fallback": p.modelFallback(),
 	})
+}
+
+// modelFallback 返回降级路由表的当前快照（未注入回调时返回空 map，前端自然不显示）。
+func (p *Panel) modelFallback() map[string]string {
+	if p.cfg.ModelFallback == nil {
+		return map[string]string{}
+	}
+	if m := p.cfg.ModelFallback(); m != nil {
+		return m
+	}
+	return map[string]string{}
 }
 
 // logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys）。
