@@ -1,33 +1,34 @@
-// disabled.go 「账号禁用」在自动化排程中的语义 —— 单一事实来源。
+// disabled.go 「账号禁用 / 暂停选号」在自动化排程中的语义 —— 单一事实来源。
 //
 // 本文件不含可执行代码，只承载一条跨 8 个遍历点的共同约定。任何遍历
-// Pool.List() 的自动化排程都**不得**按 st.Disabled 跳过账号；改任何一处前
-// 先读这里。8 个遍历点（全部指向本说明）：
+// Pool.List() 的自动化排程都**不得**按 st.Disabled / st.Paused 跳过账号
+// （**夜猫子例外**，见第五节）；改任何一处前先读这里。8 个遍历点：
 //
 //   - scheduler.go RunCheckinNow      签到 + 余额 + 解冻 + 连登 + 开学季
 //   - scheduler.go runActivity        活跃上报
 //   - scheduler.go RunKeepaliveNow    token 保活
 //   - scheduler.go RunBalanceRefreshNow 余额刷新（含 RetryTransientDisabled 恢复路径）
-//   - blackcat.go  RunBlackcatNow     夜猫子
+//   - blackcat.go  RunBlackcatNow     夜猫子 ← **唯一例外：跳 paused + disabled**
 //   - school.go    RunSchoolNow       开学季
 //   - streak.go    RunStreakBonusNow  连登兑换/抽奖
 //   - travel.go    RunTravelNow       猫猫旅行
 //
 // ---------------------------------------------------------------------------
-// 一、语义：禁用 = 只停「选号」，不停「账号维护 / 增长」
+// 一、语义：禁用/暂停 = 只停「选号」，不停「账号维护 / 增长」
 // ---------------------------------------------------------------------------
 //
-// pool 层的 disabled 只在一个地方生效：参与**对话选号**。见 pool/entry.go
-// healthy()（disabled → 不可选）与 healthyForModel()（disabled 是全账号级
-// 最强冷却，优先于一切模型级判定）——两处都只影响 Pick/路由，不涉及任何
-// 定时任务。
+// pool 层的 disabled 与 paused 只在参与**对话选号**时生效：见 pool/entry.go
+// healthy()（disabled||paused → 不可选）、healthyForModel()（同为全账号级最强
+// 判否，优先于一切模型级判定）与 pick.go 的全冷却兜底（一并排除）——
+// 四处都只影响 Pick/路由，不涉及任何定时任务。
 //
 // 而本包遍历的这些任务走的**不是 chat 通道**：
 //   - 账号维护（签到 / 保活 / 活跃上报 / 余额）走 billing + report 通道；
 //   - 增长（旅行 / 夜猫子 / 开学季 / 连登）走 growth + task 通道。
 //
 // 「禁用 chat 通道」不蕴含「这些通道也该停」。用户明确要求：不分禁用类型
-// （手动禁用 / 自动禁用）一律照常参与全部自动化排程。
+// （手动禁用 / 自动禁用）一律照常参与全部自动化排程。paused 号 disabled=false，
+// 天然绕过基于 Disabled 的过滤，**不依赖** include_disabled_in_tasks 开关。
 //
 // ---------------------------------------------------------------------------
 // 二、为什么必须放行签到：禁用与签到之间存在「死锁」
@@ -64,9 +65,9 @@
 //   - 保活：面板**只有** keepaliveAll（全量，转发给 RunKeepaliveNow，不自行过滤），
 //     没有单账号保活入口；
 //   - 活跃/旅行：面板同样只有全量入口；
-//   - internal/panel/taskcenter.go 的 tasksScanAll(:79) / queue(:198) /
-//     schoolTasksView(:481) / schoolVouchers(:547) 会按 disabled 跳过 ——
-//     它们是**只读展示/扫描**（"你能做什么"的清单），不是排程，本次不动。
+//   - internal/panel/taskcenter.go 的 tasksScanAll / queue / schoolTasksView /
+//     schoolVouchers 会按 disabled 跳过 —— 它们是**只读展示/扫描**
+//     （"你能做什么"的清单），不是排程，本次不动。
 //
 // ---------------------------------------------------------------------------
 // 四、改回去之前先看这一条：凭证检查是天然防线，不是本规定的替代品
@@ -79,4 +80,28 @@
 //
 // ⚠️ 因此**绝对不要**顺手删掉这些凭证检查：删了会 nil 解引用 panic。
 // 放行 + 凭证检查 = 语义正确且不发无效请求；二者缺一不可。
+//
+// ---------------------------------------------------------------------------
+// 五、⭐ 唯一例外：夜猫子（blackcat.go）跳 paused **与** disabled
+// ---------------------------------------------------------------------------
+//
+// 上方通则有一个例外，且**只此一个**：RunBlackcatNow 对 paused 和 disabled
+// **都** `continue` 跳过。
+//
+// 判据不是"哪个状态"而是"这个任务做什么"：夜猫子 RunNightChats 逐条
+// ChatStream 发**真实 glm-5.2 对话**（internal/upstream/blackcat.go），
+// 是全任务体系中**唯一「整任务都是真实模型对话」**的排程。
+// 而 paused / disabled 的使用场景（多号共用出口 IP，「一次只放开一个」轮换防风控）
+// 的本质就是**不发对话流量**——让位的号若仍在 23:00 被拉出来发消息，等于没让位。
+//
+// 对照其余 7 类为什么照常：签到是 billing RPC + 恢复路径；旅行是纯 RPC
+// （状态/派出/领奖 + 领养前置上报）；开学季 / 连登走 task 通道的领奖类 RPC；
+// 活跃上报是事件上报（非模型对话）；保活是刷新凭证；余额是 billing 查询。
+// 它们都不产生对话流量，与「让位」不冲突。
+//
+// ⚠️ 连带的语义要点：**disabled 在夜猫子这一处不再放行**（与另外 7 类不同）。
+// 这不矛盾 —— 禁用号确实需要在寻回路径（签到/保活/余额）上被照顾，
+// 但"发真实对话"既不是恢复路径也不该发生在被禁/让位的号上。
+// 已有测试守卫：scheduler 的 TestBlackcatSkipsDisabledAccount /
+// TestBlackcatSkipsPausedAccount。
 package scheduler

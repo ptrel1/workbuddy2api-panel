@@ -232,6 +232,16 @@ function renderAccounts(list) {
       tag = '<span class="tag bad">已禁用</span>' +
         (dh.hint ? '<div class="dhint">' + esc(dh.hint) + '</div>' : '');
     }
+    // 暂停选号（paused）：与 disabled 并列判否（都退出选号），但**文案与提示不同** ——
+    // 这正是引入该状态的目的：让位的人看到"已暂停选号 / 照常保号"，
+    // 而不是看到 disabled 那句会让人以为要重新登录的提示。
+    // 放在 disabled 之后：disabled 是更强终态（Pause 后 Disable 时 paused 被吸收，
+    // 池层已保证二者不叠加；这里的顺序只是双保险）。
+    else if (s.paused) {
+      cls = 'off';
+      tag = '<span class="tag warn">已暂停选号</span>' +
+        '<div class="dhint">不参与选号，但照常签到 / 保活 / 余额 / 旅行等保号任务（夜猫子除外）。点「恢复选号」即可回池。</div>';
+    }
     else if (cool > 0) {
       cls = 'cool';
       const kind = bl > Math.max(s.cool_remaining_sec || 0, dg > 0 ? dg : 0) ? '熔断'
@@ -286,7 +296,8 @@ function renderAccounts(list) {
       credTip += '\n实测单价（credits/1K）：\n' + costs.map(c =>
         '  ' + c.model + '：' + (c.cost_per_1k <= 0 ? '免费' : c.cost_per_1k)).join('\n');
     }
-    const frozen = s.disabled || cool > 0;
+    // 注意：原先的 `frozen = s.disabled || cool > 0` 已被按钮区的三态分支取代
+    //（disabled/cooling → 解冻；paused → 恢复选号；否则 → 暂停选号 + 禁用）。
     const tu = s.token_usage || {};
     const req = tu.request_count || 0;
     const totalTok = formatTokenCount(tu.total_tokens);
@@ -313,8 +324,17 @@ function renderAccounts(list) {
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>' +
         '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' +
         '<button class="xs ghost" data-a="models" data-u="' + esc(s.uid) + '">模型</button>' +
-        (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
-                : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
+        // 状态恢复按钮：disabled/cooling → 解冻；paused（且未禁用/无冷却）→ 恢复选号。
+        // paused 分支必须在 frozen 之前：paused 号本就不参与选号，
+        // 若落到 frozen 分支会显示成"解冻"（语义错误：它不是被冻住的坏号）。
+        (s.disabled || cool > 0
+          ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
+          : (s.paused
+              ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
+              : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额（夜猫子除外）">暂停选号</button>')) +
+        // 禁用按钮：已禁用时不再重复显示（解冻才是可用动作）。
+        // paused 号**仍可**禁用 —— 禁用是更强的终态，会吸收 paused（见 pool/transition.go）。
+        (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
       '</td></tr>';
   }).join('');
@@ -329,17 +349,20 @@ function renderAccounts(list) {
 function renderPoolHealth(list) {
   const host = $('poolAlert');
   if (!host) return;
-  const usable = list.filter(s => !s.disabled && !(s.cool_remaining_sec > 0));
+  // paused 与 disabled 一样「不可服务」，必须一并排除：否则暂停掉唯一健康号后，
+  // 横幅仍显示"1 个可用账号"（与真实选号结果矛盾 —— Pick 会返回 503）。
+  // 这类"数据不说谎但会误导"的缺陷，正是本横幅要防的。
+  const usable = list.filter(s => !s.disabled && !s.paused && !(s.cool_remaining_sec > 0));
   const n = usable.length;
   if (n >= 2) { host.hidden = true; host.innerHTML = ''; return; }
   host.hidden = false;
   if (n === 0) {
     host.className = 'pool-alert bad';
     host.innerHTML = '<b>⛔ 无可用账号</b> —— 所有请求将返回 <code>503 no_healthy_account</code>。' +
-      '请等待限流重置（见下表恢复时间）或添加新账号。';
+      '请等待限流重置（见下表恢复时间）、恢复被暂停的账号，或添加新账号。';
   } else {
     host.className = 'pool-alert';
-    host.innerHTML = '<b>⚠️ 仅剩 ' + n + ' 个可用账号</b> —— 一旦它被限流/禁用，' +
+    host.innerHTML = '<b>⚠️ 仅剩 ' + n + ' 个可用账号</b> —— 一旦它被限流/禁用/暂停，' +
       '全部请求将立即返回 503。建议尽快添加账号。';
   }
 }
@@ -353,7 +376,9 @@ function renderSkew(list) {
   if (!host) return;
   const groups = {};
   list.forEach(s => {
-    if (s.disabled) return;
+    // paused 一并排除：它不参与选号、不产生新流量（success_count 是历史累计），
+    // 计入"负载分布"会污染倾斜度口径 —— 与 disabled 同理。
+    if (s.disabled || s.paused) return;
     const r = s.realm === 'global' ? 'global' : 'cn';
     (groups[r] = groups[r] || []).push(s);
   });
@@ -418,7 +443,7 @@ $('accBody').addEventListener('click', async ev => {
   if (!b) return;
   const u = b.dataset.u, a = b.dataset.a;
   if (a === 'remove' && !confirm('移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。确认移除？')) return;
-  if (a === 'disable' && !confirm('禁用后该账号不再参与选号，需手动解冻才能恢复。确认禁用？')) return;
+  if (a === 'disable' && !confirm('禁用后该账号不再参与选号（夜猫子也跳过），需手动解冻才能恢复，面板会提示「需重新登录」类动作。若只是想临时让位、仍要保号，请改用「暂停选号」。确认禁用？')) return;
   b.disabled = true;
   try {
     if (a === 'checkin') {
@@ -433,6 +458,12 @@ $('accBody').addEventListener('click', async ev => {
     } else if (a === 'disable') {
       await api('accounts/' + encodeURIComponent(u) + '/disable', { method: 'POST' });
       toast('已禁用', 'ok');
+    } else if (a === 'pause') {
+      await api('accounts/' + encodeURIComponent(u) + '/pause', { method: 'POST' });
+      toast('已暂停选号（签到 / 保活 / 余额等照常，夜猫子除外）', 'ok');
+    } else if (a === 'resume') {
+      await api('accounts/' + encodeURIComponent(u) + '/resume', { method: 'POST' });
+      toast('已恢复选号', 'ok');
     } else if (a === 'tasks') {
       openTasks(u);
     } else if (a === 'models') {

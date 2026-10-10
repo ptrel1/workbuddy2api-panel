@@ -123,11 +123,15 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			errTotal = int64(s.ErrCount)
 		}
 		e := &entry{
-			a:                &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
-			credits:          s.Credits,
-			creditsTotal:     s.CreditsTotal,
-			creditsExpiring:  s.CreditsExpiring,
-			disabled:         s.Disabled,
+			a:               &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
+			credits:         s.Credits,
+			creditsTotal:    s.CreditsTotal,
+			creditsExpiring: s.CreditsExpiring,
+			disabled:        s.Disabled,
+			// paused 与 disabled 同层直接恢复（无过期过滤——paused 无时限，恢复即生效）。
+			// 向后兼容：旧 state.json 无本键 → s.Paused 零值 false，账号按未暂停加载，
+			// 不报错、不影响账号池启动。
+			paused:           s.Paused,
 			disabledAt:       s.DisabledAt,
 			reason:           s.Reason,
 			until:            s.Until,
@@ -249,9 +253,11 @@ func (p *Pool) stateOverviewLocked() stateFile {
 	sf := stateFile{Accounts: map[string]stateAccount{}}
 	for uid, e := range p.byUID {
 		s := stateAccount{
-			Credits:          e.credits,
-			CreditsTotal:     e.creditsTotal,
-			Disabled:         e.disabled,
+			Credits:      e.credits,
+			CreditsTotal: e.creditsTotal,
+			Disabled:     e.disabled,
+			// paused 全量落盘（无时限，不受任何惰性过滤影响）。
+			Paused:           e.paused,
 			DisabledAt:       e.disabledAt,
 			Reason:           e.reason,
 			Until:            e.until,

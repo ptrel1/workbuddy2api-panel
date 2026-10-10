@@ -32,6 +32,13 @@ import (
 type disPathStub struct {
 	suffix string                   // 匹配的路径后缀
 	hits   map[string]*atomic.Int32 // 凭证（X-User-Id 或 X-Refresh-Token）→ 次数
+	// mu 保护 hits 的取/存。
+	// ⚠️ 为什么必须加锁：handler() 交给 httptest 后**每个请求跑在独立 goroutine**，
+	// 且部分排程（余额刷新）本来就对多账号并发打上游 —— 裸 map 的并发读写会被
+	// -race 判定为 DATA RACE。atomic.Int32 只保护「计数」本身，**不保护 map 本身**。
+	// 早期版本注释写着"单 goroutine 调用"，那是**依赖调用方并发行为的脆弱假设**：
+	// 任何一处排程改成并发就会炸，而加锁的成本可以忽略。
+	mu sync.Mutex
 }
 
 func newDisPathStub(suffix string) *disPathStub {
@@ -39,20 +46,24 @@ func newDisPathStub(suffix string) *disPathStub {
 }
 
 func (s *disPathStub) count(key string) int32 {
-	if c, ok := s.hits[key]; ok {
+	s.mu.Lock()
+	c, ok := s.hits[key]
+	s.mu.Unlock()
+	if ok {
 		return c.Load()
 	}
 	return 0
 }
 
-// hit 记一次命中（键由调用方给出，如 "uid:dis" / "rt:rt-dis"）。
-// 单 goroutine 调用（各排程内顺序遍历），无并发竞争。
+// hit 记一次命中（键由调用方给出，如 "uid:dis" / "rt:rt-dis"）。并发安全。
 func (s *disPathStub) hit(key string) {
+	s.mu.Lock()
 	c, ok := s.hits[key]
 	if !ok {
 		c = &atomic.Int32{}
 		s.hits[key] = c
 	}
+	s.mu.Unlock()
 	c.Add(1)
 }
 
@@ -158,10 +169,18 @@ func TestSchoolCoversDisabledAccount(t *testing.T) {
 	}
 }
 
-// TestBlackcatCoversDisabledAccount 夜猫子排程照常覆盖禁用账号。
+// TestBlackcatSkipsDisabledAccount ★ 夜猫子是「禁用/暂停只停选号」通则的**唯一例外**：
+// disabled 号必须跳过。
+//
+// 为什么必须有这条（且与其余 7 类的放行断言并存不矛盾）：RunNightChats 逐条
+// ChatStream 发**真实 glm-5.2 对话**，是全任务体系中唯一「整任务都是真实模型对话」
+// 的排程。禁用/让位的号不该产生对话流量。见 disabled.go 第五节。
+//
+// 本用例由 TestBlackcatCoversDisabledAccount 的**断言翻转**而来（该用例曾断言
+// 禁用号参与夜猫子，属上一轮「8 类全放行」的过度推广）。
 // 首个带 uid 的调用 = BlackcatNeed → ListTasks(/v2/activity/growth/tasks)。
 // 窗口通过 blackcatNow 接缝固定为 23:30，避免该路径只在夜间才可验证。
-func TestBlackcatCoversDisabledAccount(t *testing.T) {
+func TestBlackcatSkipsDisabledAccount(t *testing.T) {
 	stub := newDisPathStub("/v2/activity/growth/tasks")
 	srv := httptest.NewServer(stub.handler())
 	defer srv.Close()
@@ -171,11 +190,47 @@ func TestBlackcatCoversDisabledAccount(t *testing.T) {
 
 	s.RunBlackcatNow()
 
-	if n := stub.count("uid:dis"); n != 1 {
-		t.Errorf("禁用账号 blackcat 任务查询次数=%d want 1（夜猫子照常）", n)
+	if n := stub.count("uid:dis"); n != 0 {
+		t.Errorf("禁用账号 blackcat 任务查询次数=%d want 0（夜猫子发真实对话，禁用号必须跳过）", n)
+	}
+	// 正向对照：正常号仍被处理 —— 否则"跳过"可能只是整个排程没跑（假通过）。
+	if n := stub.count("uid:ok"); n != 1 {
+		t.Errorf("正常账号 blackcat 任务查询次数=%d want 1（窗口内正常号应照常跑，用于对照）", n)
+	}
+}
+
+// TestBlackcatSkipsPausedAccount 暂停选号（paused）号同样跳过夜猫子 —— 这是 paused
+// 与 disabled 唯一共享"跳过"的排程点（其余 7 类 paused 一律照常参与）。
+//
+// ⚠️ 本用例**不能**复用 disScheduler：那个夹具里的 dis 号已被 Disable（disabled=true），
+// 对它 Pause 会落在 disabled+paused 叠加态上（叠加态按设计不存在，见 transition.go）。
+// 这里自建夹具：一个纯 paused 号（disabled=false）+ 一个正常号。
+func TestBlackcatSkipsPausedAccount(t *testing.T) {
+	stub := newDisPathStub("/v2/activity/growth/tasks")
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "paused", AccessToken: "at-p", RefreshToken: "rt-p", ExpiresAt: 9999999999})
+	p.Add(&auth.Auth{UID: "ok", AccessToken: "at-ok", RefreshToken: "rt-ok", ExpiresAt: 9999999999})
+	if !p.Pause("paused") {
+		t.Fatal("precondition: Pause(paused) 应成功")
+	}
+	// 前提：该号 paused 但**非** disabled —— 证明跳过来自 paused 本身，而非 disabled 连带。
+	if st, _ := p.Status("paused"); st.Disabled || !st.Paused {
+		t.Fatalf("precondition: paused 应为 paused 且非 disabled，实际 %+v", st)
+	}
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	s := New(Config{Pool: p, Upstream: up, ExpiringSoonWindow: 0})
+	freezeBlackcatAt(t, time.Date(2026, 9, 11, 23, 30, 0, 0, time.Local))
+
+	s.RunBlackcatNow()
+
+	if n := stub.count("uid:paused"); n != 0 {
+		t.Errorf("暂停账号 blackcat 任务查询次数=%d want 0（夜猫子发真实对话，让位号必须跳过）", n)
 	}
 	if n := stub.count("uid:ok"); n != 1 {
-		t.Errorf("正常账号 blackcat 任务查询次数=%d want 1", n)
+		t.Errorf("正常账号 blackcat 任务查询次数=%d want 1（窗口内正常号应照常跑，用于对照）", n)
 	}
 }
 
@@ -210,16 +265,22 @@ func TestBlackcatSkipsOutsideWindow(t *testing.T) {
 // 「只用池内 Credits 采样、不打上游」的降级路径）。
 // 断言行为：上游 user-resource 收到了禁用号的请求，且其 credits 被更新为新值。
 func TestBalanceCoversDisabledAccount(t *testing.T) {
+	// ⚠️ map 必须加锁：httptest **每个请求一个 goroutine**，而余额刷新会对多个
+	// 账号并发打上游 —— 裸 map 的并发读写会被 -race 判定为 DATA RACE（实测触发）。
+	// 注意 atomic.Int32 只保护「计数」本身，**不保护 map 的取/存**。
+	var callsMu sync.Mutex
 	calls := map[string]*atomic.Int32{}
 	var mu atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/get-user-resource") {
 			uid := r.Header.Get("X-User-Id")
+			callsMu.Lock()
 			c, ok := calls[uid]
 			if !ok {
 				c = &atomic.Int32{}
 				calls[uid] = c
 			}
+			callsMu.Unlock()
 			c.Add(1)
 			mu.Add(1)
 			// 上游返回 4242，与池内旧值（0）不同 → 可区分「真刷」与「降级采样」。
@@ -237,7 +298,10 @@ func TestBalanceCoversDisabledAccount(t *testing.T) {
 	// 用辅助函数安全取计数：账号被跳过时该键不存在，直接索引会 panic，
 	// 掩盖掉真正该报的断言失败（变异验证时实测到这点）。
 	count := func(uid string) int32 {
-		if c, ok := calls[uid]; ok {
+		callsMu.Lock()
+		c, ok := calls[uid]
+		callsMu.Unlock()
+		if ok {
 			return c.Load()
 		}
 		return 0
@@ -380,5 +444,179 @@ func TestBalanceRefreshKeepsNilAuthGuard(t *testing.T) {
 	s.RunBalanceRefreshNow() // 不应 panic
 	if calls.Load() == 0 {
 		t.Errorf("余额刷新走正常路径：即使凭证为空也应尝试一次（与原口径一致），got 0")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 暂停选号（paused）：与 disabled 唯一差别是**夜猫子跳过**，其余 7 类照常参与
+// ---------------------------------------------------------------------------
+
+// pausedScheduler 建一个含「暂停号 paused + 正常号 ok」的调度器。
+// ⚠️ 与 disScheduler 的关键差别：paused 号是**纯 paused**（disabled=false），
+// 这样"照常参与"的结论才归因于 paused 本身，而不是被 disabled 连带。
+func pausedScheduler(t *testing.T, srv *httptest.Server) (*Scheduler, *pool.Pool) {
+	t.Helper()
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "paused", AccessToken: "at-p", RefreshToken: "rt-p", ExpiresAt: 9999999999})
+	p.Add(&auth.Auth{UID: "ok", AccessToken: "at-ok", RefreshToken: "rt-ok", ExpiresAt: 9999999999})
+	if !p.Pause("paused") {
+		t.Fatal("precondition: Pause(paused) 应成功")
+	}
+	if st, _ := p.Status("paused"); st.Disabled || !st.Paused {
+		t.Fatalf("precondition: paused 应为 paused 且非 disabled，实际 disabled=%v paused=%v", st.Disabled, st.Paused)
+	}
+	up := &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL}
+	return New(Config{Pool: p, Upstream: up, ExpiringSoonWindow: 0}), p
+}
+
+// TestPausedStillCheckin 暂停号照常签到（签到是账号恢复路径 + 积分不断档）。
+func TestPausedStillCheckin(t *testing.T) {
+	fastActivity(t)
+	stub := newDisPathStub("/daily-checkin")
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	s, _ := pausedScheduler(t, srv)
+	s.RunCheckinNow()
+
+	if n := stub.count("uid:paused"); n != 1 {
+		t.Errorf("暂停账号 checkin 次数=%d want 1（暂停只停选号，签到照常）", n)
+	}
+	if n := stub.count("uid:ok"); n != 1 {
+		t.Errorf("正常账号 checkin 次数=%d want 1", n)
+	}
+}
+
+// TestPausedStillKeepalive 暂停号照常保活（刷新凭证，否则 token 过期要重登）。
+func TestPausedStillKeepalive(t *testing.T) {
+	stub := newDisPathStub("/token/refresh")
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	s, _ := pausedScheduler(t, srv)
+	s.RunKeepaliveNow()
+
+	// refresh 端点只带 X-Refresh-Token，故按刷新凭证计数。
+	if n := stub.count("rt:rt-p"); n != 1 {
+		t.Errorf("暂停账号 refresh 次数=%d want 1（保活照常）", n)
+	}
+	if n := stub.count("rt:rt-ok"); n != 1 {
+		t.Errorf("正常账号 refresh 次数=%d want 1", n)
+	}
+}
+
+// TestPausedStillActivity 暂停号照常活跃上报（走 report 通道，非模型对话）。
+func TestPausedStillActivity(t *testing.T) {
+	fastActivity(t)
+	stub := newDisPathStub("/report")
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	s, _ := pausedScheduler(t, srv)
+	s.RunActivityNow()
+
+	if n := stub.count("uid:paused"); n == 0 {
+		t.Errorf("暂停账号活跃上报次数=0 want >0（活跃是事件上报，与让位不冲突）")
+	}
+}
+
+// TestPausedStillBalanceRefresh 暂停号余额**真刷上游**（不是只读池内旧值）。
+func TestPausedStillBalanceRefresh(t *testing.T) {
+	// ⚠️ 用 sync.Map 而非 map+mutex：RunBalanceRefreshNow 内部**并发**打上游，
+	// 计数在多个 goroutine 写入。既有的 TestBalanceCoversDisabledAccount 用的是裸 map，
+	// 只在普通 go test 下侥幸不报（-race 会报 DATA RACE）—— 新用例不重复这个隐患。
+	var mu atomic.Int32
+	var calls sync.Map // uid → *atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/get-user-resource") {
+			uid := r.Header.Get("X-User-Id")
+			v, _ := calls.LoadOrStore(uid, &atomic.Int32{})
+			v.(*atomic.Int32).Add(1)
+			mu.Add(1)
+			// 返回 4242（与池内旧值 0 不同）→ 可区分「真刷」与「降级采样」。
+			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleCapacitySize":5000,"CycleCapacityRemain":4242,"CycleCapacityUsed":0}]}}}}`))
+			return
+		}
+		w.Write([]byte(`{"code":0,"msg":"ok","data":{}}`))
+	}))
+	defer srv.Close()
+
+	s, p := pausedScheduler(t, srv)
+	s.RunBalanceRefreshNow()
+
+	count := func(uid string) int32 {
+		if v, ok := calls.Load(uid); ok {
+			return v.(*atomic.Int32).Load()
+		}
+		return 0
+	}
+	if n := count("paused"); n != 1 {
+		t.Errorf("暂停账号 user-resource 次数=%d want 1（余额刷新照常真刷上游）", n)
+	}
+	if n := count("ok"); n != 1 {
+		t.Errorf("正常账号 user-resource 次数=%d want 1", n)
+	}
+	if st, _ := p.Status("paused"); st.Credits != 4242 {
+		t.Errorf("暂停账号 credits=%d want 4242（应被上游新鲜值更新）", st.Credits)
+	}
+	// 池层语义：余额 > 0 也不得解除 paused（paused 不由余额驱动，只由 Resume 解除）。
+	st, _ := p.Status("paused")
+	if !st.Paused {
+		t.Error("余额刷新不得解除暂停选号（paused 只由 Resume 解除）")
+	}
+}
+
+// TestPausedStillTravel 暂停号照常旅行 —— 旅行是纯 RPC（状态/派出/领奖 + 领养前置
+// 上报），不发模型对话，与「让位防风控」不冲突。
+// 上游口径：曾一揽子跳过，b1a2284 复核后撤回跳过（TestPausedSkipsTravel → TestPausedStillTravel）。
+func TestPausedStillTravel(t *testing.T) {
+	// 旅行的第一个请求 = BuddyInfo → /activity/growth/buddy/info（见 upstream/travel.go）。
+	stub := newDisPathStub("/activity/growth/buddy/info")
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	s, _ := pausedScheduler(t, srv)
+	s.RunTravelNow()
+
+	if n := stub.count("uid:paused"); n != 1 {
+		t.Errorf("暂停账号 buddy-info 次数=%d want 1（旅行是纯 RPC，照常参与）", n)
+	}
+	if n := stub.count("uid:ok"); n != 1 {
+		t.Errorf("正常账号 buddy-info 次数=%d want 1", n)
+	}
+}
+
+// TestPausedStillStreak 暂停号照常连登兑换/抽奖（走 growth/task 通道的领奖类 RPC）。
+func TestPausedStillStreak(t *testing.T) {
+	stub := newDisPathStub("/activity/growth/streak")
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	s, _ := pausedScheduler(t, srv)
+	s.RunStreakBonusNow()
+
+	if n := stub.count("uid:paused"); n != 1 {
+		t.Errorf("暂停账号 streak 查询次数=%d want 1（连登照常）", n)
+	}
+	if n := stub.count("uid:ok"); n != 1 {
+		t.Errorf("正常账号 streak 查询次数=%d want 1", n)
+	}
+}
+
+// TestPausedStillSchool 暂停号照常参与开学季闭环（task 通道 RPC）。
+func TestPausedStillSchool(t *testing.T) {
+	fastActivity(t)
+	stub := newDisPathStub("/portal/activity/school/tasks")
+	srv := httptest.NewServer(stub.handler())
+	defer srv.Close()
+
+	s, _ := pausedScheduler(t, srv)
+	s.RunSchoolNow()
+
+	if n := stub.count("uid:paused"); n != 1 {
+		t.Errorf("暂停账号 school/tasks 次数=%d want 1（开学季照常）", n)
+	}
+	if n := stub.count("uid:ok"); n != 1 {
+		t.Errorf("正常账号 school/tasks 次数=%d want 1", n)
 	}
 }

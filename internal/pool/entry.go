@@ -80,6 +80,13 @@ type Status struct {
 	Realm          string `json:"realm,omitempty"`
 	Disabled       bool   `json:"disabled"`
 	DisabledReason string `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	// Paused 暂停选号：退出选号候选（同 disabled 不参与选号），但**照常参与**
+	// 签到 / 活跃上报 / 保活 / 余额刷新 / 旅行 / 开学季 / 连登 /（成长队列）等自动化排程。
+	// 与 disabled 正交：disabled 是「授权/session 终态，需人工 revive 或重登」，
+	// paused 是「运维临时让位」（多号轮换防风控场景）——账号本身健康，只是暂不接流量。
+	// 唯一例外是夜猫子：它逐条发真实模型对话，与「让位」正面冲突，故一并跳过
+	//（见 scheduler/blackcat.go）。
+	Paused bool `json:"paused,omitempty"`
 	// DisableHint 禁用说明（性质 + 下一步动作 + 自动重试时刻）。
 	// 为何需要：只给"已禁用"用户不知道该干什么 —— 需重登 / 会自动重试 / 人工禁的，
 	// 三种情况动作完全不同（见 revive.go）。
@@ -178,8 +185,16 @@ type entry struct {
 	until           time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
 	disabled        bool
 	disabledAt      time.Time // 禁用时刻（「临时禁用到期自动重试」用）
-	reason          string
-	lastUsed        time.Time // 最近被选中时刻（防并发撞号）
+	// paused 暂停选号：与 disabled 正交的独立状态位。置位后退出选号候选
+	//（healthy / healthyForModel / modelExempt / 全冷却兜底四处判否），
+	// 但**不触碰任何惩罚域**（不清冷却、不清熔断、不写 reason、不重置计数）——
+	// paused 是「临时让位」，账号本身仍健康，resume 即刻可回池。
+	// 自动化排程遍历只按 Disabled 过滤，故 paused 号天然继续参与保号类任务
+	//（唯一例外：夜猫子发真实模型对话，见 scheduler/blackcat.go）。
+	// 持久化（stateAccount.Paused），跨重启不丢。
+	paused   bool
+	reason   string
+	lastUsed time.Time // 最近被选中时刻（防并发撞号）
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效。
@@ -250,11 +265,15 @@ func (e *entry) modelCostOf(model string, now time.Time) (modelCostEntry, bool) 
 	return mc, true
 }
 
-// healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断/连败降权期）。
+// healthy 报告账号当前是否可选（未禁用/未暂停、未处于任一冷却/熔断/连败降权期）。
 // 连败降权与冷却/熔断同入本判定（取更长者不叠加：三个截止是并列的或门，
 // 只要任一未到期即不可选，天然「并存取更远者」——不需要显式比较长短）。
+//
+// paused 与 disabled 同在最前判否（二者都退出选号），但语义正交：
+// disabled 是「判死」（需 revive / 重登），paused 是「临时让位」（resume 即回）。
+// 本判定被选号热路径调用，故只在首行加一个 bool 或运算 —— 无锁、无分配、无性能影响。
 func (e *entry) healthy(now time.Time) bool {
-	if e.disabled {
+	if e.disabled || e.paused {
 		return false
 	}
 	if !e.until.IsZero() && now.Before(e.until) {
@@ -270,13 +289,13 @@ func (e *entry) healthy(now time.Time) bool {
 }
 
 // modelExempt 报告账号是否处于「6004 模型级软冷却」形态：存在任一有效的 6004
-// 模型级冷却（modelCooldowns 非空），且尚未禁用、未熔断。
+// 模型级冷却（modelCooldowns 非空），且尚未禁用/暂停、未熔断。
 // 此形态下账号仅对限流中的模型不可用，对其他模型仍可选（issue #31）。
 // healthyForModel 与 ServableNow 共用本谓词，保证 chat 选号与探活口径一致。
 // 调用方负责 now 与冷却有效性的判断（本方法只看形态，不看冷却是否已过期）。
 func (e *entry) modelExempt() bool {
 	return len(e.modelCooldowns) > 0 &&
-		!e.disabled && e.breakerUntil.IsZero()
+		!e.disabled && !e.paused && e.breakerUntil.IsZero()
 }
 
 // modelCooled 报告账号对指定 model 是否正处 6004 模型级冷却（该模型的独立冷却未过期）。
@@ -293,7 +312,8 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 }
 
 // healthyForModel 报告账号对指定 model 是否可选（含 6004 模型级独立冷却判定）：
-//   - disabled → 永不可选（最高优先级）；
+//   - disabled / paused → 永不可选（最高优先级；paused 在账号级就退出选号，
+//     模型维度不构成豁免 —— 与 ModelBlocked 口径一致，与任务无关）；
 //   - 该模型正处 6004 独立冷却（modelCooldowns[reqModel] 未过期）→ 不可选
 //     （多模型限流时各自独立，互不影响）；
 //   - 否则 → 回落到账号级 healthy（until/breakerUntil 维度）。
@@ -302,7 +322,7 @@ func (e *entry) modelCooled(now time.Time, reqModel string) bool {
 // 任意多个模型同时限流：被 B 限流的账号对 A 请求仍可选（A 不在 modelCooldowns 拦截
 // 且账号级 healthy 成立）。空 reqModel / 未记录模型 → 等价 healthy。
 func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
-	if e.disabled {
+	if e.disabled || e.paused {
 		return false
 	}
 	// 手动关闭优先于一切自动机制（用户选定）：手动关掉的组合，
@@ -369,9 +389,13 @@ func (e *entry) fallbackKind(now time.Time) string {
 
 // stateAccount 单个账号的持久化状态（JSON tag 全小写下划线，向后兼容：缺字段零值）。
 type stateAccount struct {
-	Credits      int64     `json:"credits"`
-	CreditsTotal int64     `json:"credits_total,omitempty"`
-	Disabled     bool      `json:"disabled"`
+	Credits      int64 `json:"credits"`
+	CreditsTotal int64 `json:"credits_total,omitempty"`
+	Disabled     bool  `json:"disabled"`
+	// Paused 暂停选号（与 disabled 正交）。落盘持久化，跨重启不丢。
+	// 向后兼容：旧 state.json 无本键 → 零值 false，json.Unmarshal 不报错
+	//（未启用 DisallowUnknownFields，且新键缺失即零值），生产真实 state.json 可正常装载。
+	Paused       bool      `json:"paused,omitempty"`
 	DisabledAt   time.Time `json:"disabled_at,omitempty"` // 供「临时禁用到期自动重试」
 	Reason       string    `json:"reason,omitempty"`
 	Until        time.Time `json:"until,omitempty"`

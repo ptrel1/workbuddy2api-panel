@@ -81,6 +81,7 @@ func (p *Pool) Revive(uid string) bool {
 		return false
 	}
 	e.disabled = false
+	e.paused = false // 解冻是全清：暂停选号一并解除（Revive 语义 = 无条件恢复一切不可选状态）
 	e.until = time.Time{}
 	e.coolKind = 0
 	e.reason = ""
@@ -91,6 +92,40 @@ func (p *Pool) Revive(uid string) bool {
 	e.retryCount = 0
 	e.breakerUntil = time.Time{}
 	p.dirty.Store(true)
+	return true
+}
+
+// Pause 暂停选号：账号退出选号候选，但**照常参与**签到 / 活跃上报 / 保活 / 余额刷新 /
+// 旅行 / 开学季 / 连登（唯夜猫子例外——它逐条发真实模型对话，见 scheduler/blackcat.go）。
+//
+// 与 Disable 的区别（这正是本状态存在的理由）：不写 reason、不清冷却域、不重置计数、
+// 不置 disabled —— 账号是「临时让位」而非「判死」，故无需重登或人工解冻，
+// Resume 即可立刻恢复接流量。适用场景：多号共用同一出口 IP，「一次只放开一个」的
+// 轮换养号；用 disabled 表达让位会得到"需重新登录"的错误提示，且无法与真坏的号区分。
+//
+// 幂等（重复 Pause 无副作用）；uid 不存在返回 false（供调用方返回 404）。
+// 对**已禁用**账号调用时静默忽略（禁用是更强终态，不产生 disabled+paused 叠加态，
+// 见 transition.go 的 pauseLocked）。
+func (p *Pool) Pause(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	p.pauseLocked(e)
+	return true
+}
+
+// Resume 解除暂停选号（幂等，对未暂停账号为空操作）。uid 不存在返回 false。
+func (p *Pool) Resume(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	p.resumeLocked(e)
 	return true
 }
 
@@ -395,7 +430,10 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, di
 		}
 		total++
 		switch {
-		case e.disabled:
+		case e.disabled || e.paused:
+			// paused（暂停选号）与 disabled 同样不可选，合并计入 disabled 类
+			//（/status 的「不可用」口径）；细粒度区分由 Status.Paused 透出，
+			// 不改 CountsDetailed 的签名（避免牵动 /status 与面板统计卡的既有契约）。
 			disabled++
 		case !e.healthy(now):
 			cooling++
@@ -472,6 +510,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Cooling:           now.Before(e.until) || now.Before(e.breakerUntil),
 		Reason:            e.reason,
 		Disabled:          e.disabled,
+		Paused:            e.paused,
 		SuccessCount:      e.successCount,
 		ErrTotal:          e.errTotal,
 		TokenUsage:        e.tokenUsage,
