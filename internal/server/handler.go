@@ -203,6 +203,8 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 		// 改道次数；last 是各 (域, 模型) 的上次探索时刻。为什么透出：探索会**主动改道**
 		// 一个真实请求，运维必须能解释"这次为什么没走最省钱的号"，否则该机制是黑盒。
 		"cost_explore": costExploreStatusJSON(h.cfg.Pool),
+		// credit_floor 积分保底（0 = 关闭）：运维据此判断"为什么触底号不接某模型"。
+		"credit_floor": h.cfg.Pool.CreditFloor(),
 	})
 }
 

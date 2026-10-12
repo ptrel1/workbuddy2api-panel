@@ -23,3 +23,18 @@ func UID8(uid string) string {
 	}
 	return uid
 }
+
+// Label 返回日志里可读的账号标识：`<uid8>` 或 `<uid8>(<昵称>)`。
+//
+// 为什么需要：uid8 唯一但对人无意义（运维看日志时认不出是哪个账号）；
+// 昵称（"周五口"/"pt"）才是人认知里的账号。两者都给：uid8 保唯一性、昵称保可读性。
+//
+// 昵称为空时只给 uid8（不编造、不留空括号）——空昵称是常见形态（新号未设昵称）。
+// 昵称含空格/括号时不转义（日志是给人看的，不追求可再解析；对齐本包"简洁优先"）。
+func Label(uid, nickname string) string {
+	u := UID8(uid)
+	if nickname == "" {
+		return u
+	}
+	return u + "(" + nickname + ")"
+}

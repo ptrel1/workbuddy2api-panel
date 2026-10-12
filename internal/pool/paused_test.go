@@ -503,7 +503,7 @@ func TestFallbackDirectlyExcludesPaused(t *testing.T) {
 	p.Cooldown("cool", CoolSoft, time.Hour, "429")
 
 	p.mu.Lock()
-	got := p.pickEarliestExpiryLocked(nil, time.Now(), "")
+	got := p.pickEarliestExpiryLocked(nil, time.Now(), "", "")
 	p.mu.Unlock()
 
 	if got == nil || got.UID != "cool" {
@@ -520,7 +520,7 @@ func TestFallbackDirectlyExcludesPaused(t *testing.T) {
 	p.Cooldown("paused", CoolSoft, time.Minute, "429")
 	p.mu.Lock()
 	pausedExpiry := p.byUID["paused"].expiry(time.Now())
-	stillPaused := p.pickEarliestExpiryLocked(nil, time.Now(), "")
+	stillPaused := p.pickEarliestExpiryLocked(nil, time.Now(), "", "")
 	p.mu.Unlock()
 	if pausedExpiry.IsZero() {
 		t.Fatal("precondition: paused 号应处于有效冷却期（否则兜底条件不成立，断言无意义）")
@@ -531,7 +531,7 @@ func TestFallbackDirectlyExcludesPaused(t *testing.T) {
 
 	p.Resume("paused")
 	p.mu.Lock()
-	after := p.pickEarliestExpiryLocked(nil, time.Now(), "")
+	after := p.pickEarliestExpiryLocked(nil, time.Now(), "", "")
 	p.mu.Unlock()
 	if after == nil || after.UID != "paused" {
 		t.Fatalf("resume 后兜底=%v want paused（证明前面的排除确实来自 paused 判定）", after)

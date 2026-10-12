@@ -50,6 +50,18 @@ type Pool struct {
 	degradeThreshold   int
 	degradeCooldown    time.Duration
 	degradeCooldownMax time.Duration
+	// creditFloor 积分保底（SetCreditFloor 注入；**0 = 关闭，缺省即现状**）。
+	//
+	// 账号 credits < floor 时，对**实测收费**模型（tier 2，账本有效观测）不再参与选号
+	// ——防止收费请求把余额打穿、连免费模型都 402 冷却到次日签到（实测事故：某 x1.62
+	// 模型两笔扣 111.73 分把号打到 0 → 账号级 402 → 最坏约 11.5h 不可用）。
+	//
+	// tier 0（实测免费）/ tier 1（无观测）不受限：保底保的是「留余额给免费模型用」，
+	// 不是「什么都别调」——且拦了 tier 1 会让触底号永远拿不到首笔观测、锁死在
+	// 「学不回来」的死锁里（与 costTier 的探索窗口同一考量）。
+	// 签到回血（SetCreditsDetailed 越过 floor）即自动恢复。
+	// 全池触底 + 全 tier 2 时选号返回 nil（硬语义：**宁 503 不打穿**）。
+	creditFloor int64
 	// 三因子加权调优（SetWeights 注入；默认值见 defaultIdle*）。
 	idleWeightPerHour float64
 	idleWeightMax     float64
@@ -162,6 +174,24 @@ func (p *Pool) SetCostExploreInterval(d time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.costExploreInterval = d
+}
+
+// CreditFloor 透出生效的积分保底值（/status 用）。0 = 关闭。
+func (p *Pool) CreditFloor() int64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.creditFloor
+}
+
+// SetCreditFloor 注入积分保底线（main 从 config 解析后调用）。
+// **0 = 关闭（缺省即现状，零回归）**；负值非法保留原值（与其它 Set* 的"非正值保留"一致）。
+// 语义见 Pool.creditFloor 字段注释。
+func (p *Pool) SetCreditFloor(n int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if n >= 0 {
+		p.creditFloor = n
+	}
 }
 
 // CostExploreStatus 返回探索台账快照，供 /status 透出（运维据此解释"为什么这次没走最省钱的号"）。

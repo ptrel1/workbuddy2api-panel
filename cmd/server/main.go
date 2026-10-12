@@ -31,7 +31,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "2.6.2-panel"
+const appVersion = "2.7.0-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -103,6 +103,8 @@ func main() {
 	// costTier 条件探索窗口（默认 30m；config "0" = 关停）。注意这个 setter 接受 0，
 	// 不能因"非正值跳过"而忽略用户的显式关停。
 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur)
+	// 积分保底（0 = 关闭）。防"收费模型把余额打穿 → 连免费模型都 402 到次日"。
+	p.SetCreditFloor(cfg.Pool.CreditFloor)
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
@@ -394,6 +396,8 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetSoftRateMax(newCfg.SoftRateMaxDur)
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	p.SetCostExploreInterval(newCfg.CostExploreIntervalDur)
+	// 面板改 credit_floor 即时生效（漏掉这行会让面板改动静默不生效）。
+	p.SetCreditFloor(newCfg.Pool.CreditFloor)
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
 		newCfg.Schedule.ActivityHours, newCfg.Schedule.KeepaliveHours, newCfg.Schedule.BlackcatHours,

@@ -163,6 +163,19 @@ type Config struct {
 		// 缺省空 map = 不降级（对老配置零影响）。key 用**裸模型名**（不带 cn:/global:
 		// 前缀），因为前缀是网关侧路由协议、不参与模型身份。
 		ModelFallback map[string]string `json:"model_fallback"`
+
+		// CreditFloor 积分保底（0 = 关闭，**缺省即现状、零回归**）。
+		// 账号 credits < 该值时，对**实测收费**模型（tier 2 有效观测）不再参与选号，
+		// 防止收费请求把余额打穿、连免费模型都 402 冷却到次日签到
+		// （实测事故：某 x1.62 模型两笔扣 111.73 分把号打到 0 → 最坏约 11.5h 不可用）。
+		//
+		// tier 0（实测免费）/ tier 1（无观测）不受限：保底保的是「留余额给免费模型用」，
+		// 不是「什么都别调」；拦 tier 1 会让触底号永远拿不到首笔观测、锁死在
+		// 「学不回来」的死锁里。签到回血越过 floor 即自动恢复。
+		//
+		// 建议值 100（见 config.example.json）——但**代码缺省 0 = 关闭**，
+		// 保持与老配置零差异；是否开启由用户显式决定。
+		CreditFloor int64 `json:"credit_floor"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -443,6 +456,11 @@ func (c *Config) normalize() error {
 	}
 	if c.CostExploreIntervalDur < 0 {
 		c.CostExploreIntervalDur = 0 // 负数与 0 同为关停（防御性归一）
+	}
+	// 积分保底：负值归一为 0（关闭）。0 是合法值（= 关闭），故不做"回落默认"——
+	// 那会把用户显式写的 0 静默改成开启，与 model_fallback 同类坑（见其注释）。
+	if c.Pool.CreditFloor < 0 {
+		c.Pool.CreditFloor = 0
 	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
