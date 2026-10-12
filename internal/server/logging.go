@@ -296,9 +296,12 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 	tokpsField := "-"
 	if toks >= 0 {
 		tokField = fmt.Sprintf("%d", toks)
-		if total > 0 {
-			tokpsField = fmt.Sprintf("%.1f", float64(toks)/total.Seconds())
-		} else {
+		// 与 handler 的 recordAttempt 共用同一函数（tokensPerSecond）——本行本来就
+		// 收到了 ttfb 却没用它算速率，导致**流水行的 tok/s 与面板数字对不上**
+		// （面板扣了 TTFB、流水行没扣，同一请求两个数）。共用即根治该漂移。
+		if tps, ok := tokensPerSecond(int64(toks), total, ttfb); ok {
+			tokpsField = fmt.Sprintf("%.1f", tps)
+		} else if total > 0 {
 			tokpsField = "0.0"
 		}
 	}

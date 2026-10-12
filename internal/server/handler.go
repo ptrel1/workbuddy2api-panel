@@ -556,7 +556,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			unbindSticky()
 		}
 	}
-	recordAttempt := func(uid string, delta pool.TokenUsageDelta, started time.Time) {
+	recordAttempt := func(uid string, delta pool.TokenUsageDelta, started time.Time, ttfb time.Duration) {
 		delta.Model = peek.Model
 		latency := time.Since(started)
 		latencyMs := latency.Milliseconds()
@@ -565,9 +565,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		delta.HasLatencyMs = true
 		delta.LatencyMs = latencyMs
-		if delta.HasCompletionTokens && delta.CompletionTokens >= 0 && latencyMs > 0 {
-			delta.HasTokensPerSecond = true
-			delta.TokensPerSecond = float64(delta.CompletionTokens) * 1000 / float64(latencyMs)
+		// 吐字速率的分母扣掉首 token 等待（见 tokensPerSecond 注释）。
+		if delta.HasCompletionTokens && delta.CompletionTokens >= 0 {
+			if tps, ok := tokensPerSecond(delta.CompletionTokens, latency, ttfb); ok {
+				delta.HasTokensPerSecond = true
+				delta.TokensPerSecond = tps
+			}
 		}
 		h.cfg.Pool.RecordTokenUsage(uid, delta)
 
@@ -746,7 +749,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 连败兜底（issue #114）：喂连败计数——连不上上游是「不知道原因的失败」，
 			// 连败 N 次临时出池，单次/偶发不罚（NoteFailures 内部达阈才动作）。
 			// 上游 client 已打 transport error 日志。
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted, 0)
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
 			h.cfg.Pool.NoteFailures(acct.UID)
@@ -757,7 +760,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if status >= 400 {
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted, 0)
 			st.status = status
 			var kind upstream.ErrKind
 			if uerr != nil {
@@ -874,7 +877,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			_ = upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
 			}))
-			recordAttempt(acct.UID, stats.Usage(), attemptStarted)
+			recordAttempt(acct.UID, stats.Usage(), attemptStarted, stats.TTFB())
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
 			// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价，
@@ -893,13 +896,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		resp, err := upstream.Aggregate(rc)
 		rc.Close()
 		if err != nil {
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted, 0)
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
 			return
 		}
-		recordAttempt(acct.UID, usageDeltaFromResponse(resp), attemptStarted)
+		recordAttempt(acct.UID, usageDeltaFromResponse(resp), attemptStarted, 0)
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
@@ -1241,3 +1244,39 @@ func (h *Handler) hintOf(kind upstream.ErrKind, body, bareModel string, hasImage
 	}
 	return upstream.GatewayHint(kind, msg, h.hintContext(bareModel, hasImage))
 }
+
+// tokensPerSecond 计算吐字速率（tok/s），分母**扣除首 token 等待（TTFB）**。
+//
+// 为什么必须扣：TTFB 是"排队+建连+首帧"的耗时，与模型吐字快慢无关。若把它算进
+// 生成时间，同一模型换个上游（TTFB 从 0.3s 涨到 2s）速率就能凭空掉一半 ——
+// 读起来像模型变慢，其实只是排队久了。实测：TTFB=4209ms / tok=204 / total=4.8s，
+// 不扣是 42.5 tok/s，扣后 348.8 tok/s（这才是模型真实吐字速度）。
+//
+// 三个边界（缺一不可）：
+//   - ttfb <= 0（非流式/无观测）→ 不扣，退回端到端（无首 token 概念）。
+//   - ttfb >= total → 退回端到端（避免零/负分母）。
+//   - ⭐ 扣除后剩余窗口 < 200ms → 退回端到端。为什么：ttfb 量的是**首个 SSE 帧**到达
+//     时刻；当上游把整个响应攒到最后一次性下发（假流式/中间层攒批），首帧与末帧几乎
+//     同时到达，total-ttfb 只剩几毫秒 —— 几百 token 能除出**上万 tok/s 的幻数**。
+//     真流式下首帧到末帧铺满剩余窗口，200ms 远低于正常生成时长，不会误伤。
+//
+// 返回 ok=false 表示"不可测"（调用方不写该字段，而非写 0）。
+func tokensPerSecond(completionTokens int64, total, ttfb time.Duration) (float64, bool) {
+	if completionTokens <= 0 || total <= 0 {
+		return 0, false
+	}
+	gen := total
+	if ttfb > 0 && ttfb < total {
+		if remain := total - ttfb; remain >= minGenerationWindow {
+			gen = remain
+		}
+	}
+	if gen <= 0 {
+		return 0, false
+	}
+	return float64(completionTokens) / gen.Seconds(), true
+}
+
+// minGenerationWindow 扣除 TTFB 后，判定"生成时长可测"的最小窗口。
+// 低于它视为假流式（首末帧几乎同时到达），退回端到端耗时避免幻数速率。
+const minGenerationWindow = 200 * time.Millisecond
