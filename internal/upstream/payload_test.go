@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -209,5 +210,97 @@ func TestPrepareBodyDeterministic(t *testing.T) {
 				t.Fatalf("input #%d round %d differs from round 0:\n%s\n%s", i, round, first, out)
 			}
 		}
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GPT 系 max_tokens 下限（吸收上游 fd3e142）
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TestClampGPTMinMaxTokens GPT 系过小 max_tokens 抬到 16；非 GPT / 已达标 / 未携带不动。
+//
+// 背景：Claude Code 切模型时发极小 max_tokens 探针，上游 GPT 系一律 400
+// code=11133（15 拒、16 过）→ 全号轮转同样被拒 → 客户端 503，模型切不过去。
+func TestClampGPTMinMaxTokens(t *testing.T) {
+	cases := []struct {
+		name  string
+		in    string
+		wantM float64
+		wantH bool // 是否应被改
+	}{
+		{"gpt 系过小 → 抬到 16", `{"model":"gpt-6-sol","max_tokens":5}`, 16, true},
+		{"gpt 系恰好 15 → 抬", `{"model":"gpt-5.6-luna","max_tokens":15}`, 16, true},
+		{"gpt 系恰好 16 → 不动", `{"model":"gpt-6-sol","max_tokens":16}`, 16, false},
+		{"gpt 系较大 → 不动", `{"model":"gpt-6-sol","max_tokens":4096}`, 4096, false},
+		{"非 gpt 模型 → 不动", `{"model":"deepseek-v4.1-flash","max_tokens":5}`, 5, false},
+		{"hy4 非 gpt → 不动", `{"model":"hy4-preview","max_tokens":1}`, 1, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out := PrepareBodyOpt([]byte(c.in), false)
+			var m map[string]any
+			if err := json.Unmarshal(out, &m); err != nil {
+				t.Fatal(err)
+			}
+			got, _ := m["max_tokens"].(float64)
+			if got != c.wantM {
+				t.Errorf("max_tokens=%v want %v（in=%s）", got, c.wantM, c.in)
+			}
+		})
+	}
+	// 未携带 max_tokens：不得凭空添加（否则会改变"用默认上限"的语义）
+	out := PrepareBodyOpt([]byte(`{"model":"gpt-6-sol","messages":[]}`), false)
+	var m map[string]any
+	_ = json.Unmarshal(out, &m)
+	if _, has := m["max_tokens"]; has {
+		t.Error("未携带 max_tokens 时不该凭空添加")
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 工具 schema pattern 的 \_ 非标转义归一（吸收上游 230140e）
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TestNormalizeToolPatterns 归一 tools 子树的 `\_` → `_`；消息正文不碰。
+//
+// 背景：上游严格文法校验整体拒收含 `\_` 的 pattern（400 code=11129）。
+// `\_` 与 `_` 在各引擎匹配语义相同，故归一无损。
+func TestNormalizeToolPatterns(t *testing.T) {
+	// ⚠️ 消息正文里**故意放一个含 pattern 键的对象**（而非只有字符串）——
+	// 否则"越界到全 obj"的变异咬不住：字符串正文本来就不含 pattern 字段。
+	in := `{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"C:\\_path",
+		"fake_schema":{"pattern":"^keep\\_this$"}}],
+		"tools":[{"type":"function","function":{"name":"agent_run","parameters":{
+			"type":"object","properties":{
+				"runId":{"type":"string","pattern":"^agent\\_run\\_"},
+				"plain":{"type":"string","pattern":"^ok$"}
+			},
+			"patternProperties":{"^x\\_y":{"type":"string"}}
+		}}}]}`
+	out := PrepareBodyOpt([]byte(in), false)
+	s := string(out)
+	// 工具 pattern 已归一
+	if strings.Contains(s, `agent\_run\_`) {
+		t.Errorf("工具 pattern 的 \\_ 未归一：%s", s)
+	}
+	if !strings.Contains(s, `^agent_run_`) {
+		t.Errorf("归一结果不对（应含 ^agent_run_）：%s", s)
+	}
+	// patternProperties 键也归一
+	if strings.Contains(s, `x\_y`) {
+		t.Errorf("patternProperties 键未归一：%s", s)
+	}
+	// ⚠️ 消息正文里的 `\_` **不得**被碰（那是用户数据，如 Windows 路径）
+	if !strings.Contains(s, `C:\\_path`) {
+		t.Errorf("消息正文的 \\_ 被误改（应原样保留）：%s", s)
+	}
+	// ⭐ 消息里的**伪 schema**（带 pattern 键）也不得被改 —— 归一必须**只作用于
+	// tools 子树**。这条是"越界到全 obj"变异的判据（仅靠字符串正文咬不住）。
+	if !strings.Contains(s, `^keep\\_this$`) {
+		t.Errorf("消息内的 pattern 被误改（归一越界到 tools 之外）：%s", s)
+	}
+	// 无关 pattern 不动
+	if !strings.Contains(s, `^ok$`) {
+		t.Errorf("无关 pattern 被改动：%s", s)
 	}
 }

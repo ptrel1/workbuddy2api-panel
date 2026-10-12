@@ -41,6 +41,12 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	// /console 同源）只认 max_tokens——别名透传会被上游忽略后回落默认输出上限
 	// （实测 32000），长流任务被截。
 	translateMaxCompletionTokens(obj)
+	// GPT 系 max_tokens 下限（见 clampGPTMinMaxTokens）：Claude Code 切模型探针
+	// 发极小 max_tokens → 上游 GPT 系一律 400 → 全号轮转被拒 → 客户端 503。
+	clampGPTMinMaxTokens(obj)
+	// 工具 schema 的 `\_` 非标转义归一（见 normalizeToolPatterns）：上游严格文法
+	// 校验会整体拒收（11129），换账号无用，只能在发送前修。
+	normalizeToolPatterns(obj)
 	// stream_options 仅当 body 未显式带时补 {include_usage: true}（D7）：
 	// 官方 CLI 流式必发该字段，上游据此在末帧返回 usage 用量；显式带则不覆盖。
 	if _, has := obj["stream_options"]; !has {
@@ -291,5 +297,101 @@ func normalizeToolChoice(obj map[string]any) {
 		}
 	default:
 		delete(obj, "tool_choice")
+	}
+}
+
+// gptMinMaxTokens GPT 系上游接受的 max_tokens 下限。
+const gptMinMaxTokens = 16
+
+// clampGPTMinMaxTokens 把 GPT 系模型过小的 max_tokens 抬到下限。
+//
+// 背景：上游 GPT 系（实测 gpt-6-sol / gpt-6-luna / gpt-5.6-sol）对 max_tokens < 16
+// 一律 400 code=11133 model_param_invalid（15 拒、16 过，同号同 body 对照）；hy4 等
+// 非 GPT 模型无此限制。Claude Code 切模型时发 max_tokens 极小的探针，全号轮转同样
+// 被拒 → 客户端 503，模型永远切不过去。账号与 body 其余部分无关，换号无用，只能
+// 在发送前修。抬到下限只放宽输出上限、不改语义；未携带字段 / 非数值 / 已达下限一律不动。
+func clampGPTMinMaxTokens(obj map[string]any) {
+	model, _ := obj["model"].(string)
+	if !strings.Contains(strings.ToLower(model), "gpt-") {
+		return
+	}
+	var v int64
+	switch n := obj["max_tokens"].(type) {
+	case float64:
+		v = int64(n)
+	case int64:
+		v = n
+	case int:
+		v = int64(n)
+	default:
+		return
+	}
+	if v < gptMinMaxTokens {
+		obj["max_tokens"] = int64(gptMinMaxTokens)
+		log.Printf("max_tokens clamped model=%s %d -> %d", model, v, gptMinMaxTokens)
+	}
+}
+
+// normalizeToolPatterns 归一化 tools 子树里 pattern 的非标准转义 `\_`（→ `_`）。
+//
+// 上游对 tools[].function.parameters 做严格 JSON Schema/正则文法校验，pattern 含
+// `\_`（转义的字面量下划线）会整体拒收：400 code=11129 invalid_function_call_
+// parameters。`\_` 不是任何正则文法的合法转义，但所有主流引擎（RE2/PCRE/JS Annex B）
+// 都宽容地视为 `_` 本身 —— 上游校验器比它们全部更严。实案：ZCode 的 exa 插件
+// agent_run 工具 runId/previousRunId 带 `^agent\_run\_`，deepseek 系全家确定性 400
+// → 网关侧归 ErrClient 只换号不罚但喂连败计数 → 轮转烧满 5 连败触发连败降权、
+// 客户端 503。schema 级拒绝换账号无用，只能在发送前修。
+//
+// 归一无损：`\_` 与 `_` 在所有引擎匹配语义相同（归一后上游 200），工具方功能不变。
+// 只动 tools 子树（pattern 值 + patternProperties 键）；消息正文里的 `\_`
+// （如 Windows 路径 C:\_x）不碰。其余非标转义（`\:` 等）未证实触发，不扩面。
+// **独立于 sanitize 开关**：这是「让请求通过」，不是脱敏。
+func normalizeToolPatterns(obj map[string]any) {
+	rawTools, ok := obj["tools"].([]any)
+	if !ok {
+		return
+	}
+	for _, raw := range rawTools {
+		tool, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		// OpenAI 形态 tools[].function.parameters；裸 tools[].parameters 兼容。
+		if fn, ok := tool["function"].(map[string]any); ok {
+			unescapePatternLiteralEscapes(fn["parameters"])
+		}
+		unescapePatternLiteralEscapes(tool["parameters"])
+	}
+}
+
+// unescapePatternLiteralEscapes 递归改写 schema 树里 pattern 值与 patternProperties
+// 键中的 `\_` → `_`（patternProperties 的键也是正则；map 键不可原地改，命中时重建该层）。
+func unescapePatternLiteralEscapes(node any) {
+	switch n := node.(type) {
+	case map[string]any:
+		if p, ok := n["pattern"].(string); ok && strings.Contains(p, `\_`) {
+			n["pattern"] = strings.ReplaceAll(p, `\_`, `_`)
+		}
+		if props, ok := n["patternProperties"].(map[string]any); ok {
+			rebuilt := false
+			fixed := make(map[string]any, len(props))
+			for k, v := range props {
+				if strings.Contains(k, `\_`) {
+					k = strings.ReplaceAll(k, `\_`, `_`)
+					rebuilt = true
+				}
+				fixed[k] = v
+			}
+			if rebuilt {
+				n["patternProperties"] = fixed
+			}
+		}
+		for _, v := range n {
+			unescapePatternLiteralEscapes(v)
+		}
+	case []any:
+		for _, v := range n {
+			unescapePatternLiteralEscapes(v)
+		}
 	}
 }
