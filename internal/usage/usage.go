@@ -57,6 +57,10 @@ type bucket struct {
 	LatN  int64   `json:"ln"` // 延迟样本数
 	TPS   float64 `json:"v"`  // 吐字速率累计
 	TPSN  int64   `json:"vn"` // 速率样本数
+	// CH/CM 前缀缓存命中/未命中 token 累计（费用观测维度）。
+	// 旧文件无这两字段 → 零值加载，命中率分母为 0 时输出"样本不足"而非 0%，无损兼容。
+	CH int64 `json:"ch"` // cache hit tokens
+	CM int64 `json:"cm"` // cache miss tokens
 }
 
 // file 落盘结构。
@@ -138,6 +142,12 @@ type Delta struct {
 	HasLatency       bool
 	TokensPerSecond  float64
 	HasTPS           bool
+	// 前缀缓存命中/未命中 token（缺失时 Has* 为 false，累加器跳过 —— 与其它
+	// 维度同口径：不用 0 冒充"确实为 0"）。 */
+	CacheHitTokens     int64
+	HasCacheHitTokens  bool
+	CacheMissTokens    int64
+	HasCacheMissTokens bool
 }
 
 // Add 记录一次请求尝试。
@@ -188,6 +198,15 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 	if d.HasTPS {
 		b.TPS += d.TokensPerSecond
 		b.TPSN++
+	}
+	// ⚠️ 缓存计数字段**必须独立于 HasTPS**：TTFB 不可测（非流式）或未采到速率时
+	// HasTPS 为 false，但 cache 维度是**独立观测**（上游末帧 usage 直接给），
+	// 塞进 HasTPS 块会让非流式请求的缓存统计全部丢失（实测：测试 hit=0 miss=0 暴露）。
+	if d.HasCacheHitTokens {
+		b.CH += d.CacheHitTokens
+	}
+	if d.HasCacheMissTokens {
+		b.CM += d.CacheMissTokens
 	}
 	r.dirty = true
 }
@@ -325,6 +344,13 @@ type Agg struct {
 	// 一个有误导性的具体数字——属"数据不会报错但会误导人"的一类缺陷（同 §余额完整性标注）。
 	LatSamples int64 `json:"latency_samples"`
 	TPSSamples int64 `json:"tps_samples"`
+	// 前缀缓存命中/未命中 token 与命中率（费用观测维度）。
+	// CacheHitRate 在**无样本时为 -1**（不是 0）——0 会被读成"命中率极低"，
+	// 而 -1 让前端明确显示"样本不足"。与 LatSamples 的处理同哲学：
+	// "数据不会报错但会误导人"是本次要避免的一类缺陷。
+	CacheHitTokens  int64   `json:"cache_hit_tokens"`
+	CacheMissTokens int64   `json:"cache_miss_tokens"`
+	CacheHitRate    float64 `json:"cache_hit_rate"`
 }
 
 // aggAcc 是聚合过程中的累加器：Agg 只放已算好的结果，均值需要样本数才能
@@ -347,6 +373,8 @@ func (g *aggAcc) add(b *bucket) {
 	g.latSamples += b.LatN
 	g.tpsSum += b.TPS
 	g.tpsSamples += b.TPSN
+	g.CacheHitTokens += b.CH
+	g.CacheMissTokens += b.CM
 }
 
 func (g *aggAcc) finish() Agg {
@@ -360,6 +388,13 @@ func (g *aggAcc) finish() Agg {
 	}
 	if g.tpsSamples > 0 {
 		a.AvgTPS = g.tpsSum / float64(g.tpsSamples)
+	}
+	// 命中率：无样本（hit+miss 都为 0）时为 -1（"样本不足"），否则真实比率。
+	// 分母是 hit+miss 而非 prompt_tokens —— 后者可能含未计入缓存的其它部分。
+	if total := g.CacheHitTokens + g.CacheMissTokens; total > 0 {
+		a.CacheHitRate = float64(g.CacheHitTokens) / float64(total)
+	} else {
+		a.CacheHitRate = -1
 	}
 	return a
 }

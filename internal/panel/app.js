@@ -1681,6 +1681,29 @@ function usBar(prompt, completion, total) {
    域表没有，多输出会造成列错位。早先靠「mid 是否为 undefined」隐式判断，调用方稍一
    改动就会错列，故改为显式参数。**改这里必须同步 index.html 的表头与 colspan**。
    两列均经 fmtPerf 做样本数判据（少样本显示 "—"，避免拿个位数样本当模型速度）。 */
+/* fmtCacheRate 渲染前缀缓存命中率。
+   ⭐ 语义分层（与 fmtPerf 同哲学，避免"数字不报错但误导人"）：
+     - 无样本（后端给 -1）→ "—"，title 说明"该窗口无缓存样本"
+     - 样本不足（hit+miss < 20）→ "xx.x%"，灰色（少样本抖动大，不当结论看）
+     - ≥90% 绿 / 80–90% 黄 / <80% 红
+   为什么值得单列：网关**已注入 prompt_cache_key 省钱**，命中与不命中的费用差
+   可达 **17 倍**（cache_key.go 实测 0.34 → 0.02）—— 这一列直接决定实际花费。 */
+function fmtCacheRate(rate, a) {
+  const hit = a.cache_hit_tokens || 0, miss = a.cache_miss_tokens || 0;
+  const total = hit + miss;
+  if (rate == null || rate < 0 || total <= 0) {
+    return '<span class="cache-na" title="该窗口无缓存命中/未命中样本（上游未返回该维度）">—</span>';
+  }
+  const pct = (rate * 100).toFixed(1);
+  const t = '命中 ' + fmtTok(hit) + ' / 未命中 ' + fmtTok(miss) + '（共 ' + fmtTok(total) + ' tok）';
+  if (total < 20) {
+    // 少样本：给数值但弱化（灰），title 注明样本少 —— 不静默隐藏数据。
+    return '<span class="cache-na" title="' + esc(t + ' · 样本不足（<' + 20 + '），仅供参考') + '">' + pct + '%</span>';
+  }
+  const cls = rate >= 0.9 ? 'cache-hi' : (rate >= 0.8 ? 'cache-mid' : 'cache-lo');
+  return '<span class="' + cls + '" title="' + esc(t) + '">' + pct + '%</span>';
+}
+
 function usRow(name, sub, a, mid, withPerf) {
   return '<tr>' +
     '<td class="mark" aria-hidden="true"></td>' +
@@ -1693,7 +1716,8 @@ function usRow(name, sub, a, mid, withPerf) {
     '<td class="num">' + fmtTok(a.total_tokens) + '</td>' +
     (withPerf
       ? '<td class="num">' + fmtPerf(a.avg_latency_ms, a.latency_samples, 'ms') + '</td>' +
-        '<td class="num">' + fmtPerf(a.avg_tokens_per_second, a.tps_samples, 'rate') + '</td>'
+        '<td class="num">' + fmtPerf(a.avg_tokens_per_second, a.tps_samples, 'rate') + '</td>' +
+        '<td class="num">' + fmtCacheRate(a.cache_hit_rate, a) + '</td>'
       : '') +
     '</tr>';
 }
@@ -1706,7 +1730,8 @@ function renderUsage(d) {
     usStat(fmtTok(t.prompt_tokens), 'prompt') +
     usStat(fmtTok(t.completion_tokens), 'completion') +
     usStat(t.errors ? String(t.errors) : '0', '失败尝试', t.errors ? 'warn' : '') +
-    usStat(fmtMs(t.avg_latency_ms), '平均延迟');
+    usStat(fmtMs(t.avg_latency_ms), '平均延迟') +
+    usStat(fmtCacheRate(t.cache_hit_rate, t), '缓存命中率');
 
   $('usNote').textContent = (d.buckets || 0) + ' 个分桶 · ' +
     (d.since ? '自 ' + d.since.slice(0, 10) : '无数据') +

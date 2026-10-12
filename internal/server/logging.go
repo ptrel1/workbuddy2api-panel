@@ -81,8 +81,19 @@ type chatStatsReader struct {
 	// credit 上游末帧 usage.credit（本次真实扣费积分），供成本台账（NoteModelCost）。
 	hasCredit bool
 	credit    float64
-	pend      []byte // 已读未返回的行缓存
+	// 前缀缓存命中/未命中 token 数（费用观测核心维度）。
+	// 为什么要观测：网关**已注入 prompt_cache_key** 为省费用（见 cache_key.go），
+	// 但此前看不到它到底有没有命中 —— 命中与不命中的费用差可达 **17 倍**。
+	cacheHitTokens  int
+	hasCacheHit     bool
+	cacheMissTokens int
+	hasCacheMiss    bool
+	pend            []byte // 已读未返回的行缓存
 }
+
+// CacheHit / CacheMiss 返回前缀缓存命中/未命中 token 数（缺失时 ok=false）。
+func (s *chatStatsReader) CacheHit() (int, bool)  { return s.cacheHitTokens, s.hasCacheHit }
+func (s *chatStatsReader) CacheMiss() (int, bool) { return s.cacheMissTokens, s.hasCacheMiss }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
 func newChatStatsReaderSince(r io.Reader, since time.Time) *chatStatsReader {
@@ -110,6 +121,10 @@ func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
 		CompletionTokens:    int64(s.completionTokens),
 		HasTotalTokens:      s.hasTotalTokens,
 		TotalTokens:         int64(s.totalTokens),
+		HasCacheHitTokens:   s.hasCacheHit,
+		CacheHitTokens:      int64(s.cacheHitTokens),
+		HasCacheMissTokens:  s.hasCacheMiss,
+		CacheMissTokens:     int64(s.cacheMissTokens),
 	}
 }
 
@@ -133,6 +148,13 @@ func (s *chatStatsReader) parseSSELine(line string) {
 			CompletionTokens *int     `json:"completion_tokens"`
 			TotalTokens      *int     `json:"total_tokens"`
 			Credit           *float64 `json:"credit"`
+			// 前缀缓存命中/未命中（费用观测核心维度，见 upstream/cache_key.go：
+			// 同一段 8k 前缀带 cache key 后 credit 从 0.34 → 0.02，**降约 17×**）。
+			// 上游字段名以 prompt_cache_hit_tokens / prompt_cache_miss_tokens 为准；
+			// 部分形态用 cache_hit_tokens 短名，两个都收（优先长名）。
+			CacheHitTokens      *int `json:"prompt_cache_hit_tokens"`
+			CacheHitTokensShort *int `json:"cache_hit_tokens"`
+			CacheMissTokens     *int `json:"prompt_cache_miss_tokens"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
@@ -153,6 +175,25 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	if chunk.Usage.Credit != nil {
 		s.hasCredit = true
 		s.credit = *chunk.Usage.Credit
+	}
+	// 缓存命中数：长名优先，短名兜底（同一字段的两种上游形态）。
+	if chunk.Usage.CacheHitTokens != nil {
+		s.hasCacheHit = true
+		s.cacheHitTokens = *chunk.Usage.CacheHitTokens
+	} else if chunk.Usage.CacheHitTokensShort != nil {
+		s.hasCacheHit = true
+		s.cacheHitTokens = *chunk.Usage.CacheHitTokensShort
+	}
+	if chunk.Usage.CacheMissTokens != nil {
+		s.hasCacheMiss = true
+		s.cacheMissTokens = *chunk.Usage.CacheMissTokens
+	} else if s.hasCacheHit && s.hasPromptTokens {
+		// miss 缺失时按 prompt - hit 推导（上游不总是显式给 miss）。
+		// 推导值为负说明两字段口径不一致 → 视为不可信，不给该维度（宁缺勿滥）。
+		if d := s.promptTokens - s.cacheHitTokens; d >= 0 {
+			s.hasCacheMiss = true
+			s.cacheMissTokens = d
+		}
 	}
 }
 

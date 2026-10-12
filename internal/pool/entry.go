@@ -57,6 +57,12 @@ type TokenUsageDelta struct {
 	LatencyMs           int64
 	HasTokensPerSecond  bool
 	TokensPerSecond     float64
+	// 前缀缓存命中/未命中 token 数（费用观测维度）。
+	// 命中率高 → 实际费用显著低（实测同一 8k 前缀命中时 credit 0.02 vs 未命中 0.34）。
+	HasCacheHitTokens  bool
+	CacheHitTokens     int64
+	HasCacheMissTokens bool
+	CacheMissTokens    int64
 }
 
 // Status 单个账号对外暴露的状态（脱敏）。

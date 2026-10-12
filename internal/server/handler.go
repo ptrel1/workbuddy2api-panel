@@ -556,7 +556,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			unbindSticky()
 		}
 	}
-	recordAttempt := func(uid string, delta pool.TokenUsageDelta, started time.Time, ttfb time.Duration) {
+	recordAttempt := func(uid string, delta pool.TokenUsageDelta, started time.Time, ttfb time.Duration,
+		cacheHit int64, hasCacheHit bool, cacheMiss int64, hasCacheMiss bool) {
 		delta.Model = peek.Model
 		latency := time.Since(started)
 		latencyMs := latency.Milliseconds()
@@ -593,6 +594,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				HasLatency:       delta.HasLatencyMs,
 				TokensPerSecond:  delta.TokensPerSecond,
 				HasTPS:           delta.HasTokensPerSecond,
+				// 前缀缓存命中/未命中（费用观测）：流量走 stats（流式）才有，
+				// 故从 stats 直取而非从 pool.TokenUsageDelta —— 后者是账号池
+				// 维度的累加器，不含这一对字段的语义。
+				CacheHitTokens:     cacheHit,
+				HasCacheHitTokens:  hasCacheHit,
+				CacheMissTokens:    cacheMiss,
+				HasCacheMissTokens: hasCacheMiss,
 			}, delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens)
 		}
 	}
@@ -749,7 +757,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 连败兜底（issue #114）：喂连败计数——连不上上游是「不知道原因的失败」，
 			// 连败 N 次临时出池，单次/偶发不罚（NoteFailures 内部达阈才动作）。
 			// 上游 client 已打 transport error 日志。
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted, 0)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted, 0, 0, false, 0, false)
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
 			h.cfg.Pool.NoteFailures(acct.UID)
@@ -760,7 +768,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if status >= 400 {
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted, 0)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted, 0, 0, false, 0, false)
 			st.status = status
 			var kind upstream.ErrKind
 			if uerr != nil {
@@ -877,7 +885,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			_ = upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
 			}))
-			recordAttempt(acct.UID, stats.Usage(), attemptStarted, stats.TTFB())
+			ch, hch := stats.CacheHit()
+			cm, hcm := stats.CacheMiss()
+			recordAttempt(acct.UID, stats.Usage(), attemptStarted, stats.TTFB(),
+				int64(ch), hch, int64(cm), hcm)
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
 			// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价，
@@ -896,13 +907,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		resp, err := upstream.Aggregate(rc)
 		rc.Close()
 		if err != nil {
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted, 0)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted, 0, 0, false, 0, false)
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
 			return
 		}
-		recordAttempt(acct.UID, usageDeltaFromResponse(resp), attemptStarted, 0)
+		recordAttempt(acct.UID, usageDeltaFromResponse(resp), attemptStarted, 0, 0, false, 0, false)
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)

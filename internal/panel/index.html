@@ -504,6 +504,13 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   /* .fb 降级标注（「⤳ 已路由至 X」）：用 ok 色 —— 与「限流」的 warn 形成对照，
      表达"虽然限流了，但已被自动接住"。这是好消息，不该用告警色。 */
   .rlm .fb { color: var(--ok); font-weight: 550; }
+  /* 前缀缓存命中率配色：语义化阈值（≥90% 好 / 80–90% 注意 / <80% 差 / 无样本灰）。
+     为什么用 ok/warn/bad 三色而非单一色：命中率直接决定费用（命中与未命中差 ~17×），
+     运维要能一眼扫出"哪个模型/账号的缓存没生效"。 */
+  .cache-hi { color: var(--ok); font-weight: 600; }
+  .cache-mid { color: var(--warn); font-weight: 600; }
+  .cache-lo { color: var(--bad); font-weight: 600; }
+  .cache-na { color: var(--ink-3); }
   /* dhint 禁用原因：同状态列窄的问题，clamp 到 2 行（完整内容在 title 悬停）。 */
   .dhint { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
     overflow: hidden; }
@@ -943,7 +950,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <th class="mark" aria-hidden="true"></th><th>账号</th><th>域</th>
               <th class="num">请求</th><th class="num">失败</th>
               <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
-              <th class="num">均延迟</th><th class="num">均速率</th>
+              <th class="num">均延迟</th><th class="num">均速率</th><th class="num">缓存命中</th>
             </tr></thead>
             <tbody id="usAccBody"></tbody>
           </table>
@@ -959,7 +966,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <th class="mark" aria-hidden="true"></th><th>模型</th>
               <th class="num">请求</th><th class="num">失败</th>
               <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
-              <th class="num">均延迟</th><th class="num">均速率</th>
+              <th class="num">均延迟</th><th class="num">均速率</th><th class="num">缓存命中</th>
             </tr></thead>
             <tbody id="usModelBody"></tbody>
           </table>
