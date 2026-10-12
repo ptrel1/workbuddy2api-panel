@@ -1740,12 +1740,12 @@ function renderUsage(d) {
   $('usAccBody').innerHTML = (d.by_account || []).map(x =>
     usRow(x.key.slice(0, 8), x.extra || '', x,
       '<td class="num">' + esc(x.realm || '') + '</td>', true)
-  ).join('') || '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
+  ).join('') || '<tr><td colspan="11" class="empty">暂无数据</td></tr>';
 
   // 模型表：带延迟/速率列（withPerf=true），表头见 index.html「平均延迟 / 速度」。
   // 这两列让"哪个模型快、哪个慢"直接可读——此前只有账号表有，按模型统计看不到速度。
   $('usModelBody').innerHTML = (d.by_model || []).map(x =>
-    usRow(x.key, '', x, '', true)).join('') || '<tr><td colspan="9" class="empty">暂无数据</td></tr>';
+    usRow(x.key, '', x, '', true)).join('') || '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
 
   $('usRealmBody').innerHTML = (d.by_realm || []).map(x =>
     usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
