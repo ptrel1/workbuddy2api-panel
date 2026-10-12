@@ -218,6 +218,63 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 	return earliest, kinds
 }
 
+// wallclockCheckStep 墙钟校验段长：等待槽位时单次 timer 的最大时长，每段醒来用
+// 墙钟重判是否到点。值是「时点精度」与「空闲唤醒频率」的折中——60s 段内时点
+// 偏差上限 60s，对签到/保活类任务足够。
+const wallclockCheckStep = time.Minute
+
+// slotClockNow 是 waitSlot 读取墙钟的接缝（默认即 time.Now，生产行为零变化）。
+// 为什么需要它：分段等待的**唯一可观测差异**是"墙钟被重读了几次"——
+// ctx 取消 / rearm 都能通过 select 立即返回，与是否分段无关，故仅靠它们
+// 无法区分"分段"与"一把睡到底"（实测：那种测法咬不住变异）。
+// 有了这个接缝，测试可以注入一个**快进时钟**，直接验证"每段都重判墙钟"。
+var slotClockNow = time.Now
+
+// slotWake waitSlot 的三态结果。
+type slotWake int
+
+const (
+	slotFired  slotWake = iota // 墙钟已到达计划时点：补跑本批
+	slotRearm                  // 排程已变（Reconfigure）：上层重算下一次唤醒
+	slotCancel                 // ctx 取消：上层优雅退出
+)
+
+// waitSlot 分段等待到 next 的**墙钟**时刻（next 由 nextWake 用 time.Date 构造、
+// 不携带单调读数，time.Until 对它是纯墙钟差）。
+//
+// 为什么不一把 time.NewTimer(time.Until(next)) 睡到底：timer 的等待基于单调时钟，
+// macOS / Windows Modern Standby **睡眠会冻结它**——睡眠时长不足整个等待周期时，
+// fire 被顺延「睡眠时长」（墙钟已过点、timer 还要继续等），时点被错过且不会立即补跑。
+// 分段睡、每段醒来用墙钟重判，把冻结的影响限制在一段之内：睡眠结束后的第一段末尾
+// 必然发现「墙钟已越过时点」并立即补跑，偏差上限 = step + 睡眠落段余量。
+//
+// ctx 取消 / rearmSchedule（在线改配置重排）在每段的 select 里随时返回，段长
+// 不影响两者响应性。返回三态见 slotWake。
+func (s *Scheduler) waitSlot(ctx context.Context, next time.Time, step time.Duration) slotWake {
+	for {
+		wallRemain := next.Sub(slotClockNow())
+		if wallRemain <= 0 {
+			return slotFired
+		}
+		d := wallRemain
+		if d > step {
+			d = step
+		}
+		timer := time.NewTimer(d)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return slotCancel
+		case <-s.rearmSchedule:
+			timer.Stop()
+			return slotRearm
+		case <-timer.C:
+			// 单段结束：回到循环头用墙钟重判（这正是抗睡眠冻结的关键——
+			// 不信任 timer 的累计等待，只信 time.Until 的墙钟差）。
+		}
+	}
+}
+
 // Run 主循环，阻塞直到 ctx 取消。
 // Reconfigure 触发 rearmSchedule 时提前唤醒重算（新时点/开关立即生效）。
 func (s *Scheduler) Run(ctx context.Context) {
@@ -232,14 +289,12 @@ func (s *Scheduler) Run(ctx context.Context) {
 				continue
 			}
 		}
-		timer := time.NewTimer(time.Until(next))
-		select {
-		case <-ctx.Done():
-			timer.Stop()
+		switch s.waitSlot(ctx, next, wallclockCheckStep) {
+		case slotCancel:
 			return
-		case <-s.rearmSchedule:
-			timer.Stop() // 排程已变：重算下一次唤醒
-		case <-timer.C:
+		case slotRearm:
+			continue // 排程已变：重算下一次唤醒
+		case slotFired:
 			// 到点任务在排程时确定（不依赖唤醒时刻的小时数），迟到唤醒也不会漏跑。
 			// 唤醒时全部并行派发：每类一个 goroutine，慢任务族（如活跃上报
 			// 多号 × 间隔 ≈ 数分钟睡眠）不再阻塞同槽其他任务族；返回前等全部
