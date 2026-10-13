@@ -263,6 +263,14 @@ func Default() *Config {
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
+	// 请求归档缺省**开启**（只写脱敏元数据，写盘失败不影响聊天请求）。
+	// ⚠️ 必须在这里设：bool 零值是 false，而 Load 是「先 Default() 再被 JSON 覆盖」——
+	// 只在 normalize 里做数值回落是不够的（bool 没有"<=0"可判），缺 logging 段的老配置
+	// 会静默保持 false 把归档关掉（实测踩过：面板显示"归档已关闭"）。
+	// 用户显式写 `"request_archive_enabled": false` 仍可关（JSON 覆盖优先级更高）。
+	c.Logging.RequestArchiveEnabled = true
+	c.Logging.RequestRetentionDays = 7
+	c.Logging.RequestArchiveMaxMB = 100
 	return c
 }
 

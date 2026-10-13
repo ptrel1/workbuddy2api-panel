@@ -842,3 +842,63 @@ func TestCostExploreEnvOverride(t *testing.T) {
 		t.Errorf("cost_explore_interval=%v want env 45m", c.CostExploreIntervalDur)
 	}
 }
+
+// TestRequestArchiveDefaultEnabled ⭐ 缺 logging 段的老配置也必须**默认开启**归档。
+//
+// 为什么必须钉住：`RequestArchiveEnabled` 是 bool，Go 零值是 **false**；而 Load 是
+// 「先 Default() 再被 JSON 覆盖」。若只在 normalize 里做数值回落（bool 没有 "<=0" 可判），
+// 缺 logging 段的生产配置会**静默保持 false 把归档关掉** —— 实测踩过（面板显示"归档已关闭"，
+// 而上线说明写着"缺省开启"）。这条测试就是那个不一致的回归网。
+func TestRequestArchiveDefaultEnabled(t *testing.T) {
+	// 1) Default() 必须置 true
+	if !Default().Logging.RequestArchiveEnabled {
+		t.Error("Default() 的 RequestArchiveEnabled 应为 true")
+	}
+
+	// 2) 老配置（无 logging 段）加载后必须仍为 true
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(`{"listen":":7863","api_key":"k"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Logging.RequestArchiveEnabled {
+		t.Error("无 logging 段的老配置加载后归档应默认开启（bool 零值陷阱）")
+	}
+	if c.Logging.RequestRetentionDays != 7 {
+		t.Errorf("retentionDays=%d，want 7", c.Logging.RequestRetentionDays)
+	}
+	if c.Logging.RequestArchiveMaxMB != 100 {
+		t.Errorf("archiveMaxMB=%d，want 100", c.Logging.RequestArchiveMaxMB)
+	}
+
+	// 3) 用户显式关闭必须生效（JSON 覆盖优先级高于 Default）
+	path2 := filepath.Join(dir, "c2.json")
+	if err := os.WriteFile(path2, []byte(`{"logging":{"request_archive_enabled":false}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c2, err := Load(path2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.Logging.RequestArchiveEnabled {
+		t.Error("显式 request_archive_enabled=false 未被尊重（JSON 覆盖应优先于 Default）")
+	}
+
+	// 4) <=0 回落默认
+	path3 := filepath.Join(dir, "c3.json")
+	if err := os.WriteFile(path3, []byte(`{"logging":{"request_retention_days":0,"request_archive_max_mb":-5}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c3, err := Load(path3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c3.Logging.RequestRetentionDays != 7 || c3.Logging.RequestArchiveMaxMB != 100 {
+		t.Errorf("<=0 应回落默认，得 %d/%d",
+			c3.Logging.RequestRetentionDays, c3.Logging.RequestArchiveMaxMB)
+	}
+}
