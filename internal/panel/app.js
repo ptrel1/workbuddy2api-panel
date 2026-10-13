@@ -1722,6 +1722,46 @@ function usRow(name, sub, a, mid, withPerf) {
     '</tr>';
 }
 
+/* fmtCredits 积分展示：保留 2 位（分是小数，0.02 这种值很常见，整数化会看不出差别）。 */
+function fmtCredits(v) {
+  if (v == null) return '—';
+  return (Math.round(v * 100) / 100).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+/* fmtPer1K 换算比例：每千 token 扣多少分。
+   无有效样本（credit_tokens=0）时显示 "—" —— 不用 0 冒充（0 会被读成"免费"）。 */
+function fmtPer1K(rate, row) {
+  if (!row || !row.credit_tokens) {
+    return '<span class="cache-na" title="该行无「credit 与 token 同时存在」的样本，无法计算换算比例">—</span>';
+  }
+  return fmtCredits(rate);
+}
+
+/* renderDeductions 积分扣除明细表。
+   ⭐ 只渲染**有 credit 观测**的行（后端已过滤）—— 没有观测的桶显示"扣 0 分"是误导。
+   超过 maxDeductions 时后端截断，这里据 deduction_total 提示，不静默丢数据。 */
+function renderDeductions(d) {
+  const rows = d.deductions || [];
+  $('usDeductBody').innerHTML = rows.map(x =>
+    '<tr>' +
+    '<td class="mark" aria-hidden="true"></td>' +
+    '<td>' + esc(x.t) + '</td>' +
+    '<td>' + esc(x.realm || '') + '</td>' +
+    '<td>' + esc(x.nickname || ((x.uid || '').slice(0, 8))) + '</td>' +
+    '<td>' + esc(x.model || '') + '</td>' +
+    '<td class="num">' + fmtTok(x.requests) + '</td>' +
+    '<td class="num">' + fmtCredits(x.credits) + '</td>' +
+    '<td class="num">' + fmtTok(x.credit_tokens) + '</td>' +
+    '<td class="num">' + fmtPer1K(x.credits_per_1k_tokens, x) + '</td>' +
+    '</tr>'
+  ).join('') || '<tr><td colspan="9" class="empty">该窗口无积分扣除记录</td></tr>';
+
+  const total = d.deduction_total || 0;
+  $('usDeductNote').textContent = total > rows.length
+    ? '显示最近 ' + rows.length + ' 行（窗口内共 ' + total + ' 行，已截断）'
+    : (total ? '共 ' + total + ' 行' : '');
+}
+
 function renderUsage(d) {
   const t = d.totals || {};
   $('usStats').innerHTML =
@@ -1731,7 +1771,11 @@ function renderUsage(d) {
     usStat(fmtTok(t.completion_tokens), 'completion') +
     usStat(t.errors ? String(t.errors) : '0', '失败尝试', t.errors ? 'warn' : '') +
     usStat(fmtMs(t.avg_latency_ms), '平均延迟') +
-    usStat(fmtCacheRate(t.cache_hit_rate, t), '缓存命中率');
+    usStat(fmtCacheRate(t.cache_hit_rate, t), '缓存命中率') +
+    // 积分卡：无样本（credit_samples=0）时显示 "—"（不是 0）——
+    // "上游未回报扣费"与"扣了 0 分"是两回事。
+    usStat(t.credit_samples ? fmtCredits(t.credits) : '—', '扣费积分') +
+    usStat(t.credit_tokens ? fmtCredits(t.credits_per_1k_tokens) : '—', '每千 token 折积分');
 
   $('usNote').textContent = (d.buckets || 0) + ' 个分桶 · ' +
     (d.since ? '自 ' + d.since.slice(0, 10) : '无数据') +
@@ -1746,6 +1790,8 @@ function renderUsage(d) {
   // 这两列让"哪个模型快、哪个慢"直接可读——此前只有账号表有，按模型统计看不到速度。
   $('usModelBody').innerHTML = (d.by_model || []).map(x =>
     usRow(x.key, '', x, '', true)).join('') || '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
+
+  renderDeductions(d);
 
   $('usRealmBody').innerHTML = (d.by_realm || []).map(x =>
     usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';

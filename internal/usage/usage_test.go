@@ -77,8 +77,11 @@ func TestFlushLoadRoundtrip(t *testing.T) {
 	}
 	raw, _ := os.ReadFile(path)
 	var f file
-	if err := json.Unmarshal(raw, &f); err != nil || f.Version != 1 || len(f.Buckets) != 1 {
-		t.Fatalf("落盘文件异常: err=%v buckets=%d", err, len(f.Buckets))
+	// 版本号随格式演进（v2 增加积分类 cr/cn/ct 与缓存类 ch/cm 字段）；
+	// 旧文件按零值加载、token 数据不丢，故只需断言"当前版本"而非钉死历史值。
+	if err := json.Unmarshal(raw, &f); err != nil || f.Version != fileVersion || len(f.Buckets) != 1 {
+		t.Fatalf("落盘文件异常: err=%v version=%d buckets=%d (want version=%d)",
+			err, f.Version, len(f.Buckets), fileVersion)
 	}
 }
 
@@ -244,5 +247,131 @@ func TestCacheHitRateFullHitAndFullMiss(t *testing.T) {
 	// ⭐ 全未命中是**真实观测到的 0%**，与"无样本 -1"必须能区分。
 	if a := rMiss.Snapshot(24, nil).Totals; a.CacheHitRate != 0.0 {
 		t.Errorf("全未命中应得 0.0（真实观测到的零命中），得 %.2f", a.CacheHitRate)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 积分扣除历史与换算比例（吸收上游 f9ba0a6）
+//
+// 回答的是"钱包里的分**具体**花在哪了"，以及**实测结算比例**是多少
+// （与上游目录挂牌的"倍率"是两回事：倍率是标价，这里是真实扣费）。
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TestCreditsAccumulateAndRate 扣分累计 + 换算比例。
+func TestCreditsAccumulateAndRate(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	r.Add(now, "cn", "u1", "m1", Delta{
+		Credit: 0.5, HasCredit: true, TotalTokens: 1000, HasTotal: true,
+	}, true)
+	r.Add(now, "cn", "u1", "m1", Delta{
+		Credit: 1.5, HasCredit: true, TotalTokens: 3000, HasTotal: true,
+	}, true)
+
+	tot := r.Snapshot(24, nil).Totals
+	if tot.Credits != 2.0 {
+		t.Errorf("Credits=%.2f，want 2.0", tot.Credits)
+	}
+	if tot.CreditSamples != 2 {
+		t.Errorf("CreditSamples=%d，want 2", tot.CreditSamples)
+	}
+	if tot.CreditTokens != 4000 {
+		t.Errorf("CreditTokens=%d，want 4000", tot.CreditTokens)
+	}
+	// 2.0 分 / 4000 token × 1000 = 每千 token 0.5 分
+	if diff := tot.CreditsPer1KTokens - 0.5; diff > 0.0001 || diff < -0.0001 {
+		t.Errorf("CreditsPer1KTokens=%.4f，want 0.5", tot.CreditsPer1KTokens)
+	}
+}
+
+// TestCreditsMissingFieldNotZero ⭐ 上游未回报 credit 时**不得按 0 算**。
+//
+// 为什么关键：把"没观测到"算成"扣了 0 分"会让扣费统计**系统性偏低**，
+// 且用户看到"0 分"会以为免费。故用 CreditSamples 区分两者。
+func TestCreditsMissingFieldNotZero(t *testing.T) {
+	r := New("")
+	r.Add(time.Now(), "cn", "u1", "m1", Delta{
+		TotalTokens: 5000, HasTotal: true,
+		// 不带 Credit / HasCredit —— 上游没给该字段
+	}, true)
+
+	tot := r.Snapshot(24, nil).Totals
+	if tot.Credits != 0 {
+		t.Errorf("未观测到时 Credits 应为 0（零值），得 %.2f", tot.Credits)
+	}
+	// ⭐ 判据在样本数：0 样本 = "未观测"，前端据此显示 "—" 而非 "0.00"
+	if tot.CreditSamples != 0 {
+		t.Errorf("未观测到时 CreditSamples 应为 0（前端据此显示 —），得 %d", tot.CreditSamples)
+	}
+	if tot.CreditTokens != 0 {
+		t.Errorf("未观测到时 CreditTokens 应为 0，得 %d", tot.CreditTokens)
+	}
+}
+
+// TestCreditRateExcludesTokenOnlyBuckets ⭐ 换算比例的分母**只收同时有
+// credit 与 token 的样本** —— 仅 token 的旧记录不得混入分母。
+//
+// 为什么关键：本功能上线前的历史桶只有 token 没有 credit。若把它们的 token
+// 计入分母，比例会被**系统性稀释**（分母虚大 → 每千 token 显得更便宜）。
+func TestCreditRateExcludesTokenOnlyBuckets(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	// 旧形态桶：只有 token，没有 credit（模拟 v1 历史数据）
+	r.Add(now, "cn", "u1", "m1", Delta{TotalTokens: 100000, HasTotal: true}, true)
+	// 新形态桶：credit + token 同时存在
+	r.Add(now, "cn", "u1", "m1", Delta{
+		Credit: 1.0, HasCredit: true, TotalTokens: 1000, HasTotal: true,
+	}, true)
+
+	tot := r.Snapshot(24, nil).Totals
+	if tot.TotalTokens != 101000 {
+		t.Errorf("TotalTokens=%d，want 101000（含全部请求）", tot.TotalTokens)
+	}
+	// ⭐ 分母必须只含"同时有 credit 与 token"的 1000，而不是 101000
+	if tot.CreditTokens != 1000 {
+		t.Errorf("CreditTokens=%d，want 1000（只收同时有 credit 的样本，排除仅 token 的旧桶）", tot.CreditTokens)
+	}
+	// 1.0 / 1000 × 1000 = 每千 token 1.0 分（若分母被稀释成 101000 则会得到 ~0.0099）
+	if diff := tot.CreditsPer1KTokens - 1.0; diff > 0.0001 || diff < -0.0001 {
+		t.Errorf("CreditsPer1KTokens=%.4f，want 1.0（分母被污染会显著偏小）", tot.CreditsPer1KTokens)
+	}
+}
+
+// TestDeductionsListOnlyObserved 扣除明细只含有 credit 观测的行。
+func TestDeductionsListOnlyObserved(t *testing.T) {
+	r := New("")
+	now := time.Now()
+	r.Add(now, "cn", "u1", "m1", Delta{Credit: 0.3, HasCredit: true, TotalTokens: 100, HasTotal: true}, true)
+	r.Add(now, "cn", "u2", "m1", Delta{TotalTokens: 100, HasTotal: true}, true) // 无 credit 观测
+
+	snap := r.Snapshot(24, nil)
+	if snap.DeductionTotal != 1 {
+		t.Fatalf("明细应只含 1 行（无 credit 观测的桶是噪声），得 %d：%+v",
+			snap.DeductionTotal, snap.Deductions)
+	}
+	if snap.Deductions[0].UID != "u1" {
+		t.Errorf("明细行 uid=%q，want u1", snap.Deductions[0].UID)
+	}
+	if snap.Deductions[0].Credits != 0.3 {
+		t.Errorf("明细扣分=%.2f，want 0.3", snap.Deductions[0].Credits)
+	}
+}
+
+// TestDeductionsSortedByTimeDesc 明细按时间倒序（最近的扣费在最上）。
+func TestDeductionsSortedByTimeDesc(t *testing.T) {
+	r := New("")
+	base := time.Date(2026, 10, 12, 10, 0, 0, 0, time.Local)
+	r.Add(base, "cn", "u1", "m1", Delta{Credit: 1, HasCredit: true, TotalTokens: 10, HasTotal: true}, true)
+	r.Add(base.Add(2*time.Hour), "cn", "u1", "m1", Delta{Credit: 2, HasCredit: true, TotalTokens: 10, HasTotal: true}, true)
+	r.Add(base.Add(time.Hour), "cn", "u1", "m1", Delta{Credit: 3, HasCredit: true, TotalTokens: 10, HasTotal: true}, true)
+
+	deds := r.Snapshot(24, nil).Deductions
+	if len(deds) < 3 {
+		t.Fatalf("应有 3 行，得 %d", len(deds))
+	}
+	for i := 1; i < len(deds); i++ {
+		if deds[i-1].T < deds[i].T {
+			t.Errorf("未按时间倒序：%s 在 %s 之前", deds[i-1].T, deds[i].T)
+		}
 	}
 }

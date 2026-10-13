@@ -986,6 +986,23 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           </table>
         </div>
       </div>
+
+      <div class="box">
+        <header><h3>积分扣除明细</h3><span class="grow"></span>
+          <span class="note">实测结算值（usage.credit）· 换算比例 = 该行扣分 ÷ 有效 token × 1000</span></header>
+        <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr>
+              <th class="mark" aria-hidden="true"></th><th>时间</th>
+              <th>域</th><th>账号</th><th>模型</th>
+              <th class="num">请求</th><th class="num">扣分</th>
+              <th class="num">有效 token</th><th class="num">换算比例</th>
+            </tr></thead>
+            <tbody id="usDeductBody"></tbody>
+          </table>
+        </div>
+        <div class="note" id="usDeductNote" style="margin-top:6px"></div>
+      </div>
     </section>
 
     <!-- 配置 -->

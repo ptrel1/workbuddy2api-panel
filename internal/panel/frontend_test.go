@@ -1156,9 +1156,12 @@ func TestUsageModelTablePerf(t *testing.T) {
 		}
 	}
 
-	// 3) 空行 colspan 必须等于列数：mark + 模型 + 5 数据列 + 2 性能列 = 9。
-	if !strings.Contains(body, `colspan="9"`) {
-		t.Error(`模型表空行 colspan 应为 9（mark+模型+请求/失败/Prompt/Completion/合计+均延迟+均速率）`)
+	// 3) 空行 colspan 必须等于列数：mark + 模型 + 5 数据列 + 3 性能列（均延迟/均速率/缓存命中）= 10。
+	// ⚠️ 这里刻意**硬编码期望值**（而非从表头推算）：本测试的价值正是"加列时忘了改
+	// colspan"能被抓住 —— 自动推算会让两边同时漂移、永远自洽，护栏就失效了。
+	// 加列时**必须**同步改这里（v2.8.1 就是漏改 colspan 被同类断言抓到的）。
+	if !strings.Contains(body, `colspan="10"`) {
+		t.Error(`模型表空行 colspan 应为 10（mark+模型+请求/失败/Prompt/Completion/合计+均延迟+均速率+缓存命中）`)
 	}
 }
 

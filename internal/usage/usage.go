@@ -61,7 +61,24 @@ type bucket struct {
 	// 旧文件无这两字段 → 零值加载，命中率分母为 0 时输出"样本不足"而非 0%，无损兼容。
 	CH int64 `json:"ch"` // cache hit tokens
 	CM int64 `json:"cm"` // cache miss tokens
+	// CR/CRN/CRT 积分观测（版本 2 起）。
+	//   CR  = usage.credit 累计（**仅明确存在的观测**，缺字段不按 0 算）；
+	//   CRN = credit 样本数（用来区分"缺字段"与"真实 0 积分"）；
+	//   CRT = **同时**具备 credit 与 token 的同一次请求的 token 合计 ——
+	//         换算比例只用这部分做分母，避免把"仅 token 的旧记录"或
+	//         "仅 credit 的观测"混进分母导致比例失真。
+	CR  float64 `json:"cr,omitempty"`
+	CRN int64   `json:"cn,omitempty"`
+	CRT int64   `json:"ct,omitempty"`
 }
+
+// fileVersion 是 usage.json 的当前格式版本。
+//
+//	版本 1 → 基础 token/延迟/速率；
+//	版本 2 → 追加积分类字段（cr/cn/ct）与缓存类字段（ch/cm）。
+//
+// 旧版本文件缺失这些字段时按**零值**加载，旧 token 数据不会被丢弃（无损兼容）。
+const fileVersion = 2
 
 // file 落盘结构。
 type file struct {
@@ -148,6 +165,10 @@ type Delta struct {
 	HasCacheHitTokens  bool
 	CacheMissTokens    int64
 	HasCacheMissTokens bool
+	// Credit 本次请求上游回报的真实扣费积分（usage.credit）。
+	// HasCredit=false 表示上游未返回该字段（**不是"扣了 0"**）——累加器据此区分。
+	Credit    float64
+	HasCredit bool
 }
 
 // Add 记录一次请求尝试。
@@ -207,6 +228,17 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 	}
 	if d.HasCacheMissTokens {
 		b.CM += d.CacheMissTokens
+	}
+	if d.HasCredit {
+		b.CR += d.Credit
+		b.CRN++
+		// 换算比例的分母只收"同一次请求同时有 credit 与 token"的样本
+		// （见 bucket.CRT 注释）——不混入仅 token 或仅 credit 的观测。
+		if d.HasTotal {
+			b.CRT += d.TotalTokens
+		} else if d.HasPromptTokens || d.HasCompletion {
+			b.CRT += d.PromptTokens + d.CompletionTokens
+		}
 	}
 	r.dirty = true
 }
@@ -296,7 +328,7 @@ func (r *Recorder) flush(force bool) {
 		r.mu.Unlock()
 		return
 	}
-	snap := file{Version: 1, Saved: time.Now().Format(time.RFC3339), Buckets: make([]bucket, 0, len(r.buckets))}
+	snap := file{Version: fileVersion, Saved: time.Now().Format(time.RFC3339), Buckets: make([]bucket, 0, len(r.buckets))}
 	for _, b := range r.buckets {
 		snap.Buckets = append(snap.Buckets, *b)
 	}
@@ -351,6 +383,14 @@ type Agg struct {
 	CacheHitTokens  int64   `json:"cache_hit_tokens"`
 	CacheMissTokens int64   `json:"cache_miss_tokens"`
 	CacheHitRate    float64 `json:"cache_hit_rate"`
+	// 积分观测：Credits 是真实扣费累计（仅明确观测），CreditSamples 是其样本数，
+	// CreditTokens 是"同时有 credit 与 token"的 token 合计，
+	// CreditsPer1KTokens = Credits / CreditTokens × 1000（**实际扣费换算比例**，
+	// 与上游目录里的"倍率"是两回事：倍率是挂牌价，这里是实测结算价）。
+	Credits            float64 `json:"credits"`
+	CreditSamples      int64   `json:"credit_samples"`
+	CreditTokens       int64   `json:"credit_tokens"`
+	CreditsPer1KTokens float64 `json:"credits_per_1k_tokens"`
 }
 
 // aggAcc 是聚合过程中的累加器：Agg 只放已算好的结果，均值需要样本数才能
@@ -375,6 +415,9 @@ func (g *aggAcc) add(b *bucket) {
 	g.tpsSamples += b.TPSN
 	g.CacheHitTokens += b.CH
 	g.CacheMissTokens += b.CM
+	g.Credits += b.CR
+	g.CreditSamples += b.CRN
+	g.CreditTokens += b.CRT
 }
 
 func (g *aggAcc) finish() Agg {
@@ -395,6 +438,12 @@ func (g *aggAcc) finish() Agg {
 		a.CacheHitRate = float64(g.CacheHitTokens) / float64(total)
 	} else {
 		a.CacheHitRate = -1
+	}
+	// 换算比例：无样本（CreditTokens==0）时保持 0 —— 与命中率的 -1 不同，
+	// 因为 0 在这里不会被误读（"每千 token 扣 0 分"不可能被当成正常值，
+	// 前端另有 CreditSamples 判据决定是否展示）。
+	if g.CreditTokens > 0 {
+		a.CreditsPer1KTokens = g.Credits / float64(g.CreditTokens) * 1000
 	}
 	return a
 }
@@ -554,6 +603,32 @@ type Snapshot struct {
 	FileBytes int64      `json:"file_bytes"`
 	Since     string     `json:"since,omitempty"`
 	Generated string     `json:"generated"`
+	// Deductions 积分扣除明细（按时间桶 × 域 × 账号 × 模型展开）——
+	// 回答"钱包里的分**具体**花在哪了"，而不只是"总共花了多少"。
+	// DeductionTotal 是窗口内完整行数；Deductions 最多返回 maxDeductions 行，
+	// 界面据此提示"被截断但总量仍准确"（不静默丢数据）。
+	Deductions     []Deduction `json:"deductions,omitempty"`
+	DeductionTotal int         `json:"deduction_total"`
+}
+
+// Deduction 一个时间桶内的积分扣除明细。
+// Token 总量（TotalTokens）含该桶全部请求；CreditTokens **只统计与 credit 同时
+// 存在的样本** —— 换算比例据此计算，避免口径混淆（见 bucket.CRT 注释）。
+type Deduction struct {
+	T        string  `json:"t"`     // 桶时间（hour 为 2006-01-02T15，day 为 2006-01-02）
+	Scope    string  `json:"scope"` // "hour" / "day"
+	Realm    string  `json:"realm"`
+	UID      string  `json:"uid"`
+	Nickname string  `json:"nickname,omitempty"`
+	Model    string  `json:"model"`
+	Requests int64   `json:"requests"`
+	Credits  float64 `json:"credits"`
+	// CreditSamples > 0 才说明这一行的 Credits 是**真实观测**（否则是"上游没给"）。
+	CreditSamples int64 `json:"credit_samples"`
+	TotalTokens   int64 `json:"total_tokens"`
+	CreditTokens  int64 `json:"credit_tokens"`
+	// CreditsPer1KToken 实际结算换算比例（每千 token 扣多少分）。
+	CreditsPer1KToken float64 `json:"credits_per_1k_tokens"`
 }
 
 // Snapshot 聚合当前全部桶。hours 控制时序返回多少个小时点（其余按日折叠）。
@@ -636,6 +711,55 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 		}
 	}
 
+	// 积分扣除明细：把有 credit 观测的桶展开成行（时间 × 域 × 账号 × 模型）。
+	// 只收 CRN>0 的桶 —— 没有 credit 观测的桶放进明细表是噪声（会显示"扣了 0 分"，
+	// 而事实是"没观测到"）。
+	var deductions []Deduction
+	for _, b := range r.buckets {
+		if b.CRN <= 0 {
+			continue
+		}
+		scope := strings.TrimPrefix(strings.TrimPrefix(b.Scope, "h:"), "d:")
+		kind := "day"
+		if strings.HasPrefix(b.Scope, "h:") {
+			kind = "hour"
+		}
+		row := Deduction{
+			T:             scope,
+			Scope:         kind,
+			Realm:         b.Realm,
+			UID:           b.UID,
+			Nickname:      nicks[b.UID],
+			Model:         b.Model,
+			Requests:      b.Req,
+			Credits:       b.CR,
+			CreditSamples: b.CRN,
+			TotalTokens:   b.TT,
+			CreditTokens:  b.CRT,
+		}
+		if row.CreditTokens > 0 {
+			row.CreditsPer1KToken = row.Credits / float64(row.CreditTokens) * 1000
+		}
+		deductions = append(deductions, row)
+	}
+	// 时间倒序（最近的扣费在最上）；同时间按域/账号/模型稳定排序，便于横向对比。
+	sort.Slice(deductions, func(i, j int) bool {
+		if deductions[i].T != deductions[j].T {
+			return deductions[i].T > deductions[j].T
+		}
+		if deductions[i].Realm != deductions[j].Realm {
+			return deductions[i].Realm < deductions[j].Realm
+		}
+		if deductions[i].UID != deductions[j].UID {
+			return deductions[i].UID < deductions[j].UID
+		}
+		return deductions[i].Model < deductions[j].Model
+	})
+	deductionTotal := len(deductions)
+	if len(deductions) > maxDeductions {
+		deductions = deductions[:maxDeductions] // 截断但保留总数（界面据此提示）
+	}
+
 	snap := Snapshot{
 		Totals:  total.finish(),
 		ByRealm: keyed(realmAgg, func(k string) (string, string) { return k, "" }),
@@ -677,8 +801,15 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 	if len(snap.Series) > 0 {
 		snap.Since = snap.Series[0].T
 	}
+	snap.Deductions = deductions
+	snap.DeductionTotal = deductionTotal
 	return snap
 }
+
+// maxDeductions 积分扣除明细单次返回的最大行数（防止超大窗口一次吐几万行）。
+// 超出时**截断但保留总数**（DeductionTotal）——界面据此提示"显示前 N 行"，
+// 不静默丢数据。
+const maxDeductions = 1000
 
 func keyed(m map[string]*aggAcc, label func(string) (string, string)) []KeyedAgg {
 	out := make([]KeyedAgg, 0, len(m))
