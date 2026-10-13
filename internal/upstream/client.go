@@ -1581,6 +1581,13 @@ const packageEndLayout = "2006-01-02 15:04:05"
 // （pool 据此优先消耗，避免官方活动赠送的奖励积分到期作废）；soon ≤ 0 时 expiring
 // 恒 0（禁用分桶，行为与引入前一致）。expiring 是 remain 的一部分。
 func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, err error) {
+	// 企业版额度不在「个人资源包」体系内：get-user-resource* 对 enterpriseId 非空账号
+	// 恒返回空 Accounts（实测 code 0 且 Accounts null），故分流到企业口径端点。
+	// 不分流的话面板会长期显示 0/未知（额度其实是有的），且 credit_floor 判据失真。
+	if a.IsEnterprise() {
+		remain, total, expiring, _, _, err = c.enterpriseResource(a, soon)
+		return remain, total, expiring, err
+	}
 	now := time.Now()
 	body := map[string]any{
 		"PageNumber":               1,
@@ -1671,4 +1678,99 @@ func truncate(s string, n int) string {
 		return s[:n]
 	}
 	return s
+}
+
+// enterpriseUnlimitedRemain / enterpriseUnlimitedTotal 企业版「不限量」在池内的
+// 等价表示（上游 limitNum == -1）。
+//
+// 池内没有"不限"状态位，而 credits 同时参与两处判定 —— 路由权重
+// （credits/maxCredits）与 credit_floor（余额低于阈值则不接收费模型）—— 不限量
+// 必须两处都"不构成限制"，故剩余量取一个足够大的值；total 记 -1 供面板显示「不限」。
+// total 仅用于展示与快照，不参与任何判定（已核对全仓库引用面）。
+const (
+	enterpriseUnlimitedRemain int64 = 1 << 40
+	enterpriseUnlimitedTotal  int64 = -1
+)
+
+// enterpriseResource 查询**企业版账号**的分配额度，并归一到个人口径的
+// (remain, total, expiring, earliestAt, earliestRemaining)。
+//
+// 上游口径（实测，企业号）：
+//
+//	POST /v2/billing/meter/get-enterprise-user-usage
+//	{"credit":812.45,"limitNum":2000,
+//	 "cycleStartTime":"2026-09-27 00:00:00","cycleEndTime":"2026-10-26 23:59:59",
+//	 "cycleResetTime":"2026-10-27 00:00:00"}
+//
+// ⚠️ **语义与个人口径相反**：个人 CapacityRemain 是「剩余」，企业 `credit` 是
+// **本周期已用**。故 `remain = limitNum - round(credit)`、`total = limitNum`。
+// 这是本函数最容易搞反的地方。
+//
+// 注意：企业**池**总额度是另一回事，成员账号无权查询（实测池端点 403
+// not_authorized），本函数只反映该账号**被分配**的额度。
+//
+// 分桶：企业配额按周期重置、未用完即作废，与个人「奖励积分到期作废」同性质，故把
+// cycleEndTime 作为唯一到期批次 —— 周期末企业号会被 prefer_expiring 优先选中
+// （期望行为：别浪费即将作废的配额）。limitNum < 0（不限量）无作废语义，不参与分桶。
+//
+// 与上游的一处差异：上游在此处用 retryBillingTransient 做有界重试，而**本地没有
+// 该重试基建**（属另一提交），故这里走单次 billingJSON —— 与本地既有 billingJSON
+// 调用点语义一致（零新增行为）。
+func (c *Client) enterpriseResource(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
+	data, err := c.billingJSON(a, http.MethodPost, "/v2/billing/meter/get-enterprise-user-usage", map[string]any{})
+	if err != nil {
+		return 0, 0, 0, time.Time{}, 0, err
+	}
+	// 兼容上游两套字段命名（桌面端两条解析路径分别读 camelCase 与 snake_case）。
+	var resp struct {
+		Credit         float64 `json:"credit"`
+		LimitNum       int64   `json:"limitNum"`
+		LimitNumSnake  int64   `json:"limit_num"`
+		UsedNum        float64 `json:"used_num"`
+		CycleEndTime   string  `json:"cycleEndTime"`
+		CycleResetTime string  `json:"cycleResetTime"`
+	}
+	if uerr := json.Unmarshal(data, &resp); uerr != nil {
+		return 0, 0, 0, time.Time{}, 0, fmt.Errorf("enterprise resource parse: %w", uerr)
+	}
+	limit := resp.LimitNum
+	if limit == 0 && resp.LimitNumSnake != 0 {
+		limit = resp.LimitNumSnake
+	}
+	used := resp.Credit
+	if used == 0 && resp.UsedNum != 0 {
+		used = resp.UsedNum
+	}
+	// 不限量：池内无对应状态位，用大剩余量让路由权重与 credit_floor 都不构成限制。
+	if limit < 0 {
+		return enterpriseUnlimitedRemain, enterpriseUnlimitedTotal, 0, time.Time{}, 0, nil
+	}
+	// credit 是浮点（如 812.45），池内 credits 是整数：**四舍五入**到最近整数
+	// （向下取整会低报剩余额度，与"额度还有多少"的展示意图相悖）。
+	usedInt := int64(used)
+	if used-float64(usedInt) >= 0.5 {
+		usedInt++
+	}
+	remain = limit - usedInt
+	if remain < 0 {
+		remain = 0
+	}
+	total = limit
+	// 周期到期批次：cycleEndTime 优先，缺失回落 cycleResetTime。
+	// 复用个人口径同一套解析（packageEndLayout + softRateResetLoc，UTC+8 墙钟）——
+	// 上游两个端点的时间格式同源，不必另立解析。
+	now := time.Now()
+	end, perr := time.ParseInLocation(packageEndLayout, resp.CycleEndTime, softRateResetLoc)
+	ok := perr == nil && !end.IsZero()
+	if !ok {
+		end, perr = time.ParseInLocation(packageEndLayout, resp.CycleResetTime, softRateResetLoc)
+		ok = perr == nil && !end.IsZero()
+	}
+	if ok && remain > 0 && end.After(now) {
+		earliestAt, earliestRemaining = end, remain
+		if soon > 0 && !end.After(now.Add(soon)) {
+			expiring = remain
+		}
+	}
+	return remain, total, expiring, earliestAt, earliestRemaining, nil
 }

@@ -133,6 +133,26 @@ func BackfillRealmFor(a *Auth, realm string) (bool, error) {
 // IsGlobal 报告账号是否属于 global realm（= Realm() == "global"）。
 func (a *Auth) IsGlobal() bool { return a.Realm() == "global" }
 
+// IsEnterprise 报告账号是否为企业版（auth 文件带非空 enterpriseId）。
+//
+// 与 IsGlobal 正交：企业版是**账号类型**（有无个人成长体系），realm 是**路由域**
+// （cn/global）。四种组合都可能存在。
+//
+// 为什么要用它：企业版账号**没有个人成长体系**，上游对相关端点一律拒绝（实测
+// 2026-10-07 与个人号 A/B 对照）：
+//   - POST /v2/billing/meter/daily-checkin                → 400 code 10001「企业账号不支持该操作」
+//   - POST /billing/meter/claim-gift / claim-compensation → 400 code 10001 同上
+//   - GET  /activity/growth/{streak,buddy/info,heatmap}   → 403「growth system is only available for personal users」
+//   - GET  /v2/activity/growth/tasks                      → 403 同上
+//
+// 不门控就会**每日空发这些注定失败的请求**（浪费配额、污染失败统计、日志噪声）。
+//
+// 判定用 TrimSpace：手写 auth 文件时 enterpriseId 可能被写成空白串，
+// 空白应视为"无企业归属"（与 UID/昵称的容错口径一致）。
+func (a *Auth) IsEnterprise() bool {
+	return a != nil && strings.TrimSpace(a.EnterpriseID) != ""
+}
+
 // isGlobalDomain 判定 domain 是否指向 www.workbuddy.ai 家族。
 // 同时接受裸域 workbuddy.ai 与任意子域（HasSuffix("www.workbuddy.ai") 或裸域本身）。
 func isGlobalDomain(d string) bool {

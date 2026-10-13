@@ -92,6 +92,11 @@ func (p *Panel) tasksScanAll(w http.ResponseWriter, r *http.Request) {
 			if a.IsGlobal() {
 				return
 			}
+			// 企业版门控：无个人成长体系，上游对 growth 端点一律 403
+			// （growth system is only available for personal users）。
+			if a.IsEnterprise() {
+				return
+			}
 			if tasks, err := p.cfg.Upstream.ListTasks(a); err != nil {
 				it.GrowthErr = err.Error()
 			} else {
@@ -208,6 +213,11 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 			one := queueAccount{a: a}
 			// D4 门控：global 账号无 CN 成长/开学季任务体系，不发起任何上游调用。
 			if a.IsGlobal() {
+				return
+			}
+			// 企业版门控：无个人成长体系，上游对 growth 端点一律 403
+			// （growth system is only available for personal users）。
+			if a.IsEnterprise() {
 				return
 			}
 			if body.Growth {
@@ -490,6 +500,13 @@ func (p *Panel) schoolStatus(w http.ResponseWriter, r *http.Request) {
 			defer wg.Done()
 			v := acctView{UID: a.UID, Nickname: a.Nickname}
 			// D4 门控：global 账号无开学季活动，不发起任何上游调用。
+			if a.IsEnterprise() {
+				v.Err = "企业版（无开学季活动）"
+				mu.Lock()
+				out = append(out, v)
+				mu.Unlock()
+				return
+			}
 			if a.IsGlobal() {
 				v.Err = "global realm（无开学季活动）"
 				mu.Lock()
@@ -558,6 +575,8 @@ func (p *Panel) schoolVouchers(w http.ResponseWriter, r *http.Request) {
 			defer func() { <-sem }()
 			it := row{UID: a.UID, Nickname: a.Nickname}
 			switch {
+			case a.IsEnterprise():
+				it.Err = "企业版（无开学季活动）"
 			case a.IsGlobal():
 				it.Err = "global realm（无开学季活动）"
 			default:

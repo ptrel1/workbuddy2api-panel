@@ -302,13 +302,26 @@ function renderAccounts(list) {
     // 昵称缺失时退回短 uid：否则多个"未命名"账号互相无法区分。
     // 完整 uid 仍保留在行 title（悬停可核对），不占主展示位。
     const whoName = s.nickname || (s.uid.length > 8 ? s.uid.slice(0, 8) : s.uid);
-    const cred = s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits));
-    const pct = s.credits_total > 0
-      ? Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100))
-      : Math.round((s.credits || 0) / maxCred * 100);
+    // 企业版不限量：上游 limitNum == -1，网关以 credits_total = -1 透出
+    // （见 upstream enterpriseUnlimitedTotal）。此时剩余额度不参与展示，直接标「不限」——
+    // 若照样渲染 "1099511627776/..." 会把「不限」显示成一个天文数字，读起来像额度。
+    const unlimited = s.credits_total === -1;
+    const cred = unlimited ? '不限'
+      : (s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits)));
+    const pct = unlimited ? 100
+      : (s.credits_total > 0
+        ? Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100))
+        : Math.round((s.credits || 0) / maxCred * 100));
     // 成本台账 tooltip（model_costs）：每模型实测单价（≤0 = 实测免费），运维据此
     // 看「为什么总选它」——免费号垄断 / 单价排序一眼可见。
-    let credTip = s.credits_total > 0 ? '剩余 ' + s.credits + ' / 总额 ' + s.credits_total + '（' + pct + '%）' : '积分（相对池内最高）';
+    // 企业版与个人版的额度语义不同（企业是"分配额度 + 本周期已用"，个人是"剩余/总额"），
+    // 措辞分别标注，避免运维把企业分配额度误读成个人积分。
+    let credTip;
+    if (unlimited) credTip = '企业版不限量（上游 limitNum=-1）';
+    else if (s.credits_total > 0) {
+      credTip = (s.enterprise ? '企业版剩余额度 ' : '剩余 ') + s.credits +
+        ' / ' + (s.enterprise ? '分配 ' : '总额 ') + s.credits_total + '（' + pct + '%）';
+    } else credTip = '积分（相对池内最高）';
     const costs = (s.model_costs || []).filter(c => c.model);
     if (costs.length) {
       credTip += '\n实测单价（credits/1K）：\n' + costs.map(c =>
@@ -325,7 +338,7 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + esc(whoName) + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + planTag(s.uid) + '</div></td>' +
+      '<td class="who"><div class="nm">' + esc(whoName) + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + planTag(s.uid) + '</div></td>' +
       '<td>' + tag + note + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -338,9 +351,14 @@ function renderAccounts(list) {
       '</span></td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
       '<td class="acts">' +
-        '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '">签到</button>' +
-        '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>' +
-        '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' +
+        // 企业版无个人成长体系：签到（上游 400「企业账号不支持该操作」）与
+        // 任务/成长（403 growth system is only available for personal users）
+        // 都必然失败，故不渲染这两个按钮；「余额」改「额度」（走企业口径端点）。
+        (s.enterprise ? '' :
+          '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
+        '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>' +
+        (s.enterprise ? '' :
+          '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
         '<button class="xs ghost" data-a="models" data-u="' + esc(s.uid) + '">模型</button>' +
         // 状态恢复按钮：disabled/cooling → 解冻；paused（且未禁用/无冷却）→ 恢复选号。
         // paused 分支必须在 frozen 之前：paused 号本就不参与选号，

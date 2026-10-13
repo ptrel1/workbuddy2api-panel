@@ -83,7 +83,11 @@ type Status struct {
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
 	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
 	// 供面板/状态接口按域分组展示。
-	Realm          string `json:"realm,omitempty"`
+	Realm string `json:"realm,omitempty"`
+	// Enterprise 企业版标记（**计算值，不落盘**——由 auth 文件的 enterpriseId 推得）。
+	// 面板据此隐藏「签到」「任务」按钮、把「余额」文案改「额度」——
+	// 企业版没有个人成长体系，这些操作在上游必然 400/403。
+	Enterprise     bool   `json:"enterprise,omitempty"`
 	Disabled       bool   `json:"disabled"`
 	DisabledReason string `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
 	// Paused 暂停选号：退出选号候选（同 disabled 不参与选号），但**照常参与**

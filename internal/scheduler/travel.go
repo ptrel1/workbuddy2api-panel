@@ -54,6 +54,9 @@ func (s *Scheduler) RunTravelNow() {
 		if a.IsGlobal() {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
+		if a.IsEnterprise() {
+			continue // 企业版门控：无个人成长体系，上游一律 400/403（见 auth.IsEnterprise 注释）
+		}
 		if !first {
 			time.Sleep(travelAccountDelay)
 		}

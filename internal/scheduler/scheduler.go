@@ -367,14 +367,19 @@ func (s *Scheduler) RunCheckinNow() {
 		if a.IsGlobal() {
 			continue
 		}
-		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
-			// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
-			if upstream.IsAlreadyCheckin(err) {
-				log.Printf("checkin %s: 今天已签到（幂等）", st.UID)
-			} else {
-				log.Printf("checkin %s: %v", st.UID, err)
+		// ⚠️ 企业版门控**只跳过签到本身，不 continue** —— 因为下面的余额查询
+		// （UserResourceDetailed）是企业额度回填的**唯一数据源**，也是 credit_floor
+		// 判据与面板额度展示的来源。若在此 continue，企业号会永远拿不到额度。
+		if !a.IsEnterprise() {
+			if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
+				// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
+				if upstream.IsAlreadyCheckin(err) {
+					log.Printf("checkin %s: 今天已签到（幂等）", st.UID)
+				} else {
+					log.Printf("checkin %s: %v", st.UID, err)
+				}
+				// 其余业务错误也继续走余额查询
 			}
-			// 其余业务错误也继续走余额查询
 		}
 		// 分桶查余额：快过期窗口内的积分单独标记，pool 优先消耗。
 		// ExpiringSoonWindow<=0 时退化为纯总量（与引入前一致）。
@@ -416,6 +421,9 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		}
 		if a.IsGlobal() {
 			continue // D4 门控：global 无任务中心/活跃体系，不发起任何上游调用
+		}
+		if a.IsEnterprise() {
+			continue // 企业版门控：无任务中心/成长体系，上游 403（见 auth.IsEnterprise 注释）
 		}
 		if !first {
 			if !sleepCtx(ctx, activityAccountDelay) {
