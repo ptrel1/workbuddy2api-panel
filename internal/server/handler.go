@@ -18,6 +18,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
@@ -37,6 +38,10 @@ type Config struct {
 	RedisMode    string
 	SoftCooldown time.Duration // 429/限流文案软冷却基数，默认 600s（连续触发指数退避，封顶 soft_rate_max）
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
+
+	// RequestLog 请求级指标与脱敏归档记录器（reqlog 包；nil = 不记录指标）。
+	// 归档只写脱敏元数据，不写提示词/响应正文/凭证。
+	RequestLog *reqlog.Recorder
 
 	// ModelFallback 模型降级路由表（pool.model_fallback）：key = 请求模型（裸名或带域
 	// 前缀均可），value = 6004 限流时改用的等价模型。空/nil = 不降级（老行为）。
@@ -137,6 +142,28 @@ func NewHandler(cfg Config) *Handler {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 请求级指标（reqlog）：只对 chat 端点、且仅在注入了记录器时启用。
+	// 为什么在 mux 之外包一层：handler 内部有流式/非流式/各类错误多个 return 路径，
+	// 逐个埋点既易漏又会污染业务逻辑；这里统一在**出口**记账（defer 覆盖所有 return）。
+	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" {
+		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now()}
+		obs := &responseObserver{ResponseWriter: w}
+		// 回写 X-Request-Id：客户端报障时可直接引用该 ID，与服务端指标/归档一一对应。
+		w.Header().Set("X-Request-Id", trace.id)
+		h.cfg.RequestLog.Begin()
+		defer func() {
+			status := obs.status
+			if status == 0 {
+				// 从未 Write/WriteHeader（如提前 panic）：此处**无法**确知真实码，
+				// 用 200 走 event() 的状态码兜底分类（非 2xx 场景已在 handler 内标记 outcome）。
+				status = http.StatusOK
+			}
+			h.cfg.RequestLog.Record(trace.event(status))
+		}()
+		r = r.WithContext(context.WithValue(r.Context(), requestTraceKey{}, trace))
+		h.mux.ServeHTTP(obs, r)
+		return
+	}
 	h.mux.ServeHTTP(w, r)
 }
 
@@ -496,6 +523,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
+	// 把统计对象挂到请求 trace：ServeHTTP 出口据它写 reqlog.Event（模型/账号/耗时/
+	// token/积分/结果）。不挂则 trace.stat 恒 nil，指标只剩状态码与总耗时。
+	if tr := requestTraceFrom(r); tr != nil {
+		tr.stat = st
+		st.trace = tr
+	}
 	defer st.done()
 
 	tried := map[string]bool{}
@@ -569,6 +602,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		delta.HasLatencyMs = true
 		delta.LatencyMs = latencyMs
+		// 请求级指标：尝试次数与用量/积分（供 reqlog.Event 与扩展流水行）。
+		st.attempts++
+		if delta.HasPromptTokens {
+			st.promptTokens = delta.PromptTokens
+		}
+		if delta.HasCompletionTokens {
+			st.completionTokens = delta.CompletionTokens
+		}
+		if delta.HasTotalTokens {
+			st.totalTokens = delta.TotalTokens
+		} else if delta.HasPromptTokens || delta.HasCompletionTokens {
+			st.totalTokens = st.promptTokens + st.completionTokens
+		}
+		if hasCredit {
+			st.credit, st.hasCredit = credit, true
+		}
 		// 吐字速率的分母扣掉首 token 等待（见 tokensPerSecond 注释）。
 		if delta.HasCompletionTokens && delta.CompletionTokens >= 0 {
 			if tps, ok := tokensPerSecond(delta.CompletionTokens, latency, ttfb); ok {
@@ -703,6 +752,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		st.uid = acct.UID
+		st.nick = acct.Nickname
 		tried[acct.UID] = true
 		// 出站 body 的 model 名随**本轮实际模型**走（降级后即等价模型）。
 		// 循环内每轮都判：curModel 变了必须重写（故不能只在循环外判一次）。
@@ -889,7 +939,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// gateway_hint（SSE）：成功状态 200 已开流，中途 error 帧透传时附加
 			// hint 字段（hintFn 惰性求值——正常流零开销，只有真撞到 error 帧才
 			// 组装请求上下文做判定）。
-			_ = upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
+			streamErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
 			}))
 			ch, hch := stats.CacheHit()
@@ -899,6 +949,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				int64(ch), hch, int64(cm), hcm, cred, hcred)
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
+			// 请求结果分类（reqlog，纯观测不影响业务分支）：
+			//   写失败 → interrupted（客户端多半已断开，标成功会掩盖真实中断）；
+			//   流内 error 帧 → stream_error（HTTP 200 但内容失败）；
+			//   其余 → success。
+			switch {
+			case streamErr != nil:
+				st.outcome = reqlog.OutcomeInterrupted
+			case stats.SawErrorFrame():
+				st.outcome = reqlog.OutcomeStreamError
+			default:
+				st.outcome = reqlog.OutcomeSuccess
+			}
 			// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价，
 			// 供下次选号把免费/便宜的号排在前面。
 			// ⚠️ 用 curModel 而非 bareModel：记的是**本次实际发生的扣费**，而降级后
@@ -919,6 +981,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
+			st.outcome = reqlog.OutcomeStreamError
 			return
 		}
 		// 先取 credit/total：既要喂用量统计，也要喂成本账本 —— 取一次共用，
@@ -927,6 +990,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		recordAttempt(acct.UID, usageDeltaFromResponse(resp), attemptStarted, 0, 0, false, 0, false, credit, hasCredit)
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
+		st.outcome = reqlog.OutcomeSuccess
 		st.toks = completionTokens(resp)
 		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
 		// ⚠️ 同流式路径：用 curModel（实际扣费发生在等价模型上）。

@@ -801,11 +801,76 @@ async function loadErrors() {
   }
 }
 
+/* renderRequestMetrics 请求指标卡 + 最近请求表。
+   entries 优先用 JSONL 归档（跨重启、可筛），归档为空时回落进程内 recent 数组。
+   ⭐ 全部字段都是**脱敏**的：账号只显示 "昵称(uid8)" 标签、无提示词/响应正文/凭证。 */
+function renderRequestMetrics(m, entries) {
+  m = m || {};
+  const a = m.archive || {};
+  $('reqStats').innerHTML =
+    usStat(fmtTok(m.completed), '已完成') +
+    usStat(m.success_rate == null ? '—' : Number(m.success_rate).toFixed(1) + '%', '完成成功率') +
+    usStat(m.http_success_rate == null ? '—' : Number(m.http_success_rate).toFixed(1) + '%', 'HTTP 成功率') +
+    usStat(fmtMs(m.avg_duration_ms), '平均耗时') +
+    usStat(String(m.in_flight || 0), '进行中') +
+    usStat(fmtTok(a.files), '归档文件');
+  $('reqNote').textContent = a.enabled
+    ? 'JSONL 归档 ' + fmtBytes(a.bytes || 0) +
+      (a.dropped_writes ? ' · 队列满丢弃 ' + a.dropped_writes + ' 条' : '') +
+      (a.last_error ? ' · 最近错误：' + a.last_error : '')
+    : '内存指标（归档已关闭）';
+
+  const rows = entries || [];
+  $('reqBody').innerHTML = rows.map(e =>
+    '<tr>' +
+    '<td class="mark" aria-hidden="true"></td>' +
+    '<td>' + esc(reqTime(e.time)) + '</td>' +
+    '<td class="mono">' + esc(e.request_id || '') + '</td>' +
+    '<td>' + esc(e.account || '—') + '</td>' +
+    '<td>' + esc(e.model || '—') + '</td>' +
+    '<td class="num">' + (e.status || 0) + '</td>' +
+    '<td>' + reqOutcomeTag(e.outcome) + '</td>' +
+    '<td class="num">' + (e.duration_ms || 0) + 'ms</td>' +
+    '<td class="num">' + (e.total_tokens ? fmtTok(e.total_tokens) : '—') + '</td>' +
+    // 积分：credit_known=false 时显示 "—"（未回报），不用 0 冒充"没扣费"
+    '<td class="num">' + (e.credit_known ? Number(e.credit || 0).toFixed(4) : '—') + '</td>' +
+    '</tr>'
+  ).join('') || '<tr><td colspan="10" class="empty">暂无请求记录</td></tr>';
+}
+
+/* reqTime 归档时间是 RFC3339，展示只留 HH:MM:SS（跨天时补 MM-DD）。 */
+function reqTime(t) {
+  if (!t) return '—';
+  const d = new Date(t);
+  if (isNaN(d)) return String(t).slice(0, 19);
+  const today = new Date();
+  const sameDay = d.toDateString() === today.toDateString();
+  const hms = d.toTimeString().slice(0, 8);
+  return sameDay ? hms : (String(d.getMonth() + 1).padStart(2, '0') + '-' +
+    String(d.getDate()).padStart(2, '0') + ' ' + hms);
+}
+
+/* reqOutcomeTag 结果分类徽章：成功绿、中断黄、错误红。 */
+function reqOutcomeTag(o) {
+  const map = { success: ['ok', '成功'], http_error: ['bad', 'HTTP 错'],
+    stream_error: ['bad', '流错误'], interrupted: ['warn', '中断'] };
+  const [cls, text] = map[o] || ['', o || '—'];
+  return cls ? '<span class="tag ' + cls + '" style="font-size:10px">' + text + '</span>' : esc(text);
+}
+
 async function loadLogs() {
   const box = $('logBox');
   const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
   try {
-    const d = await api('logs');
+    // 请求指标与归档并行拉取：任一失败不拖垮整个日志页（catch 兜底为空）。
+    const [d, metrics, requestRows] = await Promise.all([
+      api('logs'),
+      api('request_metrics').catch(() => ({})),
+      api('request_logs?limit=100').catch(() => ({ entries: [] })),
+    ]);
+    const recent = (requestRows.entries && requestRows.entries.length)
+      ? requestRows.entries : (metrics.recent || []);
+    renderRequestMetrics(metrics, recent);
     // ch='err' 是**跨频道的错误视图**（ring 本身没有 err 频道）：
     // 按行内容判定，而不是按 ring 的归类 —— 因为错误可能出现在任何频道里
     // （chat_stream / task / sys 都有），只看单个频道会漏。

@@ -184,6 +184,18 @@ type Config struct {
 		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
 	} `json:"session_sticky"`
 
+	// Logging 请求级指标与脱敏归档（reqlog 包）。
+	// 归档**只写请求元数据**：路径/账号标签/模型/状态/耗时/token/积分，
+	// **不写**提示词、响应正文、Authorization 或任何凭证。
+	Logging struct {
+		// RequestArchiveEnabled JSONL 归档开关，缺省 true（内存指标始终启用，不受它影响）。
+		RequestArchiveEnabled bool `json:"request_archive_enabled"`
+		// RequestRetentionDays 归档保留天数，缺省 7；<=0 回落默认。
+		RequestRetentionDays int `json:"request_retention_days"`
+		// RequestArchiveMaxMB 归档总容量上限（MiB），缺省 100；<=0 回落默认。
+		RequestArchiveMaxMB int `json:"request_archive_max_mb"`
+	} `json:"logging"`
+
 	// 解析后
 	SoftRateDur            time.Duration `json:"-"`
 	SoftRateMaxDur         time.Duration `json:"-"`
@@ -461,6 +473,15 @@ func (c *Config) normalize() error {
 	// 那会把用户显式写的 0 静默改成开启，与 model_fallback 同类坑（见其注释）。
 	if c.Pool.CreditFloor < 0 {
 		c.Pool.CreditFloor = 0
+	}
+	// 请求归档：<=0 回落默认（7 天 / 100 MiB）。
+	// 为什么不用 0 表示"关闭"：**关闭由 request_archive_enabled 负责** ——
+	// 让 0 同时承担"关闭"与"未配置"两种语义会混淆（同 credit_floor 的坑）。
+	if c.Logging.RequestRetentionDays <= 0 {
+		c.Logging.RequestRetentionDays = 7
+	}
+	if c.Logging.RequestArchiveMaxMB <= 0 {
+		c.Logging.RequestArchiveMaxMB = 100
 	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3

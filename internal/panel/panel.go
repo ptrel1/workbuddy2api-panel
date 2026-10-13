@@ -24,6 +24,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
@@ -63,6 +64,9 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+
+	// RequestLog 请求级指标与脱敏归档记录器（reqlog 包；nil = 该视图返回 501）。
+	RequestLog *reqlog.Recorder
 
 	// ModelFallback 返回「模型降级路由表」（pool.model_fallback 的当前值），
 	// 供面板在限流提示里标注「已路由至 <等价模型>」——让运维一眼看出
@@ -191,6 +195,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
+	// 请求级指标与脱敏归档（reqlog）。
+	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
+	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
 
 	// 余额趋势：窗口由 days 参数控制（默认 30 天，上限 30 天=detailedKeep）。
@@ -831,6 +838,43 @@ func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 
 // usage 返回逐请求用量聚合。hours 查询参数控制小时粒度时序窗口（默认 72，
 // 上限 1440=60 天）；更早的数据自动折叠为日点，因此长期趋势不会丢。
+// requestMetrics 返回进程内请求指标（计数/成功率/最近 100 条）+ 归档存储状态。
+func (p *Panel) requestMetrics(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.RequestLog == nil {
+		writeErr(w, http.StatusNotImplemented, "request logger not available")
+		return
+	}
+	writeJSON(w, http.StatusOK, p.cfg.RequestLog.Snapshot())
+}
+
+// requestLogs 从 JSONL 归档读取最近请求；limit 默认 200、最大 1000。
+// 支持 outcome/account/model 三个筛选项（对应 reqlog.Filter）。
+func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.RequestLog == nil {
+		writeErr(w, http.StatusNotImplemented, "request logger not available")
+		return
+	}
+	limit := 200
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	rows, err := p.cfg.RequestLog.ReadArchive(limit, reqlog.Filter{
+		Outcome: r.URL.Query().Get("outcome"),
+		Account: r.URL.Query().Get("account"),
+		Model:   r.URL.Query().Get("model"),
+	})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": rows, "limit": limit})
+}
+
 func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Usage == nil {
 		writeErr(w, http.StatusNotImplemented, "usage recorder not available")

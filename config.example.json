@@ -49,6 +49,11 @@
     "url": "",
     "token": ""
   },
+  "logging": {
+    "request_archive_enabled": true,
+    "request_retention_days": 7,
+    "request_archive_max_mb": 100
+  },
   "pool": {
     "max_in_flight": 3,
     "max_in_flight_global": 2,

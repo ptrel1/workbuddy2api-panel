@@ -6,12 +6,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/reqlog"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -43,8 +46,119 @@ type chatStat struct {
 	// timing 上游分段耗时（纯观测，见 upstream/timing.go）。零值 = 未采集/未测量。
 	timing upstream.ChatTiming
 
+	// 请求级指标（reqlog）与扩展流水行所需字段。
+	trace     *requestTrace // 请求 trace（nil = reqlog 未启用，流水行保持原格式）
+	nick      string        // 账号昵称（随选号同步）；流水行经 logfmt.Label 拼成 "昵称(uid8)"
+	outcome   string        // reqlog 结果分类（success/http_error/stream_error/interrupted）
+	attempts  int           // 上游尝试次数（换号/降级重试都算）
+	credit    float64       // 本次真实扣费积分
+	hasCredit bool
+	// promptTokens/completionTokens/totalTokens 供 reqlog.Event 记录用量。
+	promptTokens     int64
+	completionTokens int64
+	totalTokens      int64
+
 	logged bool
 }
+
+type requestTraceKey struct{}
+
+// requestTrace 在一次 chat 请求内共享标识与最终统计，ServeHTTP 出口统一记账。
+// 经 context 传递（而非闭包捕获）：handler 内部有流式/非流式/错误多个 return 路径，
+// 逐个改 return 既易漏又侵入；context 让出口统一在一处。
+type requestTrace struct {
+	id    string
+	start time.Time
+	stat  *chatStat
+}
+
+// requestTraceFrom 从请求 context 取 trace（无则 nil，调用方需判空）。
+func requestTraceFrom(r *http.Request) *requestTrace {
+	if r == nil {
+		return nil
+	}
+	tr, _ := r.Context().Value(requestTraceKey{}).(*requestTrace)
+	return tr
+}
+
+// event 把本次请求的统计快照成 reqlog.Event（**全部脱敏**：账号只留
+// "昵称(uid8)" 标签，无完整 UID、无提示词、无响应正文、无凭证）。
+// 该函数是脱敏边界的单一事实来源 —— 只允许从 chatStat 的**元数据字段**取，
+// 任何"把 body/header 记进来"的改动都会让 TestRequestMetricsArchiveIsSanitized 失败。
+func (t *requestTrace) event(status int) reqlog.Event {
+	e := reqlog.Event{
+		Time:      t.start,
+		RequestID: t.id,
+		Path:      "/v1/chat/completions",
+		Status:    status,
+	}
+	duration := time.Since(t.start)
+	e.DurationMs = duration.Milliseconds()
+	if e.DurationMs < 1 {
+		// 0 耗时会被读成"瞬时完成"；最小时长 1ms 更诚实（也便于前端排序）。
+		e.DurationMs = 1
+	}
+	if t.stat != nil {
+		s := t.stat
+		e.Account = logfmt.Label(s.uid, s.nick)
+		e.Model = s.model
+		e.Outcome = s.outcome
+		if s.outcome == "" {
+			// 未显式标记结果时按状态码兜底分类（错误路径可能提前 return，
+			// 来不及标记 outcome —— 兜底比丢失更可靠）。
+			e.Outcome = reqlog.OutcomeHTTPError
+			if status >= 200 && status < 300 {
+				e.Outcome = reqlog.OutcomeSuccess
+			}
+		}
+		e.TTFBMs = s.ttfb.Milliseconds()
+		e.Attempts = s.attempts
+		e.PromptTokens = s.promptTokens
+		e.CompletionTokens = s.completionTokens
+		e.TotalTokens = s.totalTokens
+		e.Credit = s.credit
+		e.HasCredit = s.hasCredit
+		if s.toks >= 0 {
+			e.CompletionTokens = int64(s.toks)
+			if e.TotalTokens == 0 {
+				e.TotalTokens = int64(s.toks)
+			}
+		}
+	}
+	e.OK = e.Status >= 200 && e.Status < 300
+	return e
+}
+
+// responseObserver 包一层 ResponseWriter 以捕获最终状态码。
+// 为什么需要：流式响应一旦 Write 就无法再改状态码，而指标要记录**实际**发出的码
+// （handler 内部可能已 WriteHeader 后继续流式输出）。
+type responseObserver struct {
+	http.ResponseWriter
+	status int
+}
+
+func (o *responseObserver) WriteHeader(code int) {
+	if o.status == 0 {
+		o.status = code
+	}
+	o.ResponseWriter.WriteHeader(code)
+}
+
+func (o *responseObserver) Write(p []byte) (int, error) {
+	if o.status == 0 {
+		o.status = http.StatusOK
+	}
+	return o.ResponseWriter.Write(p)
+}
+
+func (o *responseObserver) Flush() {
+	if f, ok := o.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Unwrap 让 http.ResponseController 能找到底层 writer（否则 Flush/SetWriteDeadline 失效）。
+func (o *responseObserver) Unwrap() http.ResponseWriter { return o.ResponseWriter }
 
 // newChatStat 以请求进入 handler 的时刻为起点构造统计对象；toks 默认 -1（usage 缺失）。
 func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
@@ -61,6 +175,14 @@ func (s *chatStat) done() {
 		return
 	}
 	s.logged = true
+	// 有请求 trace（即 reqlog 启用）时走扩展行：多出 rid/out/try/credit 四个字段，
+	// 让流水行能直接对上面板的请求指标与 JSONL 归档。
+	// ⚠️ 无 trace 时**保持原格式完全不变**（老部署/测试的日志解析零影响）。
+	if s.trace != nil {
+		logChatRowEx(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.nick, s.status, s.toks,
+			s.timing, s.trace.id, s.outcome, s.attempts, s.credit, s.hasCredit)
+		return
+	}
 	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks, s.timing)
 }
 
@@ -88,8 +210,12 @@ type chatStatsReader struct {
 	hasCacheHit     bool
 	cacheMissTokens int
 	hasCacheMiss    bool
+	errorFrame      bool   // 流中透传过 SSE error 帧（HTTP 200 但内容失败）
 	pend            []byte // 已读未返回的行缓存
 }
+
+// SawErrorFrame 报告流中是否透传过 SSE error 帧（供 reqlog 分类 outcome）。
+func (s *chatStatsReader) SawErrorFrame() bool { return s.errorFrame }
 
 // CacheHit / CacheMiss 返回前缀缓存命中/未命中 token 数（缺失时 ok=false）。
 func (s *chatStatsReader) CacheHit() (int, bool)  { return s.cacheHitTokens, s.hasCacheHit }
@@ -143,6 +269,7 @@ func (s *chatStatsReader) parseSSELine(line string) {
 		s.ttfb = time.Since(s.start)
 	}
 	var chunk struct {
+		Error json.RawMessage `json:"error"`
 		Usage *struct {
 			PromptTokens     *int     `json:"prompt_tokens"`
 			CompletionTokens *int     `json:"completion_tokens"`
@@ -157,7 +284,13 @@ func (s *chatStatsReader) parseSSELine(line string) {
 			CacheMissTokens     *int `json:"prompt_cache_miss_tokens"`
 		} `json:"usage"`
 	}
-	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
+	// SSE error 帧检测（纯观测，供 reqlog 分类 outcome）：
+	// 上游把失败以 "data: {...,"error":...}" 透传时，HTTP 状态仍是 200，
+	// 只看状态码会把失败流记成成功。
+	if json.Unmarshal([]byte(payload), &chunk) == nil && len(chunk.Error) > 0 {
+		s.errorFrame = true
+	}
+	if chunk.Usage == nil {
 		return
 	}
 	if chunk.Usage.PromptTokens != nil {
@@ -326,6 +459,15 @@ func uidPrefix(uid string) string {
 // 不变量（upstream.ChatTiming.Total() ≤ 本行 total）：分段合计必然不超过总耗时，
 // 差值即 handler 自身开销。若违反则该观测本身不可信——见 timing_test.go 断言。
 func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks int, timing upstream.ChatTiming) {
+	logChatRowLine(ttfb, total, model, mode, uidPrefix(uid), status, toks, timing, "")
+}
+
+// logChatRowLine 是 logChatRow / logChatRowEx 的公共打印体。
+//   - uidLabel 已由调用方决定形态（logChatRow 传 uidPrefix，扩展行走昵称标签）；
+//   - extra 为空时输出**与改造前逐字节相同**的行（零回归）；
+//   - 非空时追加在行尾（扩展字段），不改变既有字段的位置与格式。
+func logChatRowLine(ttfb, total time.Duration, model, mode, uidLabel string, status int, toks int,
+	timing upstream.ChatTiming, extra string) {
 	if !chatLogEnabled {
 		return
 	}
@@ -356,17 +498,48 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 		segField = fmt.Sprintf(" | seg=prep%dms/do%dms×%d",
 			timing.Prepare.Milliseconds(), timing.Do.Milliseconds(), timing.Attempts)
 	}
-	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s%s | tok=%s | %stok/s | total=%.1fs |\n",
+	extraField := ""
+	if extra != "" {
+		extraField = " " + extra + " |"
+	}
+	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s%s | tok=%s | %stok/s | total=%.1fs |%s\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
 		mode,
 		status,
-		uidPrefix(uid),
+		uidLabel,
 		ttfbMS,
 		segField,
 		tokField,
 		tokpsField,
 		total.Seconds(),
+		extraField,
 	)
+}
+
+// logChatRowEx 带请求 ID / 结果 / 重试次数 / 扣费的扩展流水行。
+//
+// 与 logChatRow 的差异仅在**追加**四个字段（rid/out/try/credit），其余格式完全一致 ——
+// 刻意不改列宽/对齐体系（那是上游另一套日志重构，与本次指标功能无关），
+// 避免牵动本地既有格式与解析测试。
+//
+// outcome 为空时按状态码兜底分类（错误路径可能提前 return，来不及标记）。
+func logChatRowEx(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int,
+	timing upstream.ChatTiming, requestID, outcome string, attempts int, credit float64, hasCredit bool) {
+	if outcome == "" {
+		outcome = reqlog.OutcomeHTTPError
+		if status >= 200 && status < 300 {
+			outcome = reqlog.OutcomeSuccess
+		}
+	}
+	creditField := "-"
+	if hasCredit {
+		creditField = fmt.Sprintf("%.4f", credit)
+	}
+	// 账号列在有昵称时显示 "昵称(uid8)" —— 与面板/归档的 label 口径一致。
+	// 昵称为空时 Label 自动退回 uid8（不产生空括号）。
+	label := logfmt.Label(uid, nick)
+	logChatRowLine(ttfb, total, model, mode, label, status, toks, timing,
+		fmt.Sprintf("rid=%s out=%s try=%d credit=%s", requestID, outcome, attempts, creditField))
 }

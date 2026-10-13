@@ -1178,6 +1178,28 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                在逐行日志里完全不可见，聚合表里一眼可见；
              · 层级：汇总在前（看全貌）+ 明细在下（需要时下钻），
                避免"要么全淹没、要么看不到"的两难。 -->
+      <!-- 请求指标：进程内计数 + 最近请求（内存优先，不足时回落 JSONL 归档）。
+           放在错误汇总之上：先看"整体健康度"（成功率/耗时），再看"哪里错了"（汇总），
+           最后才是原始日志明细 —— 由粗到细的下钻顺序。 -->
+      <div class="box">
+        <header>
+          <h3>请求指标 <span class="hint">进程内计数 + 最近请求（脱敏，无提示词/凭证）</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="reqNote">—</span>
+        </header>
+        <div class="stats" id="reqStats"></div>
+        <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr>
+              <th class="mark" aria-hidden="true"></th><th>时间</th><th>请求 ID</th><th>账号</th><th>模型</th>
+              <th class="num">状态</th><th>结果</th><th class="num">耗时</th>
+              <th class="num">Token</th><th class="num">积分</th>
+            </tr></thead>
+            <tbody id="reqBody"></tbody>
+          </table>
+        </div>
+      </div>
+
       <div class="box" id="errBox">
         <header>
           <h3>错误汇总 <span class="hint">按「账号 × 类型」聚合，严重度优先、次数降序</span></h3>
