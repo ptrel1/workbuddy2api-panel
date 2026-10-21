@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/balance"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
@@ -73,6 +74,8 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+	// Balance 余额趋势采样记录器（nil = 该视图返回 501）
+	Balance *balance.Recorder
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -219,6 +222,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/keepalive_all", p.withAuth(p.keepaliveAll))
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
+	p.mux.HandleFunc("GET /panel/api/balance_history", p.withAuth(p.balanceHistory))
 	p.mux.HandleFunc("GET /panel/api/school/vouchers", p.withAuth(p.schoolVouchers))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
@@ -1177,4 +1181,43 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"ok": false, "error": msg})
+}
+
+// balanceHistory 返回余额采样序列，供「余额趋势」视图画折线。
+// days 查询参数控制窗口（默认 30，上限 30 = detailedKeep；更早的数据已折叠为日粒度，
+// 传更大值也只能拿到日粒度点）。
+func (p *Panel) balanceHistory(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Balance == nil {
+		writeErr(w, http.StatusNotImplemented, "balance recorder not available")
+		return
+	}
+	days := 30
+	if v := r.URL.Query().Get("days"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			days = n
+		}
+	}
+	if days > 30 {
+		days = 30
+	}
+	since := time.Now().AddDate(0, 0, -days)
+	// 昵称仅用于展示，取自池快照（不含任何凭证）；实时值优先，历史值兜底。
+	// 昵称与域仅用于展示，取自池快照（不含任何凭证）；实时值优先，历史值兜底。
+	// realm 必须在 Snapshot 前注入：cn 与 global 的积分不同源、不可互换，
+	// 跨域求和语义不成立，前端需按域分组渲染。
+	for _, st := range p.cfg.Pool.List() {
+		if st.Nickname != "" {
+			p.cfg.Balance.SetName(st.UID, st.Nickname)
+		}
+		if st.Realm != "" {
+			p.cfg.Balance.SetRealm(st.UID, st.Realm)
+		}
+	}
+	series, now := p.cfg.Balance.Snapshot(since)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":     true,
+		"now":    now.Format(time.RFC3339),
+		"days":   days,
+		"series": series,
+	})
 }

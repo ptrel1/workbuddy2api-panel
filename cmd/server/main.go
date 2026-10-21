@@ -22,6 +22,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/alert"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/balance"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/credithist"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
@@ -193,6 +194,14 @@ func main() {
 	// 回落仓库内嵌种子；models.dev 按需拉取成功后原子写回。
 	upstream.SetModelCatalogPath(stateSibling(cfg.StateFile, "model.json"))
 
+	// 余额采样记录器：与 state 文件同目录（路径由 state 推出，不加配置项）。
+	// 采样动作挂在余额刷新之后（见 internal/scheduler），这里只管装配与落盘生命周期。
+	balPath := stateSibling(cfg.StateFile, "balance_history.json")
+	bal := balance.New(balPath)
+	bal.Start()
+	defer bal.Stop()
+	log.Printf("[balance] 余额趋势采样已启用: %s 每 %v 一点（%s）", balPath, balance.Interval(), bal.Describe())
+
 	sch := scheduler.New(scheduler.Config{
 		Pool:           p,
 		Upstream:       up,
@@ -202,6 +211,8 @@ func main() {
 		KeepaliveHours: cfg.Schedule.KeepaliveHours,
 		BlackcatHours:  cfg.Schedule.BlackcatHours,
 		GrowthHours:    cfg.Schedule.GrowthHours,
+		// 余额采样记录器：挂在余额刷新之后（scheduler 内），nil = 不采样。
+		Balance: bal,
 		// 快过期积分优先消耗：签到/余额刷新按此窗口分桶（issue:积分过期）。
 		ExpiringSoonWindow: cfg.ExpiringSoonDur,
 		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
@@ -332,6 +343,8 @@ func main() {
 		RequestLog: requestLog,
 		Upstream:   up,
 		Scheduler:  sch,
+		// 余额趋势采样记录器：nil 时该视图返回 501。
+		Balance: bal,
 		// 后台任务的自动触发开关与成长任务排程共用热配置（schedule.growth_enabled）。
 		AutoTasksEnabled: sch.GrowthEnabled,
 		AuthDir:          cfg.AuthDir,
